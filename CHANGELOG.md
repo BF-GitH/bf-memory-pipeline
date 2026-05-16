@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0] - 2026-05-16
+
+### Added
+- **Database Profiles**: save/load/delete database snapshots from the Database tab
+  - Share fact sets across characters or restore previous states
+  - Dropdown shows profile name, DB count, and fact count
+  - Save Current (overwrite), Save As New (prompt for name), Load, Delete
+- Profiles stored globally in extension settings (persist across all chats)
+
+### Fixed
+- Generation trigger no longer posts "weird" system messages to chat
+  - Now uses `context.Generate('normal')` directly instead of `/trigger` slash command
+  - Falls back to `/trigger` only if Generate isn't available
+
 ## [0.1.0] - 2026-05-16
 
 ### Added

@@ -293,7 +293,13 @@ export function initPipeline() {
         addDebugLog('info', 'Triggering generation with facts ready...');
 
         try {
-            await runner('/trigger');
+            // Use Generate('normal') if available (cleaner, no slash command output)
+            // Fall back to /trigger slash command
+            if (typeof context.Generate === 'function') {
+                await context.Generate('normal');
+            } else {
+                await runner('/trigger');
+            }
         } catch (error) {
             addDebugLog('fail', `Trigger error: ${error.message}`);
             pipelineActive = false;

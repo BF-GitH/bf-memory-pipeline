@@ -143,6 +143,37 @@
 
             <!-- Tab: Database -->
             <div id="bf_mem_tab_database" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+
+                <!-- DB Profiles -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-bookmark"></i> Database Profiles
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Save and load database snapshots. Use these to share facts across characters or restore previous states.</small>
+                        <div class="bf-mem-profile-row" style="margin-top: 6px;">
+                            <select id="bf_mem_db_profile_select" class="text_pole">
+                                <option value="">-- No profile loaded --</option>
+                            </select>
+                        </div>
+                        <div class="bf-mem-db-actions" style="margin-top: 6px;">
+                            <button id="bf_mem_db_profile_load" class="menu_button">
+                                <i class="fa-solid fa-upload"></i> Load
+                            </button>
+                            <button id="bf_mem_db_profile_save" class="menu_button">
+                                <i class="fa-solid fa-floppy-disk"></i> Save Current
+                            </button>
+                            <button id="bf_mem_db_profile_save_new" class="menu_button">
+                                <i class="fa-solid fa-plus"></i> Save As New
+                            </button>
+                            <button id="bf_mem_db_profile_delete" class="menu_button redWarningBG">
+                                <i class="fa-solid fa-trash"></i>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Current Databases -->
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-database"></i> Fact Databases

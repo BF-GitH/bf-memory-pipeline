@@ -48,6 +48,8 @@ const DEFAULT_SETTINGS = {
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
+    dbProfiles: {},
+    activeDbProfile: '',
 };
 
 function getContext() {
@@ -322,6 +324,90 @@ async function showAllDatabases() {
     }
 }
 
+// --- DB Profiles ---
+
+function refreshDbProfileDropdown() {
+    const select = document.getElementById('bf_mem_db_profile_select');
+    if (!select) return;
+
+    const profiles = extensionSettings?.dbProfiles || {};
+    const active = extensionSettings?.activeDbProfile || '';
+
+    select.innerHTML = '<option value="">-- No profile loaded --</option>';
+    for (const [name, profile] of Object.entries(profiles)) {
+        const option = document.createElement('option');
+        option.value = name;
+        const factCount = Object.values(profile.databases || {}).reduce((sum, db) => sum + (db.facts?.length || 0), 0);
+        const dbCount = Object.keys(profile.databases || {}).length;
+        option.textContent = `${name} (${dbCount} dbs, ${factCount} facts)`;
+        select.appendChild(option);
+    }
+
+    if (active && profiles[active]) {
+        select.value = active;
+    }
+}
+
+async function loadDbProfile(profileName) {
+    if (!profileName) return;
+    const profile = extensionSettings?.dbProfiles?.[profileName];
+    if (!profile) {
+        toastr.error(`Profile "${profileName}" not found`, 'BF Memory');
+        return;
+    }
+
+    const { getAllDatabases, deleteDatabase, saveDatabase } = await import('./database.js');
+
+    // Clear existing databases
+    const existing = await getAllDatabases();
+    for (const category of Object.keys(existing)) {
+        await deleteDatabase(category);
+    }
+
+    // Load profile databases
+    for (const [category, db] of Object.entries(profile.databases || {})) {
+        await saveDatabase({ ...db, category });
+    }
+
+    extensionSettings.activeDbProfile = profileName;
+    saveSettings();
+    refreshDbProfileDropdown();
+    refreshDatabaseView();
+    toastr.success(`Loaded profile "${profileName}"`, 'BF Memory');
+    addDebugLog('info', `DB profile loaded: "${profileName}"`);
+}
+
+async function saveDbProfile(profileName) {
+    if (!profileName) return;
+
+    const { getAllDatabases } = await import('./database.js');
+    const databases = await getAllDatabases();
+
+    if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+    extensionSettings.dbProfiles[profileName] = {
+        databases: JSON.parse(JSON.stringify(databases)),
+        savedAt: Date.now(),
+    };
+    extensionSettings.activeDbProfile = profileName;
+    saveSettings();
+    refreshDbProfileDropdown();
+    toastr.success(`Saved profile "${profileName}"`, 'BF Memory');
+    addDebugLog('info', `DB profile saved: "${profileName}" (${Object.keys(databases).length} dbs)`);
+}
+
+async function deleteDbProfile(profileName) {
+    if (!profileName) return;
+    if (!confirm(`Delete saved profile "${profileName}"? This cannot be undone.`)) return;
+
+    delete extensionSettings.dbProfiles[profileName];
+    if (extensionSettings.activeDbProfile === profileName) {
+        extensionSettings.activeDbProfile = '';
+    }
+    saveSettings();
+    refreshDbProfileDropdown();
+    toastr.success(`Deleted profile "${profileName}"`, 'BF Memory');
+}
+
 // --- Init ---
 
 export async function initSettings() {
@@ -471,6 +557,46 @@ export async function initSettings() {
         $('#bf_mem_writer_format').val(DEFAULT_WRITER_FORMAT);
         saveSettings();
         toastr.info('Writer format reset', 'BF Memory');
+    });
+
+    // --- Database Tab: Profiles ---
+    refreshDbProfileDropdown();
+
+    $('#bf_mem_db_profile_load').on('click', () => {
+        const selected = $('#bf_mem_db_profile_select').val();
+        if (!selected) {
+            toastr.warning('Select a profile to load', 'BF Memory');
+            return;
+        }
+        loadDbProfile(selected);
+    });
+
+    $('#bf_mem_db_profile_save').on('click', () => {
+        const selected = $('#bf_mem_db_profile_select').val();
+        if (!selected) {
+            toastr.warning('Select an existing profile to overwrite, or use "Save As New"', 'BF Memory');
+            return;
+        }
+        saveDbProfile(selected);
+    });
+
+    $('#bf_mem_db_profile_save_new').on('click', () => {
+        const name = prompt('Enter a name for this database profile:');
+        if (!name || !name.trim()) return;
+        const cleanName = name.trim();
+        if (extensionSettings.dbProfiles?.[cleanName]) {
+            if (!confirm(`Profile "${cleanName}" already exists. Overwrite?`)) return;
+        }
+        saveDbProfile(cleanName);
+    });
+
+    $('#bf_mem_db_profile_delete').on('click', () => {
+        const selected = $('#bf_mem_db_profile_select').val();
+        if (!selected) {
+            toastr.warning('Select a profile to delete', 'BF Memory');
+            return;
+        }
+        deleteDbProfile(selected);
     });
 
     // --- Database Tab ---
