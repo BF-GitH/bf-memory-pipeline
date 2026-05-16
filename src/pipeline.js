@@ -1,6 +1,6 @@
-// BF Memory Pipeline - Main Orchestrator
-// Blocking approach: intercept user message, run Agent 1 + retrieval,
-// then trigger generation with facts injected. Hides response area while working.
+// BF Memory Pipeline - Main Orchestrator (v2 - Inline Blocking)
+// Runs agents during prompt assembly. Never aborts, never re-triggers.
+// ST's EventEmitter awaits async handlers, so generation waits for us.
 
 import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
@@ -12,14 +12,10 @@ import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup
 import { getSettings, addDebugLog, updateStatus } from './settings.js';
 
 // Pipeline state
-let pipelineActive = false;
-let pendingInjection = null;
 let lastProcessedMessageIndex = -1;
-let interceptedGeneration = false;
-let isInternalCall = false; // Guard: true when our agents are making LLM calls
-let isOurAbort = false; // Guard: true when WE called /abort (so GENERATION_STOPPED ignores it)
-let chatChangedAt = 0; // Timestamp of last chat change (cooldown)
-let lastTriggeredUserMsgIndex = -1; // Anti-loop: index of user message that last triggered pipeline
+let isInternalCall = false; // true when our agents are making LLM calls
+let chatChangedAt = 0;
+let lastTriggeredUserMsgIndex = -1;
 
 /**
  * Get recent chat messages
@@ -101,33 +97,84 @@ function hideWorkingIndicator() {
     if (indicator) indicator.style.display = 'none';
 }
 
-// --- Pre-generation: Agent 3 (memory) + Agent 1 (draft) in parallel, then fact retrieval ---
+// --- Determine if this generation should trigger the pipeline ---
 
-async function runPreGeneration() {
+function shouldRunPipeline(data) {
     const settings = getSettings();
-    if (!settings || !settings.enabled) return null;
+    if (!settings || !settings.enabled) return false;
 
-    const startTime = Date.now();
+    // Skip our own internal LLM calls (Agent 1, Agent 3)
+    if (isInternalCall) return false;
+
+    // Skip dry runs
+    if (data?.dryRun) return false;
+
+    // Cooldown after chat change
+    if (Date.now() - chatChangedAt < 5000) {
+        addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown active)');
+        return false;
+    }
+
+    // Only run for new user messages we haven't processed
+    const freshChat = SillyTavern.getContext().chat;
+    if (!freshChat || freshChat.length === 0) return false;
+
+    let lastUserMsgIndex = -1;
+    for (let i = freshChat.length - 1; i >= 0; i--) {
+        if (freshChat[i] && freshChat[i].is_user) {
+            lastUserMsgIndex = i;
+            break;
+        }
+    }
+
+    if (lastUserMsgIndex < 0) return false;
+
+    if (lastUserMsgIndex <= lastTriggeredUserMsgIndex) {
+        addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
+        return false;
+    }
+
+    return true;
+}
+
+// --- Core Pipeline Logic (runs inline, blocks generation) ---
+
+async function runPipelineInline(data) {
+    const settings = getSettings();
     const context = SillyTavern.getContext();
     const chat = context.chat;
     const charName = context.characters?.[context.characterId]?.name || '(unknown)';
     const characterInfo = getCharacterInfo();
     const userPersona = getUserPersona();
 
+    // Mark which user message triggered this
+    let lastUserMsgIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i] && chat[i].is_user) {
+            lastUserMsgIndex = i;
+            break;
+        }
+    }
+    lastTriggeredUserMsgIndex = lastUserMsgIndex;
+
+    const startTime = Date.now();
     const recentMessages = getRecentMessages(settings.contextMessages || 5);
     if (recentMessages.length === 0) {
         addDebugLog('info', 'No messages in chat, skipping pipeline');
-        return null;
+        return;
     }
 
-    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Profile: ${settings.memoryProfile || '(default)'}`);
+    addDebugLog('info', `--- Pipeline inline start (char: ${charName}, msgs: ${recentMessages.length}) ---`);
     for (let i = 0; i < recentMessages.length; i++) {
         const msg = recentMessages[i];
         const role = msg.is_user ? 'USER' : 'AI';
         addDebugLog('info', `  [${i + 1}/${recentMessages.length}] ${role}: ${msg.mes}`);
     }
 
-    // Find the last AI message to process for memory (the one before the user's new message)
+    showWorkingIndicator();
+    updateStatus('running', 'Preparing facts...');
+
+    // Find memory target (last AI message before the new user message)
     let memoryTargetIndex = -1;
     for (let i = chat.length - 2; i >= 0; i--) {
         if (chat[i] && !chat[i].is_user && chat[i].mes) {
@@ -138,7 +185,7 @@ async function runPreGeneration() {
 
     const formattedChat = formatMessagesForDraft(recentMessages);
 
-    // --- Run Agent 3 + Agent 1 in PARALLEL (single profile switch) ---
+    // --- Run Agent 3 + Agent 1 in PARALLEL ---
     updateStatus('running', 'Updating memory + drafting...');
     addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) in parallel...');
 
@@ -146,6 +193,7 @@ async function runPreGeneration() {
     let memoryResult = null;
 
     try {
+        isInternalCall = true;
         await runWithMemoryProfile(async () => {
             const promises = [];
 
@@ -155,7 +203,7 @@ async function runPreGeneration() {
                     .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
             );
 
-            // Agent 3: Memory update (if there's a valid target)
+            // Agent 3: Memory update
             if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
                 const targetMessage = chat[memoryTargetIndex];
                 const role = targetMessage.is_user ? 'USER' : 'AI';
@@ -175,7 +223,11 @@ async function runPreGeneration() {
         }, settings);
     } catch (error) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
-        return null;
+        hideWorkingIndicator();
+        updateStatus('error', 'Pipeline failed');
+        return;
+    } finally {
+        isInternalCall = false;
     }
 
     // --- Process Agent 3 results ---
@@ -186,23 +238,26 @@ async function runPreGeneration() {
         }
         lastProcessedMessageIndex = memoryTargetIndex;
 
-        // Check if review popup is due
+        // Check if review popup is due (defer to after generation to avoid blocking)
         if (tickMessageCounter(settings.reviewInterval || 10)) {
-            addDebugLog('info', 'Review interval reached, showing popup');
-            await showReviewPopup(
-                () => addDebugLog('info', 'User accepted all memory updates'),
-                async (editedItems) => {
-                    addDebugLog('info', `User edited ${editedItems.length} items`);
-                    const dbs = await getAllDatabases();
-                    for (const item of editedItems) {
-                        if (!dbs[item.category]) {
-                            dbs[item.category] = createEmptyDatabase(item.category);
+            addDebugLog('info', 'Review interval reached, will show popup after generation');
+            // Schedule popup after generation completes
+            setTimeout(async () => {
+                await showReviewPopup(
+                    () => addDebugLog('info', 'User accepted all memory updates'),
+                    async (editedItems) => {
+                        addDebugLog('info', `User edited ${editedItems.length} items`);
+                        const dbs = await getAllDatabases();
+                        for (const item of editedItems) {
+                            if (!dbs[item.category]) {
+                                dbs[item.category] = createEmptyDatabase(item.category);
+                            }
+                            upsertFact(dbs[item.category], item);
+                            await saveDatabase(dbs[item.category]);
                         }
-                        upsertFact(dbs[item.category], item);
-                        await saveDatabase(dbs[item.category]);
-                    }
-                },
-            );
+                    },
+                );
+            }, 2000);
         }
     } else if (memoryResult?.error) {
         addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);
@@ -211,13 +266,15 @@ async function runPreGeneration() {
     // --- Process Agent 1 results ---
     if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'}`);
-        return null;
+        hideWorkingIndicator();
+        updateStatus('error', 'Draft agent failed');
+        return;
     }
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Needed facts: ${draftResult.neededFacts.join('; ')}`);
 
-    // --- Fact Retrieval (pure DB lookup, uses Agent 3's fresh data) ---
+    // --- Fact Retrieval ---
     addDebugLog('info', 'Retrieving facts...');
     updateStatus('running', 'Retrieving facts...');
 
@@ -226,11 +283,19 @@ async function runPreGeneration() {
 
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);
 
-    // Build injection
+    // --- Build & Inject ---
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted);
     addDebugLog('info', `Injection ready (${injection.length} chars) in ${Date.now() - startTime}ms`);
 
-    return injection;
+    const success = injectMemoryContext(data, injection);
+    if (success) {
+        addDebugLog('pass', 'Memory context injected into prompt');
+    } else {
+        addDebugLog('fail', 'Failed to inject memory context');
+    }
+
+    hideWorkingIndicator();
+    updateStatus('running', 'Generating with facts...');
 }
 
 // --- Main Pipeline Init ---
@@ -238,155 +303,30 @@ async function runPreGeneration() {
 export function initPipeline() {
     const context = SillyTavern.getContext();
     const { eventSource, eventTypes } = context;
-    const runner = context.executeSlashCommandsWithOptions;
 
-    // INTERCEPT: When user sends a message, block generation,
-    // run Agent 1 + retrieval, then trigger generation with injection ready.
-    eventSource.on(eventTypes.GENERATION_STARTED, async () => {
-        const settings = getSettings();
-        if (!settings || !settings.enabled) return;
-        if (pipelineActive) return;
-
-        // Skip events from our own internal LLM calls (Agent 1, Agent 3)
-        if (isInternalCall) return;
-
-        // If this generation was triggered BY US after pipeline, don't intercept again
-        if (interceptedGeneration) {
-            interceptedGeneration = false;
-            return;
-        }
-
-        // Cooldown: ignore generation events within 5s of entering a chat
-        // (ST may auto-generate greetings or continue on chat load)
-        if (Date.now() - chatChangedAt < 5000) {
-            addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown active)');
-            return;
-        }
-
-        // ANTI-LOOP: Only trigger if there's a new user message we haven't processed
-        // Use fresh context (not the stale closure from init) in case chat array was replaced
-        const freshChat = SillyTavern.getContext().chat;
-        if (!freshChat || freshChat.length === 0) return;
-
-        // Find the most recent user message (ST may have already added an AI placeholder)
-        let lastUserMsgIndex = -1;
-        for (let i = freshChat.length - 1; i >= 0; i--) {
-            if (freshChat[i] && freshChat[i].is_user) {
-                lastUserMsgIndex = i;
-                break;
-            }
-        }
-
-        if (lastUserMsgIndex < 0) return;
-
-        if (lastUserMsgIndex <= lastTriggeredUserMsgIndex) {
-            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
-            return;
-        }
-
-        lastTriggeredUserMsgIndex = lastUserMsgIndex;
-        pipelineActive = true;
-        addDebugLog('info', '--- Pipeline triggered: intercepting generation ---');
-
-        // Stop the current generation immediately
-        isOurAbort = true;
-        try {
-            await runner('/abort');
-        } catch { /* may fail if nothing running yet, that's ok */ }
-        isOurAbort = false;
-
-        showWorkingIndicator();
-        updateStatus('running', 'Preparing facts...');
-
-        try {
-            isInternalCall = true;
-            pendingInjection = await runPreGeneration();
-        } catch (error) {
-            addDebugLog('fail', `Pre-generation error: ${error.message}`);
-            pendingInjection = null;
-        } finally {
-            isInternalCall = false;
-        }
-
-        hideWorkingIndicator();
-        updateStatus('running', 'Generating with facts...');
-
-        // Now trigger the actual generation - injection is ready
-        interceptedGeneration = true;
-        addDebugLog('info', 'Triggering generation with facts ready...');
-
-        try {
-            // Use Generate('normal') if available (cleaner, no slash command output)
-            // Fall back to /trigger slash command
-            if (typeof context.Generate === 'function') {
-                await context.Generate('normal');
-            } else {
-                await runner('/trigger');
-            }
-        } catch (error) {
-            addDebugLog('fail', `Trigger error: ${error.message}`);
-            pipelineActive = false;
-            interceptedGeneration = false;
-            updateStatus('error', 'Generation failed');
-        }
+    // THE KEY HOOK: async handler on CHAT_COMPLETION_PROMPT_READY
+    // ST's EventEmitter awaits each listener, so this blocks generation until we're done.
+    // No abort. No re-trigger. Pipeline runs inline.
+    eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, async (data) => {
+        if (!shouldRunPipeline(data)) return;
+        await runPipelineInline(data);
     });
 
-    // Inject memory context into the prompt (synchronous - injection is already prepared)
-    eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, (data) => {
-        if (!pendingInjection) return;
-        if (isInternalCall) return;
-        if (data?.dryRun) return;
-
-        addDebugLog('info', `Injecting ${pendingInjection.length} chars into prompt (format: ${data?.chat ? 'chat' : data?.messages ? 'messages' : data?.prompt ? 'text' : 'unknown'})`);
-        const success = injectMemoryContext(data, pendingInjection);
-        if (success) {
-            addDebugLog('pass', 'Memory context injected into prompt');
-        } else {
-            addDebugLog('fail', 'Failed to inject memory context - no compatible format found');
-        }
-
-        pendingInjection = null;
+    // Handle text completion APIs (same inline blocking approach)
+    eventSource.on(eventTypes.GENERATE_AFTER_DATA, async (data, dryRun) => {
+        if (dryRun || isInternalCall) return;
+        if (!shouldRunPipeline({ dryRun: false })) return;
+        await runPipelineInline(data);
     });
 
-    // Handle text completion APIs
-    eventSource.on(eventTypes.GENERATE_AFTER_DATA, (data, dryRun) => {
-        if (!pendingInjection || dryRun || isInternalCall) return;
-
-        if (data && typeof data.prompt === 'string') {
-            data.prompt = pendingInjection + '\n\n' + data.prompt;
-            addDebugLog('pass', 'Memory context injected into text prompt');
-            pendingInjection = null;
-        }
-    });
-
-    // AFTER generation complete: reset pipeline state
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, async () => {
-        pipelineActive = false;
+    // After generation complete: reset status
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
         updateStatus('idle');
-    });
-
-    // Handle generation stopped/aborted
-    eventSource.on(eventTypes.GENERATION_STOPPED, () => {
-        // Ignore if WE called /abort (we're about to /trigger)
-        if (isOurAbort) return;
-
-        if (pipelineActive && !interceptedGeneration) {
-            // User aborted during our pipeline work
-            pipelineActive = false;
-            pendingInjection = null;
-            hideWorkingIndicator();
-            updateStatus('idle', 'Aborted');
-            addDebugLog('info', 'Generation stopped by user during pipeline');
-        }
     });
 
     // Reset on chat change
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
-        pipelineActive = false;
-        pendingInjection = null;
-        interceptedGeneration = false;
         isInternalCall = false;
-        isOurAbort = false;
         lastProcessedMessageIndex = -1;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
@@ -405,8 +345,8 @@ export function initPipeline() {
             }
         }
 
-        addDebugLog('info', `Chat changed - pipeline state reset (lastUserMsg=${lastTriggeredUserMsgIndex})`);
+        addDebugLog('info', `Chat changed - state reset (lastUserMsg=${lastTriggeredUserMsgIndex})`);
     });
 
-    console.log('[BFMemory] Pipeline initialized (blocking mode)');
+    console.log('[BFMemory] Pipeline initialized (inline blocking mode)');
 }
