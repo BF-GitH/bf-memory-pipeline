@@ -98,23 +98,36 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
  * Build the prompt for Agent 3
  */
 function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
-    let prompt = '[OOC: SYSTEM INSTRUCTION - Do NOT continue the roleplay. You are a fact extraction engine. Follow the instructions below and output ONLY the requested JSON format.]\n\n';
-    prompt += (getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT) + '\n\n';
+    const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
+
+    const parts = [
+        '```system',
+        'MODE: FACT EXTRACTION ENGINE (not roleplay)',
+        'TASK: Extract facts from the message below into structured JSON.',
+        'OUTPUT: Only #Facts: and #Summary: sections. No prose, no actions, no dialogue.',
+        '```',
+        '',
+        sysPrompt,
+        '',
+    ];
 
     if (characterInfo) {
-        prompt += `#Character Info:\n${characterInfo}\n\n`;
+        parts.push('```character_info', characterInfo, '```', '');
     }
 
-    // Include current database state (summarized)
     const dbSummary = summarizeDatabases(existingDatabases);
     if (dbSummary) {
-        prompt += `#Existing Databases:\n${dbSummary}\n\n`;
+        parts.push('```existing_databases', dbSummary, '```', '');
     }
 
-    prompt += `#New Message to Analyze:\n${messageText}\n\n`;
-    prompt += '[OOC: Remember - output ONLY #Facts: and #Summary: sections. Do NOT write roleplay text. Output JSON objects for facts.]';
+    parts.push('```message_to_analyze', messageText, '```', '');
+    parts.push('Now output ONLY these two sections (no other text):');
+    parts.push('#Facts:');
+    parts.push('[one JSON object per line, or (none)]');
+    parts.push('#Summary:');
+    parts.push('[1-2 sentences about what changed]');
 
-    return prompt;
+    return parts.join('\n');
 }
 
 /**

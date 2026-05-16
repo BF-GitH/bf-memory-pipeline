@@ -64,21 +64,36 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
  * Build the prompt for Agent 1
  */
 function buildDraftPrompt(recentChat, characterInfo, userPersona) {
-    let prompt = '[OOC: SYSTEM INSTRUCTION - Do NOT continue the roleplay. You are an analytical assistant. Follow the instructions below and output ONLY the requested format.]\n\n';
-    prompt += (getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT) + '\n\n';
+    // Structure the prompt so the model cannot mistake it for RP continuation.
+    // Key: instruction at START and END, chat wrapped in code fence, no narrative flow.
+    const sysPrompt = getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT;
+
+    const parts = [
+        '```system',
+        'MODE: ANALYTICAL ASSISTANT (not roleplay)',
+        'TASK: Read the chat log below and produce a structured plan.',
+        'OUTPUT: Only the exact format shown in instructions. No prose, no actions, no dialogue.',
+        '```',
+        '',
+        sysPrompt,
+        '',
+    ];
 
     if (characterInfo) {
-        prompt += `#Character Info:\n${characterInfo}\n\n`;
+        parts.push('```character_info', characterInfo, '```', '');
     }
-
     if (userPersona) {
-        prompt += `#User Persona:\n${userPersona}\n\n`;
+        parts.push('```user_persona', userPersona, '```', '');
     }
 
-    prompt += `#Reference Chats:\n${recentChat}\n\n`;
-    prompt += '[OOC: Remember - output ONLY #Draft: and #Needed_Facts: sections. Do NOT write roleplay text.]';
+    parts.push('```chat_log', recentChat, '```', '');
+    parts.push('Now output ONLY these two sections (no other text):');
+    parts.push('#Draft:');
+    parts.push('[your 1-3 sentence plan here]');
+    parts.push('#Needed_Facts:');
+    parts.push('[semicolon-separated keywords here]');
 
-    return prompt;
+    return parts.join('\n');
 }
 
 /**

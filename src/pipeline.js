@@ -121,7 +121,10 @@ async function runPreGeneration() {
 
     const context = SillyTavern.getContext();
     const charName = context.characters?.[context.characterId]?.name || '(unknown)';
-    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Profile: ${settings.memoryProfile || '(default)'}`);
+    const lastMsg = recentMessages[recentMessages.length - 1];
+    const lastMsgPreview = lastMsg ? `${lastMsg.is_user ? 'USER' : 'AI'}: "${lastMsg.mes.substring(0, 60)}..."` : '(none)';
+    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Last: ${lastMsgPreview}`);
+    addDebugLog('info', `Profile: ${settings.memoryProfile || '(default)'}`);
 
     // Agent 1: Draft (runs on memory profile)
     let draftResult;
