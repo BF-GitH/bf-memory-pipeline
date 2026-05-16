@@ -2,6 +2,9 @@
 // Handles UI, settings persistence, and debug logging
 
 import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
+import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
+import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
+import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
 
 let Popup, POPUP_TYPE;
 async function ensurePopup() {
@@ -42,6 +45,9 @@ const DEFAULT_SETTINGS = {
     tertiaryChance: 15,
     showToast: true,
     debugMode: false,
+    draftPrompt: '',
+    memoryPrompt: '',
+    writerFormat: '',
 };
 
 function getContext() {
@@ -52,35 +58,10 @@ export function getSettings() {
     return extensionSettings;
 }
 
-export function addDebugLog(type, message) {
-    const entry = {
-        time: new Date().toLocaleTimeString(),
-        type,
-        message,
-    };
-    debugLog.push(entry);
-    if (debugLog.length > MAX_DEBUG_ENTRIES) debugLog.shift();
-
-    const settings = getSettings();
-    if (settings?.debugMode) {
-        updateDebugPanel();
-    }
-
-    // Also console log
-    const prefix = type === 'fail' ? '!' : type === 'pass' ? '+' : '-';
-    console.log(`[BFMemory] ${prefix} ${message}`);
-}
-
-function updateDebugPanel() {
-    const panel = document.getElementById('bf_mem_debug_log');
-    if (!panel) return;
-
-    const html = debugLog.slice(-50).reverse().map(entry => {
-        const cls = entry.type === 'fail' ? 'bf-mem-log-fail' : entry.type === 'pass' ? 'bf-mem-log-pass' : 'bf-mem-log-info';
-        return `<div class="${cls}"><span class="bf-mem-log-time">${entry.time}</span> ${escapeHtml(entry.message)}</div>`;
-    }).join('');
-
-    panel.innerHTML = html;
+function saveSettings() {
+    const context = getContext();
+    context.extensionSettings[EXTENSION_NAME] = extensionSettings;
+    context.saveSettingsDebounced();
 }
 
 function escapeHtml(text) {
@@ -89,247 +70,242 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-function saveSettings() {
-    const context = getContext();
-    if (context.extension_settings) {
-        context.extension_settings[EXTENSION_NAME] = extensionSettings;
+// --- Status ---
+
+export function updateStatus(status, message = '') {
+    const dot = document.getElementById('bf_mem_status_dot');
+    const text = document.getElementById('bf_mem_status_text');
+
+    if (dot) {
+        dot.className = 'bf-mem-status-dot';
+        if (status === 'running') dot.classList.add('running');
+        else if (status === 'error') dot.classList.add('error');
+        else if (extensionSettings?.enabled) dot.classList.add('active');
     }
-    context.saveSettingsDebounced?.();
+
+    if (text && message) {
+        text.textContent = message;
+    } else if (text) {
+        text.textContent = extensionSettings?.enabled
+            ? `Active${extensionSettings.useMemoryProfile ? ' (separate profile)' : ''}`
+            : 'Disabled';
+    }
 }
 
-function buildProfileDropdown(selectedId) {
-    const profiles = getConnectionProfiles();
-    let options = '<option value="">-- Select Memory Profile --</option>';
-    for (const profile of profiles) {
-        const selected = profile.id === selectedId ? 'selected' : '';
-        const name = profile.name || profile.id;
-        options += `<option value="${escapeHtml(profile.id)}" ${selected}>${escapeHtml(name)}</option>`;
+// --- Debug Log ---
+
+export function addDebugLog(type, message) {
+    const timestamp = new Date().toLocaleTimeString();
+    debugLog.unshift({ type, message, timestamp });
+    if (debugLog.length > MAX_DEBUG_ENTRIES) debugLog = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+
+    renderDebugLog();
+
+    if (extensionSettings?.debugMode) {
+        const prefix = type === 'pass' ? '[PASS]' : type === 'fail' ? '[FAIL]' : '[INFO]';
+        console.log(`[BFMemory] ${prefix} ${message}`);
     }
-    return options;
 }
 
-export async function initSettings() {
-    const context = getContext();
+function renderDebugLog() {
+    const container = document.getElementById('bf_mem_debug_log');
+    if (!container) return;
 
-    // Load saved settings
-    if (!context.extension_settings) context.extension_settings = {};
-    if (!context.extension_settings[EXTENSION_NAME]) {
-        context.extension_settings[EXTENSION_NAME] = { ...DEFAULT_SETTINGS };
-    }
-    extensionSettings = context.extension_settings[EXTENSION_NAME];
-
-    // Merge any missing defaults
-    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-        if (extensionSettings[key] === undefined) {
-            extensionSettings[key] = value;
-        }
-    }
-
-    // Build settings UI
-    const settingsHtml = `
-    <div id="bf_memory_settings" class="bf-mem-settings">
-        <div class="inline-drawer">
-            <div class="inline-drawer-toggle inline-drawer-header">
-                <b>BF's Memory Pipeline</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
-            </div>
-            <div class="inline-drawer-content">
-                <!-- Enable Toggle -->
-                <div class="bf-mem-row">
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="bf_mem_enabled" ${extensionSettings.enabled ? 'checked' : ''} />
-                        <span>Enable Memory Pipeline</span>
-                    </label>
-                </div>
-
-                <!-- Memory Profile -->
-                <div class="bf-mem-row">
-                    <label>Memory Profile (for Draft + Memory agents)</label>
-                    <div class="bf-mem-row-inner">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_use_profile" ${extensionSettings.useMemoryProfile ? 'checked' : ''} />
-                            <span>Use separate profile</span>
-                        </label>
-                        <select id="bf_mem_profile" class="text_pole">
-                            ${buildProfileDropdown(extensionSettings.memoryProfile)}
-                        </select>
-                    </div>
-                </div>
-
-                <!-- Context Messages -->
-                <div class="bf-mem-row">
-                    <label>Context Messages (sent to Draft Agent)</label>
-                    <input type="number" id="bf_mem_context" class="text_pole" min="1" max="100"
-                        value="${extensionSettings.contextMessages}" />
-                    <small class="bf-mem-hint">Number of recent chat messages Agent 1 sees (1-100)</small>
-                </div>
-
-                <!-- Review Interval -->
-                <div class="bf-mem-row">
-                    <label>Review Popup Interval (messages)</label>
-                    <input type="number" id="bf_mem_review_interval" class="text_pole" min="1" max="200"
-                        value="${extensionSettings.reviewInterval}" />
-                    <small class="bf-mem-hint">How many messages before the fact review popup appears (1-200)</small>
-                </div>
-
-                <!-- Retrieval Probabilities -->
-                <div class="bf-mem-row">
-                    <label>Secondary Fact Chance: <span id="bf_mem_secondary_val">${extensionSettings.secondaryChance}%</span></label>
-                    <input type="range" id="bf_mem_secondary" class="bf-mem-slider" min="0" max="100" step="5"
-                        value="${extensionSettings.secondaryChance}" />
-                    <small class="bf-mem-hint">How often related but not directly requested facts are included</small>
-                </div>
-                <div class="bf-mem-row">
-                    <label>Tertiary Fact Chance: <span id="bf_mem_tertiary_val">${extensionSettings.tertiaryChance}%</span></label>
-                    <input type="range" id="bf_mem_tertiary" class="bf-mem-slider" min="0" max="100" step="5"
-                        value="${extensionSettings.tertiaryChance}" />
-                    <small class="bf-mem-hint">How often distant/thematic facts are included (e.g. food mention -> a restaurant memory)</small>
-                </div>
-
-                <!-- General Settings -->
-                <div class="bf-mem-row">
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="bf_mem_toast" ${extensionSettings.showToast ? 'checked' : ''} />
-                        <span>Show toast notifications</span>
-                    </label>
-                </div>
-                <div class="bf-mem-row">
-                    <label class="checkbox_label">
-                        <input type="checkbox" id="bf_mem_debug" ${extensionSettings.debugMode ? 'checked' : ''} />
-                        <span>Debug mode</span>
-                    </label>
-                </div>
-
-                <!-- Database Browser -->
-                <div class="bf-mem-row">
-                    <button id="bf_mem_browse_db" class="menu_button">Browse Databases</button>
-                    <button id="bf_mem_clear_db" class="menu_button redWarningBG">Clear All Databases</button>
-                </div>
-
-                <!-- Debug Panel -->
-                <div id="bf_mem_debug_panel" class="bf-mem-debug-panel" style="display: ${extensionSettings.debugMode ? 'block' : 'none'}">
-                    <div class="bf-mem-debug-header">
-                        <b>Debug Log</b>
-                        <button id="bf_mem_clear_log" class="menu_button">Clear</button>
-                    </div>
-                    <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
-                </div>
-            </div>
+    container.innerHTML = debugLog.map(entry => `
+        <div class="bf-mem-debug-entry ${entry.type}">
+            <span class="bf-mem-log-time">[${entry.timestamp}]</span> ${escapeHtml(entry.message).replace(/\n/g, '<br>')}
         </div>
-    </div>`;
-
-    // Insert into extensions panel
-    const container = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
-    if (container) {
-        container.insertAdjacentHTML('beforeend', settingsHtml);
-    }
-
-    // Bind events
-    document.getElementById('bf_mem_enabled')?.addEventListener('change', (e) => {
-        extensionSettings.enabled = e.target.checked;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_use_profile')?.addEventListener('change', (e) => {
-        extensionSettings.useMemoryProfile = e.target.checked;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_profile')?.addEventListener('change', (e) => {
-        extensionSettings.memoryProfile = e.target.value;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_context')?.addEventListener('change', (e) => {
-        extensionSettings.contextMessages = parseInt(e.target.value) || 5;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_review_interval')?.addEventListener('change', (e) => {
-        extensionSettings.reviewInterval = parseInt(e.target.value) || 10;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_secondary')?.addEventListener('input', (e) => {
-        const val = parseInt(e.target.value) || 0;
-        extensionSettings.secondaryChance = val;
-        document.getElementById('bf_mem_secondary_val').textContent = `${val}%`;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_tertiary')?.addEventListener('input', (e) => {
-        const val = parseInt(e.target.value) || 0;
-        extensionSettings.tertiaryChance = val;
-        document.getElementById('bf_mem_tertiary_val').textContent = `${val}%`;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_toast')?.addEventListener('change', (e) => {
-        extensionSettings.showToast = e.target.checked;
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_debug')?.addEventListener('change', (e) => {
-        extensionSettings.debugMode = e.target.checked;
-        const panel = document.getElementById('bf_mem_debug_panel');
-        if (panel) panel.style.display = e.target.checked ? 'block' : 'none';
-        saveSettings();
-    });
-
-    document.getElementById('bf_mem_clear_log')?.addEventListener('click', () => {
-        debugLog = [];
-        updateDebugPanel();
-    });
-
-    document.getElementById('bf_mem_browse_db')?.addEventListener('click', async () => {
-        await showDatabaseBrowser();
-    });
-
-    document.getElementById('bf_mem_clear_db')?.addEventListener('click', async () => {
-        await ensurePopup();
-        if (Popup) {
-            const result = await Popup.show.confirm('Clear ALL memory databases for this character?', 'This cannot be undone.');
-            if (result) {
-                const { getAllDatabases, deleteDatabase } = await import('./database.js');
-                const dbs = await getAllDatabases();
-                for (const category of Object.keys(dbs)) {
-                    await deleteDatabase(category);
-                }
-                addDebugLog('info', 'All databases cleared');
-                toastr.success('All memory databases cleared', 'BF Memory');
-            }
-        }
-    });
-
-    // Refresh profile dropdown when profiles change
-    context.eventSource?.on(context.eventTypes?.CONNECTION_PROFILE_LOADED, () => {
-        const dropdown = document.getElementById('bf_mem_profile');
-        if (dropdown) {
-            dropdown.innerHTML = buildProfileDropdown(extensionSettings.memoryProfile);
-        }
-    });
-
-    console.log('[BFMemory] Settings initialized');
+    `).join('');
 }
 
-async function showDatabaseBrowser() {
+function exportLogs() {
+    const header = `=== BF Memory Pipeline Debug Logs ===\nExported: ${new Date().toISOString()}\nEntries: ${debugLog.length}\n${'='.repeat(40)}\n\n`;
+    const logText = debugLog.map(entry => `[${entry.timestamp}] [${entry.type.toUpperCase().padEnd(5)}] ${entry.message}`).join('\n');
+    return header + logText;
+}
+
+// --- Profile Dropdown ---
+
+function reloadProfiles() {
+    const select = document.getElementById('bf_mem_profile');
+    if (!select) return;
+
+    const currentValue = select.value;
+    select.innerHTML = '<option value="">-- Select Memory Profile --</option>';
+
+    const profiles = getConnectionProfiles();
+    const activeProfile = getCurrentProfileId();
+
+    profiles.forEach(profile => {
+        const option = document.createElement('option');
+        option.value = profile.id;
+        option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
+        select.appendChild(option);
+    });
+
+    if (currentValue && profiles.find(p => p.id === currentValue)) {
+        select.value = currentValue;
+    } else if (extensionSettings?.memoryProfile) {
+        select.value = extensionSettings.memoryProfile;
+    }
+}
+
+// --- Tabs ---
+
+function setupTabs() {
+    const tablist = document.querySelector('.bf-mem-tabs[role="tablist"]');
+    if (!tablist) return;
+
+    const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+
+    function activateTab(tab) {
+        tabs.forEach(t => {
+            t.setAttribute('aria-selected', 'false');
+            t.setAttribute('tabindex', '-1');
+            t.classList.remove('active');
+            const panel = document.getElementById(t.getAttribute('aria-controls'));
+            if (panel) panel.style.display = 'none';
+        });
+
+        tab.setAttribute('aria-selected', 'true');
+        tab.setAttribute('tabindex', '0');
+        tab.classList.add('active');
+
+        const panel = document.getElementById(tab.getAttribute('aria-controls'));
+        if (panel) panel.style.display = '';
+
+        // Refresh DB view when switching to database tab
+        if (tab.getAttribute('aria-controls') === 'bf_mem_tab_database') {
+            refreshDatabaseView();
+        }
+    }
+
+    tabs.forEach(tab => {
+        tab.addEventListener('click', () => activateTab(tab));
+        tab.addEventListener('keydown', (e) => {
+            const idx = tabs.indexOf(tab);
+            let target = null;
+            if (e.key === 'ArrowRight') target = tabs[(idx + 1) % tabs.length];
+            else if (e.key === 'ArrowLeft') target = tabs[(idx - 1 + tabs.length) % tabs.length];
+            if (target) { e.preventDefault(); activateTab(target); }
+        });
+    });
+}
+
+// --- Database View ---
+
+async function refreshDatabaseView() {
+    const { getAllDatabases } = await import('./database.js');
+    const databases = await getAllDatabases();
+    const categories = Object.keys(databases);
+
+    const statsEl = document.getElementById('bf_mem_db_stats');
+    const listEl = document.getElementById('bf_mem_db_list');
+
+    if (!statsEl || !listEl) return;
+
+    const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
+    statsEl.innerHTML = `<b>${categories.length}</b> databases | <b>${totalFacts}</b> total facts`;
+
+    if (categories.length === 0) {
+        listEl.innerHTML = '<div class="bf-mem-empty">No databases yet. They will be created as you chat.</div>';
+        return;
+    }
+
+    listEl.innerHTML = categories.map(cat => {
+        const db = databases[cat];
+        const factCount = db.facts.length;
+        const knowers = [...new Set(db.facts.flatMap(f => f.knownBy || []))];
+        return `
+            <div class="bf-mem-db-card" data-category="${escapeHtml(cat)}">
+                <div class="bf-mem-db-card-header">
+                    <span class="bf-mem-db-card-name">${escapeHtml(cat)}</span>
+                    <span class="bf-mem-db-card-count">${factCount}/50</span>
+                </div>
+                <div class="bf-mem-db-card-meta">
+                    ${knowers.length ? `Known by: ${escapeHtml(knowers.join(', '))}` : ''}
+                </div>
+                <div class="bf-mem-db-card-actions">
+                    <button class="bf-mem-db-view menu_button" data-category="${escapeHtml(cat)}">
+                        <i class="fa-solid fa-eye"></i> View
+                    </button>
+                    <button class="bf-mem-db-delete menu_button" data-category="${escapeHtml(cat)}">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </div>
+            </div>`;
+    }).join('');
+
+    // Bind view buttons
+    listEl.querySelectorAll('.bf-mem-db-view').forEach(btn => {
+        btn.addEventListener('click', () => viewSingleDatabase(btn.dataset.category, databases));
+    });
+
+    // Bind delete buttons
+    listEl.querySelectorAll('.bf-mem-db-delete').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            if (!confirm(`Delete database "${btn.dataset.category}"?`)) return;
+            const { deleteDatabase } = await import('./database.js');
+            await deleteDatabase(btn.dataset.category);
+            toastr.success(`Database "${btn.dataset.category}" deleted`, 'BF Memory');
+            refreshDatabaseView();
+        });
+    });
+}
+
+async function viewSingleDatabase(category, databases) {
+    const db = databases[category];
+    if (!db) return;
+
+    let html = `<div class="bf-mem-db-browser">
+        <h4>${escapeHtml(category)} (${db.facts.length} facts)</h4>
+        <table class="bf-mem-db-table">
+            <tr><th>Key</th><th>Value</th><th>Known By</th><th>Tags</th><th>Relationships</th></tr>`;
+
+    for (const fact of db.facts) {
+        const rels = fact.relationships || {};
+        const relStr = [
+            ...(rels.primary || []).map(r => `P:${r}`),
+            ...(rels.secondary || []).map(r => `S:${r}`),
+            ...(rels.tertiary || []).map(r => `T:${r}`),
+        ].join(', ');
+
+        html += `<tr>
+            <td><b>${escapeHtml(fact.key)}</b></td>
+            <td>${escapeHtml(fact.value)}</td>
+            <td>${escapeHtml((fact.knownBy || []).join(', '))}</td>
+            <td>${escapeHtml((fact.tags || []).join(', '))}</td>
+            <td>${escapeHtml(relStr)}</td>
+        </tr>`;
+    }
+    html += '</table></div>';
+
+    await ensurePopup();
+    if (Popup) {
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
+        await popup.show();
+    }
+}
+
+async function showAllDatabases() {
     const { getAllDatabases } = await import('./database.js');
     const databases = await getAllDatabases();
     const categories = Object.keys(databases);
 
     if (categories.length === 0) {
-        toastr.info('No memory databases yet. They will be created as you chat.', 'BF Memory');
+        toastr.info('No databases yet.', 'BF Memory');
         return;
     }
 
     let html = '<div class="bf-mem-db-browser">';
     for (const [category, db] of Object.entries(databases)) {
-        html += `<div class="bf-mem-db-section">`;
-        html += `<h4>${escapeHtml(category)} (${db.facts.length} facts)</h4>`;
-        html += '<table class="bf-mem-db-table"><tr><th>Key</th><th>Value</th><th>Known By</th><th>Tags</th></tr>';
+        html += `<div class="bf-mem-db-section">
+            <h4>${escapeHtml(category)} (${db.facts.length} facts)</h4>
+            <table class="bf-mem-db-table">
+                <tr><th>Key</th><th>Value</th><th>Known By</th><th>Tags</th></tr>`;
         for (const fact of db.facts) {
             html += `<tr>
-                <td>${escapeHtml(fact.key)}</td>
+                <td><b>${escapeHtml(fact.key)}</b></td>
                 <td>${escapeHtml(fact.value)}</td>
                 <td>${escapeHtml((fact.knownBy || []).join(', '))}</td>
                 <td>${escapeHtml((fact.tags || []).join(', '))}</td>
@@ -341,6 +317,217 @@ async function showDatabaseBrowser() {
 
     await ensurePopup();
     if (Popup) {
-        await Popup.show.text('Memory Databases', html);
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
+        await popup.show();
     }
+}
+
+// --- Init ---
+
+export async function initSettings() {
+    const context = getContext();
+
+    // Load saved settings
+    if (!context.extensionSettings) context.extensionSettings = {};
+    if (!context.extensionSettings[EXTENSION_NAME]) {
+        context.extensionSettings[EXTENSION_NAME] = { ...DEFAULT_SETTINGS };
+    }
+    extensionSettings = context.extensionSettings[EXTENSION_NAME];
+
+    // Merge missing defaults
+    for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
+        if (extensionSettings[key] === undefined) {
+            extensionSettings[key] = value;
+        }
+    }
+
+    // Load HTML template
+    let path = `scripts/extensions/third-party/${EXTENSION_NAME}`;
+    let html = null;
+
+    try {
+        html = await $.get(`${path}/templates/settings.html`);
+    } catch {
+        path = `scripts/extensions/${EXTENSION_NAME}`;
+        try {
+            html = await $.get(`${path}/templates/settings.html`);
+        } catch {
+            console.error('[BFMemory] Failed to load UI template');
+            return;
+        }
+    }
+
+    $('#extensions_settings').append(html);
+
+    // --- Setup Tabs ---
+    setupTabs();
+
+    // --- Pipeline Tab ---
+    $('#bf_mem_enabled').prop('checked', extensionSettings.enabled).on('change', function () {
+        extensionSettings.enabled = $(this).prop('checked');
+        updateStatus('idle');
+        saveSettings();
+    });
+
+    $('#bf_mem_use_profile').prop('checked', extensionSettings.useMemoryProfile).on('change', function () {
+        extensionSettings.useMemoryProfile = $(this).prop('checked');
+        $('#bf_mem_profile_section').toggle(extensionSettings.useMemoryProfile);
+        saveSettings();
+    });
+    $('#bf_mem_profile_section').toggle(extensionSettings.useMemoryProfile);
+
+    reloadProfiles();
+    $('#bf_mem_profile').val(extensionSettings.memoryProfile || '').on('change', function () {
+        extensionSettings.memoryProfile = $(this).val() || '';
+        saveSettings();
+    });
+
+    $('#bf_mem_refresh_profiles').on('click', () => {
+        reloadProfiles();
+        toastr.info('Profiles refreshed', 'BF Memory');
+    });
+
+    // Context slider
+    $('#bf_mem_context').val(extensionSettings.contextMessages);
+    $('#bf_mem_context_val').text(extensionSettings.contextMessages);
+    $('#bf_mem_context').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.contextMessages = val;
+        $('#bf_mem_context_val').text(val);
+        saveSettings();
+    });
+
+    // Review interval slider
+    $('#bf_mem_review_interval').val(extensionSettings.reviewInterval);
+    $('#bf_mem_review_val').text(extensionSettings.reviewInterval);
+    $('#bf_mem_review_interval').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.reviewInterval = val;
+        $('#bf_mem_review_val').text(val);
+        saveSettings();
+    });
+
+    // Secondary chance
+    $('#bf_mem_secondary').val(extensionSettings.secondaryChance);
+    $('#bf_mem_secondary_val').text(`${extensionSettings.secondaryChance}%`);
+    $('#bf_mem_secondary').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.secondaryChance = val;
+        $('#bf_mem_secondary_val').text(`${val}%`);
+        saveSettings();
+    });
+
+    // Tertiary chance
+    $('#bf_mem_tertiary').val(extensionSettings.tertiaryChance);
+    $('#bf_mem_tertiary_val').text(`${extensionSettings.tertiaryChance}%`);
+    $('#bf_mem_tertiary').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.tertiaryChance = val;
+        $('#bf_mem_tertiary_val').text(`${val}%`);
+        saveSettings();
+    });
+
+    // Toast
+    $('#bf_mem_toast').prop('checked', extensionSettings.showToast).on('change', function () {
+        extensionSettings.showToast = $(this).prop('checked');
+        saveSettings();
+    });
+
+    // --- Prompts Tab ---
+    $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).on('change', function () {
+        const val = $(this).val().trim();
+        extensionSettings.draftPrompt = (val === DEFAULT_DRAFT_PROMPT) ? '' : val;
+        saveSettings();
+    });
+
+    $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || DEFAULT_MEMORY_PROMPT).on('change', function () {
+        const val = $(this).val().trim();
+        extensionSettings.memoryPrompt = (val === DEFAULT_MEMORY_PROMPT) ? '' : val;
+        saveSettings();
+    });
+
+    $('#bf_mem_writer_format').val(extensionSettings.writerFormat || DEFAULT_WRITER_FORMAT).on('change', function () {
+        const val = $(this).val().trim();
+        extensionSettings.writerFormat = (val === DEFAULT_WRITER_FORMAT) ? '' : val;
+        saveSettings();
+    });
+
+    $('#bf_mem_reset_draft_prompt').on('click', () => {
+        extensionSettings.draftPrompt = '';
+        $('#bf_mem_draft_prompt').val(DEFAULT_DRAFT_PROMPT);
+        saveSettings();
+        toastr.info('Draft prompt reset', 'BF Memory');
+    });
+
+    $('#bf_mem_reset_memory_prompt').on('click', () => {
+        extensionSettings.memoryPrompt = '';
+        $('#bf_mem_memory_prompt').val(DEFAULT_MEMORY_PROMPT);
+        saveSettings();
+        toastr.info('Memory prompt reset', 'BF Memory');
+    });
+
+    $('#bf_mem_reset_writer_format').on('click', () => {
+        extensionSettings.writerFormat = '';
+        $('#bf_mem_writer_format').val(DEFAULT_WRITER_FORMAT);
+        saveSettings();
+        toastr.info('Writer format reset', 'BF Memory');
+    });
+
+    // --- Database Tab ---
+    $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
+    $('#bf_mem_browse_db').on('click', () => showAllDatabases());
+    $('#bf_mem_export_db').on('click', async () => {
+        const { getAllDatabases } = await import('./database.js');
+        const databases = await getAllDatabases();
+        const json = JSON.stringify(databases, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `bf-memory-export-${Date.now()}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+        toastr.success('Databases exported', 'BF Memory');
+    });
+
+    $('#bf_mem_clear_db').on('click', async () => {
+        if (!confirm('Clear ALL memory databases for this character? This cannot be undone.')) return;
+        const { getAllDatabases, deleteDatabase } = await import('./database.js');
+        const dbs = await getAllDatabases();
+        for (const category of Object.keys(dbs)) {
+            await deleteDatabase(category);
+        }
+        addDebugLog('info', 'All databases cleared');
+        toastr.success('All databases cleared', 'BF Memory');
+        refreshDatabaseView();
+    });
+
+    // --- Debug Tab ---
+    $('#bf_mem_debug').prop('checked', extensionSettings.debugMode).on('change', function () {
+        extensionSettings.debugMode = $(this).prop('checked');
+        saveSettings();
+    });
+
+    $('#bf_mem_clear_log').on('click', () => {
+        debugLog = [];
+        renderDebugLog();
+    });
+
+    $('#bf_mem_copy_log').on('click', async () => {
+        const logText = exportLogs();
+        try {
+            await navigator.clipboard.writeText(logText);
+            toastr.success('Logs copied to clipboard', 'BF Memory');
+        } catch {
+            prompt('Copy logs:', logText);
+        }
+    });
+
+    // --- Auto-refresh profiles on change ---
+    context.eventSource?.on(context.eventTypes?.CONNECTION_PROFILE_LOADED, () => reloadProfiles());
+
+    // --- Initial state ---
+    updateStatus('idle');
+
+    console.log('[BFMemory] Settings initialized');
 }

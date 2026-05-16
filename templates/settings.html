@@ -1,0 +1,197 @@
+<div id="bf_memory_settings" class="bf-mem-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>BF's Memory Pipeline</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <!-- Status Bar -->
+            <div class="bf-mem-status-bar">
+                <div class="bf-mem-status-dot" id="bf_mem_status_dot"></div>
+                <span id="bf_mem_status_text">Disabled</span>
+                <label class="checkbox_label" style="margin-left: auto;">
+                    <input type="checkbox" id="bf_mem_enabled" />
+                    <span>Enable</span>
+                </label>
+            </div>
+
+            <!-- Tabs -->
+            <div class="bf-mem-tabs" role="tablist">
+                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_pipeline" tabindex="0">Pipeline</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">Prompts</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
+            </div>
+
+            <!-- Tab: Pipeline Settings -->
+            <div id="bf_mem_tab_pipeline" role="tabpanel" class="bf-mem-tabpanel">
+
+                <!-- Connection Profile -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-plug"></i> Connection Profile
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_use_profile" />
+                            <span>Use separate profile for Draft + Memory agents</span>
+                        </label>
+                        <div id="bf_mem_profile_section" class="bf-mem-profile-row">
+                            <select id="bf_mem_profile" class="text_pole"></select>
+                            <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
+                                <i class="fa-solid fa-arrows-rotate"></i>
+                            </button>
+                        </div>
+                        <small class="bf-mem-hint">Writer (Agent 2) always uses your default/active profile.</small>
+                    </div>
+                </div>
+
+                <!-- Context & Timing -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-sliders"></i> Context & Timing
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_context_val">5</span></label>
+                            <input type="range" id="bf_mem_context" min="1" max="50" step="1" value="5" />
+                            <small class="bf-mem-hint">How many recent messages Agent 1 (Drafter) sees</small>
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
+                            <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
+                            <small class="bf-mem-hint">Messages between fact review popups</small>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Retrieval Probabilities -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-dice"></i> Fact Retrieval
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Secondary Fact Chance <span class="bf-mem-val" id="bf_mem_secondary_val">50%</span></label>
+                            <input type="range" id="bf_mem_secondary" min="0" max="100" step="5" value="50" />
+                            <small class="bf-mem-hint">Related but not directly requested (e.g. at restaurant -> food preferences)</small>
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Tertiary Fact Chance <span class="bf-mem-val" id="bf_mem_tertiary_val">15%</span></label>
+                            <input type="range" id="bf_mem_tertiary" min="0" max="100" step="5" value="15" />
+                            <small class="bf-mem-hint">Distant thematic connections (e.g. topic mentioned -> old memory)</small>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- General -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-gear"></i> General
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_toast" />
+                            <span>Show toast notifications</span>
+                        </label>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Prompts -->
+            <div id="bf_mem_tab_prompts" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Agent 1: Draft Planner Prompt
+                        <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Draft agent system prompt..."></textarea>
+                        <small class="bf-mem-hint">This prompt tells Agent 1 how to plan a reply and list needed facts.</small>
+                    </div>
+                </div>
+
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Agent 3: Memory Updater Prompt
+                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Memory updater system prompt..."></textarea>
+                        <small class="bf-mem-hint">This prompt tells Agent 3 how to extract and update facts.</small>
+                    </div>
+                </div>
+
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Writer Injection Format
+                        <button id="bf_mem_reset_writer_format" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_writer_format" class="bf-mem-textarea" rows="6" placeholder="Writer injection header/footer..."></textarea>
+                        <small class="bf-mem-hint">Template wrapping the facts injected into the main model's prompt. Use {draft} and {facts} placeholders.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Database -->
+            <div id="bf_mem_tab_database" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-database"></i> Fact Databases
+                        <button id="bf_mem_refresh_db" class="bf-mem-reset-btn menu_button" title="Refresh">
+                            <i class="fa-solid fa-arrows-rotate"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <div id="bf_mem_db_stats" class="bf-mem-db-stats">Loading...</div>
+                        <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
+                        <div class="bf-mem-db-actions">
+                            <button id="bf_mem_browse_db" class="menu_button">
+                                <i class="fa-solid fa-eye"></i> View All Facts
+                            </button>
+                            <button id="bf_mem_export_db" class="menu_button">
+                                <i class="fa-solid fa-download"></i> Export
+                            </button>
+                            <button id="bf_mem_clear_db" class="menu_button redWarningBG">
+                                <i class="fa-solid fa-trash"></i> Clear All
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Debug -->
+            <div id="bf_mem_tab_debug" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-bug"></i> Debug Log
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_debug" />
+                            <span>Enable debug logging</span>
+                        </label>
+                        <div class="bf-mem-debug-actions">
+                            <button id="bf_mem_clear_log" class="menu_button">
+                                <i class="fa-solid fa-eraser"></i> Clear
+                            </button>
+                            <button id="bf_mem_copy_log" class="menu_button">
+                                <i class="fa-solid fa-copy"></i> Copy
+                            </button>
+                        </div>
+                        <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+</div>

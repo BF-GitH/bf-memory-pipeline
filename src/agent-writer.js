@@ -3,6 +3,21 @@
 // Receives: draft + retrieved facts + character cards + system prompt
 // Output: injected into the prompt so the main model writes a fact-grounded response
 
+// Lazy access to avoid circular dependency (settings imports our DEFAULT_WRITER_FORMAT)
+function getSettingsSafe() {
+    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+}
+
+export const DEFAULT_WRITER_FORMAT = `[Memory Context - Use these established facts for consistency]
+
+#Established Facts:
+{facts}
+
+#Scene Direction:
+{draft}
+
+[Follow the established facts above. Do not contradict them. Characters only know facts tagged with their name.]`;
+
 /**
  * Build the fact injection block that gets inserted into the prompt
  * This doesn't call an LLM - it prepares context for the main generation
@@ -11,26 +26,15 @@
  * @returns {string} Injection text to add to the prompt
  */
 export function buildWriterInjection(draft, factsFormatted) {
-    const parts = [];
+    const settings = getSettingsSafe();
 
-    parts.push('[Memory Context - Use these established facts for consistency]');
+    const template = settings?.writerFormat || DEFAULT_WRITER_FORMAT;
+    const factsText = (factsFormatted && factsFormatted !== '(No stored facts available)') ? factsFormatted : '(none available)';
+    const draftText = draft || '(no direction)';
 
-    if (factsFormatted && factsFormatted !== '(No stored facts available)') {
-        parts.push('');
-        parts.push('#Established Facts:');
-        parts.push(factsFormatted);
-    }
-
-    if (draft) {
-        parts.push('');
-        parts.push('#Scene Direction:');
-        parts.push(draft);
-    }
-
-    parts.push('');
-    parts.push('[Follow the established facts above. Do not contradict them. Characters only know facts tagged with their name.]');
-
-    return parts.join('\n');
+    return template
+        .replace('{facts}', factsText)
+        .replace('{draft}', draftText);
 }
 
 /**

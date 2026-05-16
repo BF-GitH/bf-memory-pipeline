@@ -2,7 +2,12 @@
 // Receives recent chat + character cards + system prompt
 // Outputs: draft reply idea + list of needed fact categories
 
-const DRAFT_SYSTEM_PROMPT = `You are a roleplay draft planner. Your job is to:
+// Lazy import to avoid circular dependency (settings imports our DEFAULT_DRAFT_PROMPT)
+function getSettingsSafe() {
+    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+}
+
+export const DEFAULT_DRAFT_PROMPT = `You are a roleplay draft planner. Your job is to:
 1. Read the recent chat messages and character information
 2. Plan what the character should do/say next
 3. List what facts would be needed to write a good, consistent reply
@@ -52,7 +57,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
  * Build the prompt for Agent 1
  */
 function buildDraftPrompt(recentChat, characterInfo, userPersona) {
-    let prompt = DRAFT_SYSTEM_PROMPT + '\n\n';
+    let prompt = (getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT) + '\n\n';
 
     if (characterInfo) {
         prompt += `#Character Info:\n${characterInfo}\n\n`;

@@ -3,8 +3,12 @@
 // Updates fact databases, tracks who knows what, manages cross-references
 
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
+// Lazy import to avoid circular dependency (settings imports our DEFAULT_MEMORY_PROMPT)
+function getSettingsSafe() {
+    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+}
 
-const MEMORY_UPDATE_PROMPT = `You are a fact extraction and database maintenance agent for a roleplay. Your job is to:
+export const DEFAULT_MEMORY_PROMPT = `You are a fact extraction and database maintenance agent for a roleplay. Your job is to:
 1. Read the new message and extract any NEW facts or UPDATED facts
 2. Determine which characters now know each fact
 3. Categorize facts into appropriate databases
@@ -86,7 +90,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
  * Build the prompt for Agent 3
  */
 function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
-    let prompt = MEMORY_UPDATE_PROMPT + '\n\n';
+    let prompt = (getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT) + '\n\n';
 
     if (characterInfo) {
         prompt += `#Character Info:\n${characterInfo}\n\n`;
