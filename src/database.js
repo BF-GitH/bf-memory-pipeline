@@ -109,8 +109,14 @@ export async function saveDatabase(db) {
         created: Date.now(),
     });
 
-    // Save settings
-    context.saveSettingsDebounced?.();
+    // Save settings immediately (not debounced) to prevent data loss on page close
+    if (context.saveSettingsDebounced) {
+        context.saveSettingsDebounced();
+        // Force flush if available
+        if (typeof context.saveSettingsDebounced.flush === 'function') {
+            context.saveSettingsDebounced.flush();
+        }
+    }
 }
 
 /**
@@ -195,7 +201,11 @@ export function searchFacts(databases, keywords) {
             const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')}`.toLowerCase();
 
             // Check for direct keyword match (primary)
-            const directMatch = lowerKeywords.some(kw => factText.includes(kw) || categoryLower.includes(kw));
+            // Split keyword phrases into words for matching (e.g. "Seraphina past" -> ["seraphina", "past"])
+            const directMatch = lowerKeywords.some(kw => {
+                const words = kw.split(/\s+/).filter(w => w.length > 2);
+                return words.some(word => factText.includes(word) || categoryLower.includes(word));
+            });
             if (directMatch) {
                 results.push({ fact, category, tier: 'primary' });
                 continue;
@@ -203,17 +213,25 @@ export function searchFacts(databases, keywords) {
 
             // Check relationship links for secondary/tertiary matches
             if (fact.relationships) {
-                const secondaryMatch = (fact.relationships.secondary || []).some(ref =>
-                    lowerKeywords.some(kw => ref.toLowerCase().includes(kw)),
-                );
+                const secondaryMatch = (fact.relationships.secondary || []).some(ref => {
+                    const refLower = ref.toLowerCase();
+                    return lowerKeywords.some(kw => {
+                        const words = kw.split(/\s+/).filter(w => w.length > 2);
+                        return words.some(word => refLower.includes(word));
+                    });
+                });
                 if (secondaryMatch) {
                     results.push({ fact, category, tier: 'secondary' });
                     continue;
                 }
 
-                const tertiaryMatch = (fact.relationships.tertiary || []).some(ref =>
-                    lowerKeywords.some(kw => ref.toLowerCase().includes(kw)),
-                );
+                const tertiaryMatch = (fact.relationships.tertiary || []).some(ref => {
+                    const refLower = ref.toLowerCase();
+                    return lowerKeywords.some(kw => {
+                        const words = kw.split(/\s+/).filter(w => w.length > 2);
+                        return words.some(word => refLower.includes(word));
+                    });
+                });
                 if (tertiaryMatch) {
                     results.push({ fact, category, tier: 'tertiary' });
                 }

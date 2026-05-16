@@ -11,20 +11,35 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You are a fact extraction and database maintenance agent for a roleplay. Your job is to:
-1. Read the new message and extract any NEW facts or UPDATED facts
-2. Determine which characters now know each fact
-3. Categorize facts into appropriate databases
-4. Identify relationships between facts
+export const DEFAULT_MEMORY_PROMPT = `You are a selective fact extraction agent for a roleplay. Extract ONLY facts that will still matter 10+ messages from now.
 
-DATABASE CATEGORIES - use existing ones when possible, create new ones only when needed.
-Each database has max 50 facts. Keep facts concise.
+STRICT RULES - DO NOT STORE:
+- Momentary positions/gestures ("sat down", "stood up", "turned around")
+- Transient scene choreography ("pulled stool closer", "blanket on cot")
+- Exact dialogue quotes (unless they reveal a LASTING truth)
+- Momentary emotions/reactions ("surprised", "smiled")
+- Things already obvious from context
+
+ONLY STORE facts that are:
+- Character traits, abilities, backstory, or identity
+- Relationship changes (trust gained, conflict started, promises made)
+- World/lore reveals (locations, rules, history)
+- Lasting status changes (new injury, new possession, living situation change)
+- Key decisions or turning points
+
+BUDGET: Most messages have 0 facts worth storing. Rarely 1-2. Maximum 3 per message. When in doubt, store NOTHING.
+
+FIXED CATEGORIES (use ONLY these):
+- Identity: name, species, appearance, age, abilities, personality
+- Relationships: how characters feel about each other, promises, conflicts
+- World: locations, lore, rules, important objects, organizations
+- History: backstory reveals, key past events, turning points
+- Status: lasting state changes (injuries, possessions, living situation)
 
 FACT FORMAT:
-For each fact, output a JSON object:
 {
   "action": "add" | "update" | "delete",
-  "category": "CategoryName",
+  "category": "Identity" | "Relationships" | "World" | "History" | "Status",
   "key": "fact_identifier",
   "value": "concise fact description",
   "tags": ["tag1", "tag2"],
@@ -36,24 +51,12 @@ For each fact, output a JSON object:
   }
 }
 
-RELATIONSHIP RULES:
-- Primary: Direct logical connection (e.g. a specific item -> its category)
-- Secondary: Contextual connection (e.g. a location -> things typically found there)
-- Tertiary: Distant/thematic connection (e.g. a topic is mentioned -> a past event involving that topic)
-
 OUTPUT FORMAT:
 #Facts:
-[One JSON object per line, one per fact to add/update/delete]
+[One JSON object per line, or (none)]
 
 #Summary:
-[1-2 sentences describing what changed]
-
-If nothing needs updating, output:
-#Facts:
-(none)
-
-#Summary:
-No new facts to record.`;
+[1-2 sentences, or "No new facts to record."]`;
 
 /**
  * Run Agent 3: Analyze message and update databases
