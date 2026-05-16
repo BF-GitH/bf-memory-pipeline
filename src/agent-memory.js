@@ -98,7 +98,8 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
  * Build the prompt for Agent 3
  */
 function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
-    let prompt = (getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT) + '\n\n';
+    let prompt = '[OOC: SYSTEM INSTRUCTION - Do NOT continue the roleplay. You are a fact extraction engine. Follow the instructions below and output ONLY the requested JSON format.]\n\n';
+    prompt += (getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT) + '\n\n';
 
     if (characterInfo) {
         prompt += `#Character Info:\n${characterInfo}\n\n`;
@@ -111,7 +112,7 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
     }
 
     prompt += `#New Message to Analyze:\n${messageText}\n\n`;
-    prompt += 'Extract facts and output updates:';
+    prompt += '[OOC: Remember - output ONLY #Facts: and #Summary: sections. Do NOT write roleplay text. Output JSON objects for facts.]';
 
     return prompt;
 }

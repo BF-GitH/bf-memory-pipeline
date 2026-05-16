@@ -64,7 +64,8 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
  * Build the prompt for Agent 1
  */
 function buildDraftPrompt(recentChat, characterInfo, userPersona) {
-    let prompt = (getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT) + '\n\n';
+    let prompt = '[OOC: SYSTEM INSTRUCTION - Do NOT continue the roleplay. You are an analytical assistant. Follow the instructions below and output ONLY the requested format.]\n\n';
+    prompt += (getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT) + '\n\n';
 
     if (characterInfo) {
         prompt += `#Character Info:\n${characterInfo}\n\n`;
@@ -75,7 +76,7 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona) {
     }
 
     prompt += `#Reference Chats:\n${recentChat}\n\n`;
-    prompt += 'Now create the draft and list needed facts:';
+    prompt += '[OOC: Remember - output ONLY #Draft: and #Needed_Facts: sections. Do NOT write roleplay text.]';
 
     return prompt;
 }

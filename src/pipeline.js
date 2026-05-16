@@ -17,6 +17,7 @@ let pendingInjection = null;
 let lastProcessedMessageIndex = -1;
 let isMemoryUpdateRunning = false;
 let interceptedGeneration = false;
+let isInternalCall = false; // Guard: true when our agents are making LLM calls
 
 /**
  * Get recent chat messages
@@ -178,6 +179,7 @@ async function runPostGeneration(currentMessageIndex) {
     if (!targetMessage || !targetMessage.mes) return;
 
     isMemoryUpdateRunning = true;
+    isInternalCall = true;
     addDebugLog('info', `Phase 3: Updating memory for message ${targetIndex}...`);
 
     try {
@@ -228,6 +230,7 @@ async function runPostGeneration(currentMessageIndex) {
         addDebugLog('fail', `Memory update error: ${error.message}`);
     } finally {
         isMemoryUpdateRunning = false;
+        isInternalCall = false;
     }
 }
 
@@ -244,6 +247,9 @@ export function initPipeline() {
         const settings = getSettings();
         if (!settings || !settings.enabled) return;
         if (pipelineActive) return;
+
+        // Skip events from our own internal LLM calls (Agent 1, Agent 3)
+        if (isInternalCall) return;
 
         // If this generation was triggered BY US after pipeline, don't intercept again
         if (interceptedGeneration) {
@@ -263,10 +269,13 @@ export function initPipeline() {
         updateStatus('running', 'Preparing facts...');
 
         try {
+            isInternalCall = true;
             pendingInjection = await runPreGeneration();
         } catch (error) {
             addDebugLog('fail', `Pre-generation error: ${error.message}`);
             pendingInjection = null;
+        } finally {
+            isInternalCall = false;
         }
 
         hideWorkingIndicator();
@@ -289,6 +298,7 @@ export function initPipeline() {
     // Inject memory context into the prompt (synchronous - injection is already prepared)
     eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, (data) => {
         if (!pendingInjection) return;
+        if (isInternalCall) return;
         if (data?.dryRun) return;
 
         addDebugLog('info', `Injecting ${pendingInjection.length} chars into prompt (format: ${data?.chat ? 'chat' : data?.messages ? 'messages' : data?.prompt ? 'text' : 'unknown'})`);
@@ -304,7 +314,7 @@ export function initPipeline() {
 
     // Handle text completion APIs
     eventSource.on(eventTypes.GENERATE_AFTER_DATA, (data, dryRun) => {
-        if (!pendingInjection || dryRun) return;
+        if (!pendingInjection || dryRun || isInternalCall) return;
 
         if (data && typeof data.prompt === 'string') {
             data.prompt = pendingInjection + '\n\n' + data.prompt;
@@ -344,6 +354,7 @@ export function initPipeline() {
         pipelineActive = false;
         pendingInjection = null;
         interceptedGeneration = false;
+        isInternalCall = false;
         lastProcessedMessageIndex = -1;
         isMemoryUpdateRunning = false;
         hideWorkingIndicator();
