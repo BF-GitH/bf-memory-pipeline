@@ -2,6 +2,8 @@
 // Receives recent chat + character cards + system prompt
 // Outputs: draft reply idea + list of needed fact categories
 
+import { addDebugLog } from './settings.js';
+
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_DRAFT_PROMPT)
 function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
@@ -39,6 +41,8 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
 
     const prompt = buildDraftPrompt(recentChat, characterInfo, userPersona);
 
+    addDebugLog('info', `Agent 1 prompt length: ${prompt.length} chars`);
+
     try {
         const result = await context.generateQuietPrompt({
             quietPrompt: prompt,
@@ -46,8 +50,11 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
         });
 
         const resultStr = typeof result === 'string' ? result : String(result || '');
+        addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 300)}${resultStr.length > 300 ? '...' : ''}"`);
         return parseDraftResult(resultStr);
     } catch (error) {
+        const detail = error?.response ? ` [HTTP ${error.response.status}]` : '';
+        addDebugLog('fail', `Agent 1 error${detail}: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
         return { draft: '', neededFacts: [], raw: '', error: error.message };
     }

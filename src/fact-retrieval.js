@@ -3,7 +3,7 @@
 // No LLM calls - pure database lookup with smart fallback matching
 
 import { getAllDatabases, searchFacts } from './database.js';
-import { getSettings } from './settings.js';
+import { getSettings, addDebugLog } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
@@ -46,12 +46,18 @@ const FALLBACK_MAPPINGS = {
  */
 export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const databases = await getAllDatabases();
-    if (Object.keys(databases).length === 0) {
+    const dbCount = Object.keys(databases).length;
+    const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
+    addDebugLog('info', `Retrieval: ${dbCount} databases loaded (${totalFacts} total facts)`);
+
+    if (dbCount === 0) {
+        addDebugLog('info', 'No databases exist yet, skipping retrieval');
         return { facts: [], formatted: '', stats: { primary: 0, secondary: 0, tertiary: 0 } };
     }
 
     // Combine explicit requests with context keywords
     const allKeywords = [...new Set([...neededInfo, ...contextKeywords])];
+    addDebugLog('info', `Retrieval keywords: ${allKeywords.join(', ')}`);
 
     // Search databases for direct matches
     const directResults = searchFacts(databases, allKeywords);
@@ -113,7 +119,11 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         tertiary: filteredResults.filter(r => r.tier === 'tertiary').length,
     };
 
-    console.log(`[BFMemory] Retrieved ${filteredResults.length} facts (P:${stats.primary} S:${stats.secondary} T:${stats.tertiary})`);
+    addDebugLog('info', `Retrieval result: ${filteredResults.length} facts (P:${stats.primary} S:${stats.secondary} T:${stats.tertiary})`);
+    if (filteredResults.length > 0) {
+        const factSummary = filteredResults.slice(0, 5).map(r => `[${r.tier[0].toUpperCase()}] ${r.category}:${r.fact.key}`).join(', ');
+        addDebugLog('info', `Top facts: ${factSummary}${filteredResults.length > 5 ? ` (+${filteredResults.length - 5} more)` : ''}`);
+    }
 
     return { facts: filteredResults, formatted, stats };
 }

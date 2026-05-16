@@ -1,6 +1,8 @@
 // BF Memory Pipeline - Profile Switching Module
 // Shared by Agent 1 (Drafter) and Agent 3 (Memory Updater)
 
+import { addDebugLog } from './settings.js';
+
 function getContext() {
     return SillyTavern.getContext();
 }
@@ -90,22 +92,27 @@ export async function restoreProfile(profileId) {
  */
 export async function runWithMemoryProfile(fn, settings) {
     if (!settings.useMemoryProfile || !settings.memoryProfile) {
+        addDebugLog('info', 'No memory profile configured, using current profile');
         return await fn();
     }
 
     const originalProfile = getCurrentProfileId();
+    addDebugLog('info', `Switching profile: ${originalProfile || '(none)'} -> ${settings.memoryProfile}`);
     const swapped = await swapProfile(settings.memoryProfile);
 
     if (swapped === false && getCurrentProfileId() !== settings.memoryProfile) {
+        addDebugLog('fail', `Profile switch failed, running with current profile`);
         return await fn();
     }
 
+    addDebugLog('pass', `Profile switched to memory profile`);
     await new Promise(resolve => setTimeout(resolve, 500));
 
     try {
         return await fn();
     } finally {
         if (originalProfile && swapped !== false) {
+            addDebugLog('info', `Restoring original profile: ${originalProfile}`);
             await restoreProfile(originalProfile);
         }
     }

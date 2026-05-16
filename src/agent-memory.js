@@ -3,6 +3,8 @@
 // Updates fact databases, tracks who knows what, manages cross-references
 
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
+import { addDebugLog } from './settings.js';
+
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_MEMORY_PROMPT)
 function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
@@ -64,6 +66,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     const context = SillyTavern.getContext();
 
     const prompt = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
+    addDebugLog('info', `Agent 3 prompt length: ${prompt.length} chars`);
 
     try {
         const result = await context.generateQuietPrompt({
@@ -72,15 +75,20 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
         });
 
         const resultStr = typeof result === 'string' ? result : String(result || '');
+        addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 400)}${resultStr.length > 400 ? '...' : ''}"`);
+
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
 
         // Apply updates to databases
         if (parsed.updates.length > 0) {
+            addDebugLog('info', `Agent 3 applying ${parsed.updates.length} updates...`);
             await applyUpdates(parsed.updates, existingDatabases);
         }
 
         return parsed;
     } catch (error) {
+        const detail = error?.response ? ` [HTTP ${error.response.status}]` : '';
+        addDebugLog('fail', `Agent 3 error${detail}: ${error.message || error}`);
         console.error('[BFMemory] Agent 3 (Memory) error:', error);
         return { updates: [], summary: '', raw: '', error: error.message };
     }
@@ -185,6 +193,7 @@ async function applyUpdates(updates, existingDatabases) {
         // Get or create database
         if (!existingDatabases[category]) {
             existingDatabases[category] = createEmptyDatabase(category);
+            addDebugLog('info', `Created new database: "${category}"`);
         }
 
         const db = existingDatabases[category];
@@ -192,8 +201,9 @@ async function applyUpdates(updates, existingDatabases) {
         if (update.action === 'delete') {
             db.facts = db.facts.filter(f => f.key !== update.key);
             db.updatedAt = Date.now();
+            addDebugLog('info', `Deleted fact: [${category}] ${update.key}`);
         } else {
-            // add or update
+            const isNew = !db.facts.some(f => f.key === update.key);
             upsertFact(db, {
                 key: update.key,
                 value: update.value || '',
@@ -202,6 +212,7 @@ async function applyUpdates(updates, existingDatabases) {
                 relationships: update.relationships || { primary: [], secondary: [], tertiary: [] },
                 source: update.source,
             });
+            addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"`);
         }
 
         modified.add(category);
@@ -211,9 +222,10 @@ async function applyUpdates(updates, existingDatabases) {
     for (const category of modified) {
         try {
             await saveDatabase(existingDatabases[category]);
-            console.log(`[BFMemory] Saved database: ${category}`);
+            const factCount = existingDatabases[category].facts.length;
+            addDebugLog('pass', `Saved database "${category}" (${factCount} facts)`);
         } catch (error) {
-            console.error(`[BFMemory] Failed to save database ${category}:`, error);
+            addDebugLog('fail', `Failed to save database "${category}": ${error.message}`);
         }
     }
 }

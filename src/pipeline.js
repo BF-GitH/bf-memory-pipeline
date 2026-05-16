@@ -118,6 +118,10 @@ async function runPreGeneration() {
     const characterInfo = getCharacterInfo();
     const userPersona = getUserPersona();
 
+    const context = SillyTavern.getContext();
+    const charName = context.characters?.[context.characterId]?.name || '(unknown)';
+    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Profile: ${settings.memoryProfile || '(default)'}`);
+
     // Agent 1: Draft (runs on memory profile)
     let draftResult;
     try {
@@ -125,12 +129,13 @@ async function runPreGeneration() {
             return await runDraftAgent(formattedChat, characterInfo, userPersona);
         }, settings);
     } catch (error) {
-        addDebugLog('fail', `Agent 1 error: ${error.message}`);
+        addDebugLog('fail', `Agent 1 exception: ${error.message}`);
+        addDebugLog('fail', `Stack: ${(error.stack || '').split('\n').slice(0, 3).join(' | ')}`);
         return null;
     }
 
     if (draftResult.error) {
-        addDebugLog('fail', `Agent 1 failed: ${draftResult.error}`);
+        addDebugLog('fail', `Agent 1 returned error: ${draftResult.error}`);
         return null;
     }
 
@@ -286,11 +291,12 @@ export function initPipeline() {
         if (!pendingInjection) return;
         if (data?.dryRun) return;
 
+        addDebugLog('info', `Injecting ${pendingInjection.length} chars into prompt (format: ${data?.chat ? 'chat' : data?.messages ? 'messages' : data?.prompt ? 'text' : 'unknown'})`);
         const success = injectMemoryContext(data, pendingInjection);
         if (success) {
             addDebugLog('pass', 'Memory context injected into prompt');
         } else {
-            addDebugLog('fail', 'Failed to inject memory context');
+            addDebugLog('fail', 'Failed to inject memory context - no compatible format found');
         }
 
         pendingInjection = null;
