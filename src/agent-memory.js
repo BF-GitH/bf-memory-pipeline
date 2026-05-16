@@ -155,11 +155,11 @@ function parseMemoryUpdateResult(response, messageIndex) {
         return result;
     }
 
-    // Parse each JSON line
+    // Parse each JSON object (handles nested braces via brace counting)
     const factsRaw = factsMatch[1].trim();
-    const jsonMatches = factsRaw.match(/\{[^}]+\}/g) || [];
+    const jsonObjects = extractJsonObjects(factsRaw);
 
-    for (const jsonStr of jsonMatches) {
+    for (const jsonStr of jsonObjects) {
         try {
             const fact = JSON.parse(jsonStr);
             if (fact.category && fact.key) {
@@ -167,13 +167,42 @@ function parseMemoryUpdateResult(response, messageIndex) {
                 result.updates.push(fact);
             }
         } catch {
-            // Try to be lenient with malformed JSON
             console.warn('[BFMemory] Failed to parse fact JSON:', jsonStr.substring(0, 100));
+            addDebugLog('fail', `JSON parse error: ${jsonStr.substring(0, 80)}`);
         }
     }
 
     console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
     return result;
+}
+
+/**
+ * Extract JSON objects from text, handling nested braces correctly.
+ * @param {string} text
+ * @returns {string[]} Array of JSON object strings
+ */
+function extractJsonObjects(text) {
+    const objects = [];
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] === '{') {
+            let depth = 0;
+            let start = i;
+            while (i < text.length) {
+                if (text[i] === '{') depth++;
+                else if (text[i] === '}') {
+                    depth--;
+                    if (depth === 0) {
+                        objects.push(text.substring(start, i + 1));
+                        break;
+                    }
+                }
+                i++;
+            }
+        }
+        i++;
+    }
+    return objects;
 }
 
 /**

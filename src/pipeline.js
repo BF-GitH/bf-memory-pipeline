@@ -18,6 +18,7 @@ let lastProcessedMessageIndex = -1;
 let isMemoryUpdateRunning = false;
 let interceptedGeneration = false;
 let isInternalCall = false; // Guard: true when our agents are making LLM calls
+let chatChangedAt = 0; // Timestamp of last chat change (cooldown)
 
 /**
  * Get recent chat messages
@@ -260,6 +261,13 @@ export function initPipeline() {
             return;
         }
 
+        // Cooldown: ignore generation events within 5s of entering a chat
+        // (ST may auto-generate greetings or continue on chat load)
+        if (Date.now() - chatChangedAt < 5000) {
+            addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown active)');
+            return;
+        }
+
         pipelineActive = true;
         addDebugLog('info', '--- Pipeline triggered: intercepting generation ---');
 
@@ -360,6 +368,7 @@ export function initPipeline() {
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
         isMemoryUpdateRunning = false;
+        chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
         addDebugLog('info', 'Chat changed - pipeline state reset');
