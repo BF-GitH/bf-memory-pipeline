@@ -190,12 +190,12 @@ async function runPipelineInline(data) {
 
     const formattedChat = formatMessagesForDraft(recentMessages);
 
-    // --- Run Agent 3 + Agent 1 in PARALLEL ---
+    // --- Run Agent 3 + Agent 1 + Speculative Retrieval in PARALLEL ---
     // SAFETY: We use CMRS (ConnectionManagerRequestService) to call the memory profile
     // directly by ID, WITHOUT switching the active UI profile. This is safe during
     // mid-generation because it doesn't touch the DOM or active connection state.
     updateStatus('running', 'Updating memory + drafting...');
-    addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) in parallel...');
+    addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) + speculative retrieval in parallel...');
 
     const memoryProfileId = getMemoryProfileId(settings);
     if (memoryProfileId) {
@@ -206,6 +206,11 @@ async function runPipelineInline(data) {
 
     let draftResult = null;
     let memoryResult = null;
+    let speculativeRetrieval = null;
+
+    // Start speculative fact retrieval using context keywords (no LLM needed)
+    const contextKeywords = extractContextKeywords(recentMessages);
+    addDebugLog('info', `Speculative retrieval keywords: ${contextKeywords.join(', ')}`);
 
     try {
         isInternalCall = true;
@@ -233,7 +238,13 @@ async function runPipelineInline(data) {
             promises.push(Promise.resolve(null));
         }
 
-        [draftResult, memoryResult] = await Promise.all(promises);
+        // Speculative retrieval: start fact lookup with context keywords NOW (no LLM wait)
+        promises.push(
+            retrieveFacts(contextKeywords, [])
+                .catch(err => { addDebugLog('info', `Speculative retrieval failed: ${err.message}`); return null; }),
+        );
+
+        [draftResult, memoryResult, speculativeRetrieval] = await Promise.all(promises);
     } catch (error) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
         hideWorkingIndicator();
@@ -276,7 +287,7 @@ async function runPipelineInline(data) {
         addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);
     }
 
-    // --- Process Agent 1 results ---
+    // --- Process Agent 1 results + merge with speculative retrieval ---
     if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'}`);
         hideWorkingIndicator();
@@ -287,12 +298,45 @@ async function runPipelineInline(data) {
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Needed facts: ${draftResult.neededFacts.join('; ')}`);
 
-    // --- Fact Retrieval ---
-    addDebugLog('info', 'Retrieving facts...');
-    updateStatus('running', 'Retrieving facts...');
+    // --- Fact Retrieval: merge speculative + Agent 1's specific requests ---
+    updateStatus('running', 'Merging facts...');
 
-    const contextKeywords = extractContextKeywords(recentMessages);
-    const retrieval = await retrieveFacts(draftResult.neededFacts, contextKeywords);
+    // Find keywords Agent 1 requested that weren't already in speculative retrieval
+    const speculativeKeywordSet = new Set(contextKeywords.map(k => k.toLowerCase()));
+    const deltaKeywords = draftResult.neededFacts.filter(k => !speculativeKeywordSet.has(k.toLowerCase()));
+
+    let retrieval = speculativeRetrieval || { facts: [], formatted: '', stats: { primary: 0, secondary: 0, tertiary: 0 } };
+
+    if (deltaKeywords.length > 0) {
+        addDebugLog('info', `Delta retrieval for Agent 1 keywords: ${deltaKeywords.join(', ')}`);
+        const deltaRetrieval = await retrieveFacts(deltaKeywords, []);
+
+        // Merge: add delta facts not already in speculative results
+        const existingKeys = new Set(retrieval.facts.map(r => `${r.category}:${r.fact.key}`));
+        for (const fact of deltaRetrieval.facts) {
+            const id = `${fact.category}:${fact.fact.key}`;
+            if (!existingKeys.has(id)) {
+                retrieval.facts.push(fact);
+                existingKeys.add(id);
+            }
+        }
+
+        // Recalculate stats and formatted output
+        retrieval.stats = {
+            primary: retrieval.facts.filter(r => r.tier === 'primary').length,
+            secondary: retrieval.facts.filter(r => r.tier === 'secondary').length,
+            tertiary: retrieval.facts.filter(r => r.tier === 'tertiary').length,
+        };
+        retrieval.formatted = retrieval.facts.length > 0
+            ? retrieval.facts.map(({ fact, category }) => {
+                const knownBy = (fact.knownBy || []).join(', ');
+                const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+                return `${prefix} ${category}: ${fact.value}`;
+            }).join('\n')
+            : '(No stored facts available)';
+    } else {
+        addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
+    }
 
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);
 
@@ -361,6 +405,12 @@ export function initPipeline() {
 
     // After generation complete: reset status and double-fire guard
     eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
+        pipelineJustInjected = false;
+        updateStatus('idle');
+    });
+
+    // Also reset on generation stop/failure (user clicks Stop, or error)
+    eventSource.on(eventTypes.GENERATION_STOPPED, () => {
         pipelineJustInjected = false;
         updateStatus('idle');
     });

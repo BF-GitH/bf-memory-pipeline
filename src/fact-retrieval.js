@@ -156,27 +156,27 @@ function formatFactsForWriter(results) {
 export function extractContextKeywords(messages) {
     if (!messages || messages.length === 0) return [];
 
-    // Combine all message text
-    const allText = messages.map(m => m.mes || '').join(' ').toLowerCase();
+    // Keep original text for capitalization detection, lowercased for trigger matching
+    const originalText = messages.map(m => m.mes || '').join(' ');
+    const lowerText = originalText.toLowerCase();
 
     // Extract proper nouns (capitalized words) and significant terms
-    const words = allText.split(/\s+/);
+    const words = originalText.split(/\s+/);
     const keywords = new Set();
 
     for (const word of words) {
         const clean = word.replace(/[^a-zA-Z0-9]/g, '');
         if (clean.length < 3) continue;
 
-        // Add words that might be names or locations (capitalized in original)
-        const originalWord = word.replace(/[^a-zA-Z0-9]/g, '');
-        if (originalWord[0] === originalWord[0]?.toUpperCase() && originalWord.length > 2) {
-            keywords.add(clean);
+        // Add words that are capitalized (likely names, locations, proper nouns)
+        if (clean[0] === clean[0].toUpperCase() && clean[0] !== clean[0].toLowerCase()) {
+            keywords.add(clean.toLowerCase());
         }
     }
 
     // Also check for fallback trigger words
     for (const trigger of Object.keys(FALLBACK_MAPPINGS)) {
-        if (allText.includes(trigger)) {
+        if (lowerText.includes(trigger)) {
             keywords.add(trigger);
         }
     }

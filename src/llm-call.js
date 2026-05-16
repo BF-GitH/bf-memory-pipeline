@@ -5,6 +5,17 @@
 
 import { addDebugLog } from './settings.js';
 
+const LLM_TIMEOUT_MS = 30000; // 30 second timeout for agent LLM calls
+
+/** Wrap a promise with a timeout */
+function withTimeout(promise, ms) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`LLM call timed out after ${ms / 1000}s`)), ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 /**
  * Detect the current chat completion source and model from ST settings.
  * Used only as fallback when CMRS is unavailable and no profile is specified.
@@ -103,7 +114,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
     // Priority 1: Use CMRS with the specified profile (safe, no profile switching)
     if (profileId) {
         try {
-            const result = await callViaCMRS(profileId, messages);
+            const result = await withTimeout(callViaCMRS(profileId, messages), LLM_TIMEOUT_MS);
             return result;
         } catch (cmrsErr) {
             addDebugLog('info', `CMRS failed (${cmrsErr.message}), falling back to direct proxy`);
@@ -112,7 +123,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
 
     // Priority 2: Direct ST proxy fetch (reads current DOM config)
     try {
-        const result = await callSTProxy(messages);
+        const result = await withTimeout(callSTProxy(messages), LLM_TIMEOUT_MS);
         return result;
     } catch (proxyErr) {
         addDebugLog('info', `ST proxy failed (${proxyErr.message}), falling back to generateQuietPrompt`);
@@ -121,7 +132,10 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
     // Priority 3: generateQuietPrompt (includes chat context, but better than nothing)
     const context = SillyTavern.getContext();
     const fallbackPrompt = `${systemPrompt}\n\n${userPrompt}`;
-    const result = await context.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true });
+    const result = await withTimeout(
+        context.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
+        LLM_TIMEOUT_MS,
+    );
     return typeof result === 'string' ? result : String(result || '');
 }
 
