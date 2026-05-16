@@ -19,6 +19,7 @@ let interceptedGeneration = false;
 let isInternalCall = false; // Guard: true when our agents are making LLM calls
 let isOurAbort = false; // Guard: true when WE called /abort (so GENERATION_STOPPED ignores it)
 let chatChangedAt = 0; // Timestamp of last chat change (cooldown)
+let lastTriggeredUserMsgIndex = -1; // Anti-loop: index of user message that last triggered pipeline
 
 /**
  * Get recent chat messages
@@ -262,6 +263,23 @@ export function initPipeline() {
             return;
         }
 
+        // ANTI-LOOP: Only trigger if the last message is a new user message we haven't processed
+        const chat = context.chat;
+        if (!chat || chat.length === 0) return;
+
+        const lastMsg = chat[chat.length - 1];
+        if (!lastMsg || !lastMsg.is_user) {
+            addDebugLog('info', 'Skipping pipeline (last message is not from user)');
+            return;
+        }
+
+        const lastMsgIndex = chat.length - 1;
+        if (lastMsgIndex <= lastTriggeredUserMsgIndex) {
+            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastMsgIndex})`);
+            return;
+        }
+
+        lastTriggeredUserMsgIndex = lastMsgIndex;
         pipelineActive = true;
         addDebugLog('info', '--- Pipeline triggered: intercepting generation ---');
 
@@ -365,6 +383,7 @@ export function initPipeline() {
         isInternalCall = false;
         isOurAbort = false;
         lastProcessedMessageIndex = -1;
+        lastTriggeredUserMsgIndex = -1;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
