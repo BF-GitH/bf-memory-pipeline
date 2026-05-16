@@ -264,13 +264,14 @@ export function initPipeline() {
         }
 
         // ANTI-LOOP: Only trigger if there's a new user message we haven't processed
-        const chat = context.chat;
-        if (!chat || chat.length === 0) return;
+        // Use fresh context (not the stale closure from init) in case chat array was replaced
+        const freshChat = SillyTavern.getContext().chat;
+        if (!freshChat || freshChat.length === 0) return;
 
         // Find the most recent user message (ST may have already added an AI placeholder)
         let lastUserMsgIndex = -1;
-        for (let i = chat.length - 1; i >= 0; i--) {
-            if (chat[i] && chat[i].is_user) {
+        for (let i = freshChat.length - 1; i >= 0; i--) {
+            if (freshChat[i] && freshChat[i].is_user) {
                 lastUserMsgIndex = i;
                 break;
             }
@@ -387,11 +388,24 @@ export function initPipeline() {
         isInternalCall = false;
         isOurAbort = false;
         lastProcessedMessageIndex = -1;
-        lastTriggeredUserMsgIndex = -1;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
-        addDebugLog('info', 'Chat changed - pipeline state reset');
+
+        // Initialize lastTriggeredUserMsgIndex to current last user message
+        // so only NEW messages (sent after chat load) trigger the pipeline
+        const currentChat = SillyTavern.getContext().chat;
+        lastTriggeredUserMsgIndex = -1;
+        if (currentChat && currentChat.length > 0) {
+            for (let i = currentChat.length - 1; i >= 0; i--) {
+                if (currentChat[i] && currentChat[i].is_user) {
+                    lastTriggeredUserMsgIndex = i;
+                    break;
+                }
+            }
+        }
+
+        addDebugLog('info', `Chat changed - pipeline state reset (lastUserMsg=${lastTriggeredUserMsgIndex})`);
     });
 
     console.log('[BFMemory] Pipeline initialized (blocking mode)');
