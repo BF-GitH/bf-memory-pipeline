@@ -16,6 +16,7 @@ let lastProcessedMessageIndex = -1;
 let isInternalCall = false; // true when our agents are making LLM calls
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
+let lastInjection = null; // cached injection text for swipes/regens
 
 /**
  * Get recent chat messages
@@ -104,7 +105,10 @@ function shouldRunPipeline(data) {
     if (!settings || !settings.enabled) return false;
 
     // Skip our own internal LLM calls (Agent 1, Agent 3)
-    if (isInternalCall) return false;
+    if (isInternalCall) {
+        addDebugLog('info', 'Skipping pipeline (internal agent call)');
+        return false;
+    }
 
     // Skip dry runs
     if (data?.dryRun) return false;
@@ -285,6 +289,7 @@ async function runPipelineInline(data) {
 
     // --- Build & Inject ---
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted);
+    lastInjection = injection; // Cache for swipes/regens
     addDebugLog('info', `Injection ready (${injection.length} chars) in ${Date.now() - startTime}ms`);
 
     const success = injectMemoryContext(data, injection);
@@ -308,15 +313,39 @@ export function initPipeline() {
     // ST's EventEmitter awaits each listener, so this blocks generation until we're done.
     // No abort. No re-trigger. Pipeline runs inline.
     eventSource.on(eventTypes.CHAT_COMPLETION_PROMPT_READY, async (data) => {
-        if (!shouldRunPipeline(data)) return;
-        await runPipelineInline(data);
+        if (shouldRunPipeline(data)) {
+            await runPipelineInline(data);
+            return;
+        }
+
+        // Swipe/regen: re-inject cached facts (no agents, instant)
+        if (lastInjection && !isInternalCall && !data?.dryRun) {
+            const settings = getSettings();
+            if (!settings || !settings.enabled) return;
+
+            const success = injectMemoryContext(data, lastInjection);
+            if (success) {
+                addDebugLog('info', `Swipe/regen: re-injected cached facts (${lastInjection.length} chars)`);
+            }
+        }
     });
 
     // Handle text completion APIs (same inline blocking approach)
     eventSource.on(eventTypes.GENERATE_AFTER_DATA, async (data, dryRun) => {
         if (dryRun || isInternalCall) return;
-        if (!shouldRunPipeline({ dryRun: false })) return;
-        await runPipelineInline(data);
+        if (shouldRunPipeline({ dryRun: false })) {
+            await runPipelineInline(data);
+            return;
+        }
+
+        // Swipe/regen: re-inject cached facts
+        if (lastInjection && data && typeof data.prompt === 'string') {
+            const settings = getSettings();
+            if (!settings || !settings.enabled) return;
+
+            data.prompt = lastInjection + '\n\n' + data.prompt;
+            addDebugLog('info', `Swipe/regen (text): re-injected cached facts (${lastInjection.length} chars)`);
+        }
     });
 
     // After generation complete: reset status
@@ -328,6 +357,7 @@ export function initPipeline() {
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
+        lastInjection = null;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
