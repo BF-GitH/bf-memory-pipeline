@@ -263,23 +263,27 @@ export function initPipeline() {
             return;
         }
 
-        // ANTI-LOOP: Only trigger if the last message is a new user message we haven't processed
+        // ANTI-LOOP: Only trigger if there's a new user message we haven't processed
         const chat = context.chat;
         if (!chat || chat.length === 0) return;
 
-        const lastMsg = chat[chat.length - 1];
-        if (!lastMsg || !lastMsg.is_user) {
-            addDebugLog('info', 'Skipping pipeline (last message is not from user)');
+        // Find the most recent user message (ST may have already added an AI placeholder)
+        let lastUserMsgIndex = -1;
+        for (let i = chat.length - 1; i >= 0; i--) {
+            if (chat[i] && chat[i].is_user) {
+                lastUserMsgIndex = i;
+                break;
+            }
+        }
+
+        if (lastUserMsgIndex < 0) return;
+
+        if (lastUserMsgIndex <= lastTriggeredUserMsgIndex) {
+            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
             return;
         }
 
-        const lastMsgIndex = chat.length - 1;
-        if (lastMsgIndex <= lastTriggeredUserMsgIndex) {
-            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastMsgIndex})`);
-            return;
-        }
-
-        lastTriggeredUserMsgIndex = lastMsgIndex;
+        lastTriggeredUserMsgIndex = lastUserMsgIndex;
         pipelineActive = true;
         addDebugLog('info', '--- Pipeline triggered: intercepting generation ---');
 
