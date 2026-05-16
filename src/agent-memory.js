@@ -30,16 +30,18 @@ ONLY STORE facts that are:
 BUDGET: Most messages have 0 facts worth storing. Rarely 1-2. Maximum 3 per message. When in doubt, store NOTHING.
 
 FIXED CATEGORIES (use ONLY these):
-- Identity: name, species, appearance, age, abilities, personality
-- Relationships: how characters feel about each other, promises, conflicts
+- Identity: name, species, appearance, age, abilities, personality traits
+- Relationships: how characters feel about each other, promises, conflicts, trust levels
 - World: locations, lore, rules, important objects, organizations
 - History: backstory reveals, key past events, turning points
 - Status: lasting state changes (injuries, possessions, living situation)
+- Behavior: recurring habits, speech patterns, coping mechanisms, routines (NOT one-time actions)
+- Dialogue: significant promises, confessions, lies, recurring phrases, important reveals (NOT ordinary conversation)
 
 FACT FORMAT:
 {
   "action": "add" | "update" | "delete",
-  "category": "Identity" | "Relationships" | "World" | "History" | "Status",
+  "category": "Identity" | "Relationships" | "World" | "History" | "Status" | "Behavior" | "Dialogue",
   "key": "fact_identifier",
   "value": "concise fact description",
   "tags": ["tag1", "tag2"],
