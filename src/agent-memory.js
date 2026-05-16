@@ -4,6 +4,7 @@
 
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { addDebugLog } from './settings.js';
+import { callAgentLLM } from './llm-call.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_MEMORY_PROMPT)
 function getSettingsSafe() {
@@ -63,18 +64,11 @@ No new facts to record.`;
  * @returns {Promise<MemoryUpdateResult>}
  */
 export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases) {
-    const context = SillyTavern.getContext();
-
-    const prompt = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
-    addDebugLog('info', `Agent 3 prompt length: ${prompt.length} chars`);
+    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
+    addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const result = await context.generateQuietPrompt({
-            quietPrompt: prompt,
-            skipWIAN: true,
-        });
-
-        const resultStr = typeof result === 'string' ? result : String(result || '');
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt);
         addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 400)}${resultStr.length > 400 ? '...' : ''}"`);
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
@@ -87,8 +81,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 
         return parsed;
     } catch (error) {
-        const detail = error?.response ? ` [HTTP ${error.response.status}]` : '';
-        addDebugLog('fail', `Agent 3 error${detail}: ${error.message || error}`);
+        addDebugLog('fail', `Agent 3 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 3 (Memory) error:', error);
         return { updates: [], summary: '', raw: '', error: error.message };
     }
@@ -100,34 +93,24 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
-    const parts = [
-        '```system',
-        'MODE: FACT EXTRACTION ENGINE (not roleplay)',
-        'TASK: Extract facts from the message below into structured JSON.',
-        'OUTPUT: Only #Facts: and #Summary: sections. No prose, no actions, no dialogue.',
-        '```',
-        '',
-        sysPrompt,
-        '',
-    ];
+    // System message: pure instruction
+    const systemPrompt = sysPrompt;
 
+    // User message: data to analyze
+    const dataParts = [];
     if (characterInfo) {
-        parts.push('```character_info', characterInfo, '```', '');
+        dataParts.push(`## Character Info\n${characterInfo}`);
     }
 
     const dbSummary = summarizeDatabases(existingDatabases);
     if (dbSummary) {
-        parts.push('```existing_databases', dbSummary, '```', '');
+        dataParts.push(`## Existing Databases\n${dbSummary}`);
     }
 
-    parts.push('```message_to_analyze', messageText, '```', '');
-    parts.push('Now output ONLY these two sections (no other text):');
-    parts.push('#Facts:');
-    parts.push('[one JSON object per line, or (none)]');
-    parts.push('#Summary:');
-    parts.push('[1-2 sentences about what changed]');
+    dataParts.push(`## Message to Analyze\n${messageText}`);
+    dataParts.push('\nNow output ONLY #Facts: and #Summary: sections.');
 
-    return parts.join('\n');
+    return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
 
 /**

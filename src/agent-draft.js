@@ -3,6 +3,7 @@
 // Outputs: draft reply idea + list of needed fact categories
 
 import { addDebugLog } from './settings.js';
+import { callAgentLLM } from './llm-call.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_DRAFT_PROMPT)
 function getSettingsSafe() {
@@ -37,24 +38,15 @@ RULES:
  * @returns {Promise<DraftResult>}
  */
 export async function runDraftAgent(recentChat, characterInfo, userPersona) {
-    const context = SillyTavern.getContext();
-
-    const prompt = buildDraftPrompt(recentChat, characterInfo, userPersona);
-
-    addDebugLog('info', `Agent 1 prompt length: ${prompt.length} chars`);
+    const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona);
+    addDebugLog('info', `Agent 1 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const result = await context.generateQuietPrompt({
-            quietPrompt: prompt,
-            skipWIAN: true,
-        });
-
-        const resultStr = typeof result === 'string' ? result : String(result || '');
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt);
         addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 300)}${resultStr.length > 300 ? '...' : ''}"`);
         return parseDraftResult(resultStr);
     } catch (error) {
-        const detail = error?.response ? ` [HTTP ${error.response.status}]` : '';
-        addDebugLog('fail', `Agent 1 error${detail}: ${error.message || error}`);
+        addDebugLog('fail', `Agent 1 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
         return { draft: '', neededFacts: [], raw: '', error: error.message };
     }
@@ -64,36 +56,23 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
  * Build the prompt for Agent 1
  */
 function buildDraftPrompt(recentChat, characterInfo, userPersona) {
-    // Structure the prompt so the model cannot mistake it for RP continuation.
-    // Key: instruction at START and END, chat wrapped in code fence, no narrative flow.
     const sysPrompt = getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT;
 
-    const parts = [
-        '```system',
-        'MODE: ANALYTICAL ASSISTANT (not roleplay)',
-        'TASK: Read the chat log below and produce a structured plan.',
-        'OUTPUT: Only the exact format shown in instructions. No prose, no actions, no dialogue.',
-        '```',
-        '',
-        sysPrompt,
-        '',
-    ];
+    // System message: pure instruction, no RP content
+    const systemPrompt = sysPrompt;
 
+    // User message: all the data the agent needs to analyze
+    const dataParts = [];
     if (characterInfo) {
-        parts.push('```character_info', characterInfo, '```', '');
+        dataParts.push(`## Character Info\n${characterInfo}`);
     }
     if (userPersona) {
-        parts.push('```user_persona', userPersona, '```', '');
+        dataParts.push(`## User Persona\n${userPersona}`);
     }
+    dataParts.push(`## Recent Chat\n${recentChat}`);
+    dataParts.push('\nNow output ONLY #Draft: and #Needed_Facts: sections.');
 
-    parts.push('```chat_log', recentChat, '```', '');
-    parts.push('Now output ONLY these two sections (no other text):');
-    parts.push('#Draft:');
-    parts.push('[your 1-3 sentence plan here]');
-    parts.push('#Needed_Facts:');
-    parts.push('[semicolon-separated keywords here]');
-
-    return parts.join('\n');
+    return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
 
 /**
