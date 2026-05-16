@@ -185,14 +185,40 @@ export function removeFact(db, key) {
 }
 
 /**
+ * Get character names to filter from keyword matching (they appear in every fact)
+ * @returns {Set<string>} lowercased character name words
+ */
+function getCharacterNameWords() {
+    const names = new Set();
+    try {
+        const context = getContext();
+        const charName = context.characters?.[context.characterId]?.name || '';
+        const userName = context.name1 || '';
+        for (const name of [charName, userName]) {
+            for (const word of name.split(/\s+/)) {
+                if (word.length > 2) names.add(word.toLowerCase());
+            }
+        }
+    } catch (e) { /* ignore */ }
+    return names;
+}
+
+/**
  * Search across all databases for facts matching keywords
  * @param {Object<string, DatabaseSchema>} databases - All databases
  * @param {string[]} keywords - Keywords to search for
  * @returns {Array<{fact: FactSchema, category: string, tier: string}>}
  */
 export function searchFacts(databases, keywords) {
+    const MAX_PRIMARY = 8;
     const results = [];
+    const nameWords = getCharacterNameWords();
     const lowerKeywords = keywords.map(k => k.toLowerCase());
+
+    // Pre-process keywords: split into words, filter out char names and short words
+    const keywordWordSets = lowerKeywords.map(kw => {
+        return kw.split(/\s+/).filter(w => w.length > 3 && !nameWords.has(w));
+    }).filter(words => words.length > 0);
 
     for (const [category, db] of Object.entries(databases)) {
         const categoryLower = category.toLowerCase();
@@ -200,12 +226,16 @@ export function searchFacts(databases, keywords) {
         for (const fact of db.facts) {
             const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')}`.toLowerCase();
 
-            // Check for direct keyword match (primary)
-            // Split keyword phrases into words for matching (e.g. "Seraphina past" -> ["seraphina", "past"])
-            const directMatch = lowerKeywords.some(kw => {
-                const words = kw.split(/\s+/).filter(w => w.length > 2);
-                return words.some(word => factText.includes(word) || categoryLower.includes(word));
+            // Direct keyword match: require phrase-level relevance
+            // Single-word keywords: that word must match
+            // Multi-word keywords: at least 2 words must match (not just any one)
+            const directMatch = keywordWordSets.some(words => {
+                if (words.length === 0) return false;
+                const matchCount = words.filter(word => factText.includes(word) || categoryLower.includes(word)).length;
+                if (words.length === 1) return matchCount >= 1;
+                return matchCount >= 2; // Multi-word phrases need 2+ word hits
             });
+
             if (directMatch) {
                 results.push({ fact, category, tier: 'primary' });
                 continue;
@@ -215,10 +245,9 @@ export function searchFacts(databases, keywords) {
             if (fact.relationships) {
                 const secondaryMatch = (fact.relationships.secondary || []).some(ref => {
                     const refLower = ref.toLowerCase();
-                    return lowerKeywords.some(kw => {
-                        const words = kw.split(/\s+/).filter(w => w.length > 2);
-                        return words.some(word => refLower.includes(word));
-                    });
+                    return keywordWordSets.some(words =>
+                        words.some(word => refLower.includes(word))
+                    );
                 });
                 if (secondaryMatch) {
                     results.push({ fact, category, tier: 'secondary' });
@@ -227,13 +256,54 @@ export function searchFacts(databases, keywords) {
 
                 const tertiaryMatch = (fact.relationships.tertiary || []).some(ref => {
                     const refLower = ref.toLowerCase();
-                    return lowerKeywords.some(kw => {
-                        const words = kw.split(/\s+/).filter(w => w.length > 2);
-                        return words.some(word => refLower.includes(word));
-                    });
+                    return keywordWordSets.some(words =>
+                        words.some(word => refLower.includes(word))
+                    );
                 });
                 if (tertiaryMatch) {
                     results.push({ fact, category, tier: 'tertiary' });
+                }
+            }
+        }
+    }
+
+    // Cap primary results: if too many, demote extras to secondary
+    const primaryResults = results.filter(r => r.tier === 'primary');
+    if (primaryResults.length > MAX_PRIMARY) {
+        // Keep the first MAX_PRIMARY as primary, demote the rest
+        let primaryCount = 0;
+        for (const result of results) {
+            if (result.tier === 'primary') {
+                primaryCount++;
+                if (primaryCount > MAX_PRIMARY) {
+                    result.tier = 'secondary';
+                }
+            }
+        }
+    }
+
+    // Relationship-based expansion: facts related to primary hits get promoted
+    const primaryFacts = results.filter(r => r.tier === 'primary');
+    const alreadyFound = new Set(results.map(r => `${r.category}:${r.fact.key}`));
+
+    for (const primaryResult of primaryFacts) {
+        if (!primaryResult.fact.relationships) continue;
+        const relatedRefs = [
+            ...(primaryResult.fact.relationships.primary || []),
+            ...(primaryResult.fact.relationships.secondary || []),
+        ];
+
+        // Search remaining facts for relationship matches
+        for (const [category, db] of Object.entries(databases)) {
+            for (const fact of db.facts) {
+                const id = `${category}:${fact.key}`;
+                if (alreadyFound.has(id)) continue;
+
+                const factIdentifiers = `${category} ${fact.key} ${(fact.tags || []).join(' ')}`.toLowerCase();
+                const matched = relatedRefs.some(ref => factIdentifiers.includes(ref.toLowerCase()));
+                if (matched) {
+                    results.push({ fact, category, tier: 'secondary' });
+                    alreadyFound.add(id);
                 }
             }
         }

@@ -7,7 +7,7 @@ import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
-import { runWithMemoryProfile } from './profiler.js';
+import { getMemoryProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus } from './settings.js';
 
@@ -17,6 +17,7 @@ let isInternalCall = false; // true when our agents are making LLM calls
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
 let lastInjection = null; // cached injection text for swipes/regens
+let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
 
 /**
  * Get recent chat messages
@@ -190,41 +191,49 @@ async function runPipelineInline(data) {
     const formattedChat = formatMessagesForDraft(recentMessages);
 
     // --- Run Agent 3 + Agent 1 in PARALLEL ---
+    // SAFETY: We use CMRS (ConnectionManagerRequestService) to call the memory profile
+    // directly by ID, WITHOUT switching the active UI profile. This is safe during
+    // mid-generation because it doesn't touch the DOM or active connection state.
     updateStatus('running', 'Updating memory + drafting...');
     addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) in parallel...');
+
+    const memoryProfileId = getMemoryProfileId(settings);
+    if (memoryProfileId) {
+        addDebugLog('info', `Using memory profile "${memoryProfileId}" via CMRS (no profile switching)`);
+    } else {
+        addDebugLog('info', 'No memory profile configured, agents will use current connection');
+    }
 
     let draftResult = null;
     let memoryResult = null;
 
     try {
         isInternalCall = true;
-        await runWithMemoryProfile(async () => {
-            const promises = [];
+        const promises = [];
 
-            // Agent 1: Draft
+        // Agent 1: Draft
+        promises.push(
+            runDraftAgent(formattedChat, characterInfo, userPersona, memoryProfileId)
+                .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
+        );
+
+        // Agent 3: Memory update
+        if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
+            const targetMessage = chat[memoryTargetIndex];
+            const role = targetMessage.is_user ? 'USER' : 'AI';
+            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}: ${targetMessage.mes}`);
+
+            const databases = await getAllDatabases();
             promises.push(
-                runDraftAgent(formattedChat, characterInfo, userPersona)
-                    .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
+                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, memoryProfileId)
+                    .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
             );
+        } else {
+            addDebugLog('info', `Agent 3: no new AI message to process (target=${memoryTargetIndex}, last=${lastProcessedMessageIndex})`);
+            promises.push(Promise.resolve(null));
+        }
 
-            // Agent 3: Memory update
-            if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
-                const targetMessage = chat[memoryTargetIndex];
-                const role = targetMessage.is_user ? 'USER' : 'AI';
-                addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}: ${targetMessage.mes}`);
-
-                const databases = await getAllDatabases();
-                promises.push(
-                    runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases)
-                        .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
-                );
-            } else {
-                addDebugLog('info', `Agent 3: no new AI message to process (target=${memoryTargetIndex}, last=${lastProcessedMessageIndex})`);
-                promises.push(Promise.resolve(null));
-            }
-
-            [draftResult, memoryResult] = await Promise.all(promises);
-        }, settings);
+        [draftResult, memoryResult] = await Promise.all(promises);
     } catch (error) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
         hideWorkingIndicator();
@@ -295,6 +304,7 @@ async function runPipelineInline(data) {
     const success = injectMemoryContext(data, injection);
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
+        pipelineJustInjected = true; // prevent double-injection on second event fire
     } else {
         addDebugLog('fail', 'Failed to inject memory context');
     }
@@ -319,7 +329,8 @@ export function initPipeline() {
         }
 
         // Swipe/regen: re-inject cached facts (no agents, instant)
-        if (lastInjection && !isInternalCall && !data?.dryRun) {
+        // Skip if pipeline just injected in this same generation cycle (double-fire guard)
+        if (lastInjection && !isInternalCall && !data?.dryRun && !pipelineJustInjected) {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
 
@@ -348,8 +359,9 @@ export function initPipeline() {
         }
     });
 
-    // After generation complete: reset status
+    // After generation complete: reset status and double-fire guard
     eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
+        pipelineJustInjected = false;
         updateStatus('idle');
     });
 
@@ -358,6 +370,7 @@ export function initPipeline() {
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
         lastInjection = null;
+        pipelineJustInjected = false;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');

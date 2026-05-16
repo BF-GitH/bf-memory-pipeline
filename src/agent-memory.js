@@ -68,12 +68,12 @@ OUTPUT FORMAT:
  * @param {Object} existingDatabases - Current state of all databases
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases) {
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null) {
     const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt);
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
         addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars):\n${resultStr}`);
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex);

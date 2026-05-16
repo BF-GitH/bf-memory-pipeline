@@ -37,12 +37,12 @@ RULES:
  * @param {string} userPersona - User's persona description
  * @returns {Promise<DraftResult>}
  */
-export async function runDraftAgent(recentChat, characterInfo, userPersona) {
+export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null) {
     const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona);
     addDebugLog('info', `Agent 1 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt);
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
         addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars):\n${resultStr}`);
         return parseDraftResult(resultStr);
     } catch (error) {

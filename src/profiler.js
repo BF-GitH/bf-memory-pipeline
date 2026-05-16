@@ -1,5 +1,12 @@
-// BF Memory Pipeline - Profile Switching Module
-// Shared by Agent 1 (Drafter) and Agent 3 (Memory Updater)
+// BF Memory Pipeline - Profile Module
+// Provides memory profile ID for Agent 1 (Drafter) and Agent 3 (Memory Updater).
+//
+// SAFETY NOTE (v0.2.0): This module NO LONGER switches the active UI profile.
+// Previously, runWithMemoryProfile() would swap the DOM profile dropdown during
+// CHAT_COMPLETION_PROMPT_READY, which was unsafe because ST was mid-generation.
+// Now we pass the profile ID to callAgentLLM(), which uses
+// ConnectionManagerRequestService (CMRS) to send requests directly via the
+// specified profile without touching the DOM or active connection state.
 
 import { addDebugLog } from './settings.js';
 
@@ -28,92 +35,34 @@ export function getCurrentProfileId() {
     }
 }
 
-export async function swapProfile(targetId) {
-    try {
-        const current = getExtensionSettings()?.connectionManager?.selectedProfile;
-        const profiles = getExtensionSettings()?.connectionManager?.profiles;
-
-        if (current === targetId) return false;
-
-        if (!Array.isArray(profiles) || profiles.findIndex(p => p.id === targetId) < 0) {
-            console.error('[BFMemory] Invalid profile ID:', targetId);
-            return false;
-        }
-
-        const dropdown = document.getElementById('connection_profiles');
-        if (!dropdown) return false;
-
-        $('#connection_profiles').val(targetId);
-        dropdown.dispatchEvent(new Event('change'));
-
-        await new Promise((resolve) => {
-            getContext().eventSource.once(
-                getContext().eventTypes.CONNECTION_PROFILE_LOADED,
-                resolve,
-            );
-        });
-
-        return current;
-    } catch (error) {
-        console.error('[BFMemory] Error swapping profile:', error);
-        return false;
+/**
+ * Get the memory profile ID from settings, or null if not configured.
+ * This does NOT switch any profile - just returns the ID for use with CMRS.
+ * @param {object} settings - Extension settings
+ * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
+ */
+export function getMemoryProfileId(settings) {
+    if (!settings?.useMemoryProfile || !settings?.memoryProfile) {
+        return null;
     }
-}
 
-export async function restoreProfile(profileId) {
-    if (!profileId) return false;
-
-    try {
-        const dropdown = document.getElementById('connection_profiles');
-        if (!dropdown) return false;
-
-        const loadPromise = new Promise((resolve) => {
-            const timeout = setTimeout(() => resolve(), 3000);
-            getContext().eventSource.once(
-                getContext().eventTypes.CONNECTION_PROFILE_LOADED,
-                () => { clearTimeout(timeout); resolve(); },
-            );
-        });
-
-        $('#connection_profiles').val(profileId);
-        dropdown.dispatchEvent(new Event('change'));
-        await loadPromise;
-        await new Promise(resolve => setTimeout(resolve, 500));
-        return true;
-    } catch (error) {
-        console.error('[BFMemory] Error restoring profile:', error);
-        return false;
+    // Verify the profile still exists
+    const profiles = getConnectionProfiles();
+    const exists = profiles.some(p => p.id === settings.memoryProfile);
+    if (!exists) {
+        addDebugLog('fail', `Memory profile "${settings.memoryProfile}" not found in connection manager`);
+        return null;
     }
+
+    return settings.memoryProfile;
 }
 
 /**
- * Run an async function using the memory profile, then restore.
- * Agent 1 (Drafter) and Agent 3 (Memory Updater) use this.
+ * @deprecated Use getMemoryProfileId() + pass profileId to callAgentLLM() instead.
+ * Kept for backward compatibility but now just runs the function directly.
+ * No profile switching occurs.
  */
 export async function runWithMemoryProfile(fn, settings) {
-    if (!settings.useMemoryProfile || !settings.memoryProfile) {
-        addDebugLog('info', 'No memory profile configured, using current profile');
-        return await fn();
-    }
-
-    const originalProfile = getCurrentProfileId();
-    addDebugLog('info', `Switching profile: ${originalProfile || '(none)'} -> ${settings.memoryProfile}`);
-    const swapped = await swapProfile(settings.memoryProfile);
-
-    if (swapped === false && getCurrentProfileId() !== settings.memoryProfile) {
-        addDebugLog('fail', `Profile switch failed, running with current profile`);
-        return await fn();
-    }
-
-    addDebugLog('pass', `Profile switched to memory profile`);
-    await new Promise(resolve => setTimeout(resolve, 500));
-
-    try {
-        return await fn();
-    } finally {
-        if (originalProfile && swapped !== false) {
-            addDebugLog('info', `Restoring original profile: ${originalProfile}`);
-            await restoreProfile(originalProfile);
-        }
-    }
+    addDebugLog('info', '[DEPRECATED] runWithMemoryProfile called - no profile switching performed');
+    return await fn();
 }
