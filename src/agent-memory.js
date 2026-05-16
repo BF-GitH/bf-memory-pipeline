@@ -1,0 +1,223 @@
+// BF Memory Pipeline - Agent 3: Memory Updater
+// Runs AFTER the response is displayed, processes N-1 message
+// Updates fact databases, tracks who knows what, manages cross-references
+
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
+
+const MEMORY_UPDATE_PROMPT = `You are a fact extraction and database maintenance agent for a roleplay. Your job is to:
+1. Read the new message and extract any NEW facts or UPDATED facts
+2. Determine which characters now know each fact
+3. Categorize facts into appropriate databases
+4. Identify relationships between facts
+
+DATABASE CATEGORIES - use existing ones when possible, create new ones only when needed.
+Each database has max 50 facts. Keep facts concise.
+
+FACT FORMAT:
+For each fact, output a JSON object:
+{
+  "action": "add" | "update" | "delete",
+  "category": "CategoryName",
+  "key": "fact_identifier",
+  "value": "concise fact description",
+  "tags": ["tag1", "tag2"],
+  "knownBy": ["Character1", "Character2"],
+  "relationships": {
+    "primary": ["DirectlyRelatedCategory"],
+    "secondary": ["SomewhatRelatedCategory"],
+    "tertiary": ["DistantlyRelatedCategory"]
+  }
+}
+
+RELATIONSHIP RULES:
+- Primary: Direct logical connection (apple -> Food, apartment -> Location)
+- Secondary: Contextual connection (restaurant -> Food_Preferences, apartment -> Furniture)
+- Tertiary: Distant/thematic (food mention -> that restaurant they went to once)
+
+OUTPUT FORMAT:
+#Facts:
+[One JSON object per line, one per fact to add/update/delete]
+
+#Summary:
+[1-2 sentences describing what changed]
+
+If nothing needs updating, output:
+#Facts:
+(none)
+
+#Summary:
+No new facts to record.`;
+
+/**
+ * Run Agent 3: Analyze message and update databases
+ * @param {string} messageText - The message to analyze
+ * @param {number} messageIndex - Message index (for source tracking)
+ * @param {string} characterInfo - Character card info
+ * @param {Object} existingDatabases - Current state of all databases
+ * @returns {Promise<MemoryUpdateResult>}
+ */
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases) {
+    const context = SillyTavern.getContext();
+
+    const prompt = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
+
+    try {
+        const result = await context.generateQuietPrompt({
+            quietPrompt: prompt,
+            skipWIAN: true,
+        });
+
+        const resultStr = typeof result === 'string' ? result : String(result || '');
+        const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
+
+        // Apply updates to databases
+        if (parsed.updates.length > 0) {
+            await applyUpdates(parsed.updates, existingDatabases);
+        }
+
+        return parsed;
+    } catch (error) {
+        console.error('[BFMemory] Agent 3 (Memory) error:', error);
+        return { updates: [], summary: '', raw: '', error: error.message };
+    }
+}
+
+/**
+ * Build the prompt for Agent 3
+ */
+function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
+    let prompt = MEMORY_UPDATE_PROMPT + '\n\n';
+
+    if (characterInfo) {
+        prompt += `#Character Info:\n${characterInfo}\n\n`;
+    }
+
+    // Include current database state (summarized)
+    const dbSummary = summarizeDatabases(existingDatabases);
+    if (dbSummary) {
+        prompt += `#Existing Databases:\n${dbSummary}\n\n`;
+    }
+
+    prompt += `#New Message to Analyze:\n${messageText}\n\n`;
+    prompt += 'Extract facts and output updates:';
+
+    return prompt;
+}
+
+/**
+ * Summarize databases for the prompt (keep it compact)
+ */
+function summarizeDatabases(databases) {
+    if (!databases || Object.keys(databases).length === 0) return '(No databases yet)';
+
+    const lines = [];
+    for (const [category, db] of Object.entries(databases)) {
+        const factKeys = db.facts.map(f => f.key).join(', ');
+        lines.push(`[${category}] (${db.facts.length} facts): ${factKeys}`);
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Parse Agent 3's response
+ */
+function parseMemoryUpdateResult(response, messageIndex) {
+    const result = {
+        updates: [],
+        summary: '',
+        raw: response,
+        error: null,
+    };
+
+    if (!response || !response.trim()) {
+        result.error = 'Empty response from memory updater';
+        return result;
+    }
+
+    // Extract summary
+    const summaryMatch = response.match(/#Summary:?\s*([\s\S]*?)$/i);
+    if (summaryMatch) {
+        result.summary = summaryMatch[1].trim();
+    }
+
+    // Extract facts section
+    const factsMatch = response.match(/#Facts:?\s*([\s\S]*?)(?=#Summary|$)/i);
+    if (!factsMatch || factsMatch[1].trim() === '(none)') {
+        return result;
+    }
+
+    // Parse each JSON line
+    const factsRaw = factsMatch[1].trim();
+    const jsonMatches = factsRaw.match(/\{[^}]+\}/g) || [];
+
+    for (const jsonStr of jsonMatches) {
+        try {
+            const fact = JSON.parse(jsonStr);
+            if (fact.category && fact.key) {
+                fact.source = `msg_${messageIndex}`;
+                result.updates.push(fact);
+            }
+        } catch {
+            // Try to be lenient with malformed JSON
+            console.warn('[BFMemory] Failed to parse fact JSON:', jsonStr.substring(0, 100));
+        }
+    }
+
+    console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
+    return result;
+}
+
+/**
+ * Apply parsed updates to databases and save
+ * @param {Array} updates - Parsed fact updates
+ * @param {Object} existingDatabases - Current databases
+ */
+async function applyUpdates(updates, existingDatabases) {
+    const modified = new Set();
+
+    for (const update of updates) {
+        const category = update.category;
+
+        // Get or create database
+        if (!existingDatabases[category]) {
+            existingDatabases[category] = createEmptyDatabase(category);
+        }
+
+        const db = existingDatabases[category];
+
+        if (update.action === 'delete') {
+            db.facts = db.facts.filter(f => f.key !== update.key);
+            db.updatedAt = Date.now();
+        } else {
+            // add or update
+            upsertFact(db, {
+                key: update.key,
+                value: update.value || '',
+                tags: update.tags || [],
+                knownBy: update.knownBy || [],
+                relationships: update.relationships || { primary: [], secondary: [], tertiary: [] },
+                source: update.source,
+            });
+        }
+
+        modified.add(category);
+    }
+
+    // Save all modified databases
+    for (const category of modified) {
+        try {
+            await saveDatabase(existingDatabases[category]);
+            console.log(`[BFMemory] Saved database: ${category}`);
+        } catch (error) {
+            console.error(`[BFMemory] Failed to save database ${category}:`, error);
+        }
+    }
+}
+
+/**
+ * @typedef {Object} MemoryUpdateResult
+ * @property {Array} updates - Parsed fact updates
+ * @property {string} summary - Human-readable summary
+ * @property {string} raw - Raw LLM response
+ * @property {string|null} error
+ */

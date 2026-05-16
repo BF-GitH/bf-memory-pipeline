@@ -1,0 +1,217 @@
+/* BF Memory Pipeline - Styles */
+
+/* Settings Panel */
+.bf-mem-settings {
+    padding: 5px;
+}
+
+.bf-mem-row {
+    margin: 8px 0;
+}
+
+.bf-mem-row-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    margin-top: 4px;
+}
+
+.bf-mem-hint {
+    display: block;
+    color: #888;
+    font-size: 11px;
+    margin-top: 2px;
+}
+
+.bf-mem-slider {
+    width: 100%;
+    margin-top: 4px;
+    cursor: pointer;
+}
+
+/* Debug Panel */
+.bf-mem-debug-panel {
+    margin-top: 10px;
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 5px;
+    padding: 8px;
+    max-height: 400px;
+    overflow: hidden;
+}
+
+.bf-mem-debug-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+}
+
+.bf-mem-debug-log {
+    max-height: 350px;
+    overflow-y: auto;
+    font-family: monospace;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.bf-mem-log-info { color: var(--SmartThemeBodyColor, #ccc); }
+.bf-mem-log-pass { color: #4caf50; }
+.bf-mem-log-fail { color: #f44336; }
+.bf-mem-log-time { color: #888; margin-right: 6px; }
+
+/* Review Popup */
+#bf_mem_review_overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.7);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.bf-mem-review-popup {
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-radius: 10px;
+    padding: 20px;
+    max-width: 700px;
+    width: 90%;
+    max-height: 80vh;
+    overflow-y: auto;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-review-popup h3 {
+    margin: 0 0 10px;
+}
+
+.bf-mem-review-popup p {
+    margin: 0 0 15px;
+    color: #aaa;
+    font-size: 13px;
+}
+
+.bf-mem-review-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-bottom: 15px;
+    max-height: 50vh;
+    overflow-y: auto;
+}
+
+.bf-mem-review-item {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    grid-template-rows: auto auto;
+    gap: 4px 8px;
+    padding: 8px;
+    border-radius: 5px;
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    position: relative;
+}
+
+.bf-mem-review-item.bf-mem-add { border-left: 3px solid #4caf50; }
+.bf-mem-review-item.bf-mem-update { border-left: 3px solid #ff9800; }
+.bf-mem-review-item.bf-mem-delete { border-left: 3px solid #f44336; }
+
+.bf-mem-action-badge {
+    font-size: 10px;
+    font-weight: bold;
+    padding: 2px 6px;
+    border-radius: 3px;
+    align-self: center;
+}
+
+.bf-mem-add .bf-mem-action-badge { background: #4caf50; color: #fff; }
+.bf-mem-update .bf-mem-action-badge { background: #ff9800; color: #fff; }
+.bf-mem-delete .bf-mem-action-badge { background: #f44336; color: #fff; }
+
+.bf-mem-category {
+    font-weight: bold;
+    align-self: center;
+    color: var(--SmartThemeBodyColor, #ddd);
+}
+
+.bf-mem-key {
+    grid-column: 3;
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 4px 6px;
+    font-size: 12px;
+}
+
+.bf-mem-value {
+    grid-column: 1 / -1;
+    background: var(--SmartThemeBlurTintColor, #222);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 3px;
+    color: var(--SmartThemeBodyColor, #eee);
+    padding: 4px 6px;
+    font-size: 12px;
+    resize: vertical;
+    min-height: 40px;
+}
+
+.bf-mem-known {
+    grid-column: 1 / -1;
+    font-size: 11px;
+    color: #888;
+}
+
+.bf-mem-remove-btn {
+    position: absolute;
+    top: 4px;
+    right: 4px;
+    background: none;
+    border: none;
+    color: #f44336;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 6px;
+}
+
+.bf-mem-review-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+/* Database Browser */
+.bf-mem-db-browser {
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+.bf-mem-db-section {
+    margin-bottom: 15px;
+}
+
+.bf-mem-db-section h4 {
+    margin: 0 0 5px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-db-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.bf-mem-db-table th,
+.bf-mem-db-table td {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    padding: 4px 8px;
+    text-align: left;
+}
+
+.bf-mem-db-table th {
+    background: var(--SmartThemeBlurTintColor, #333);
+    font-weight: bold;
+}
