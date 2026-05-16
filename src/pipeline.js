@@ -6,7 +6,7 @@ import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { runWithMemoryProfile } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus } from './settings.js';
@@ -15,7 +15,6 @@ import { getSettings, addDebugLog, updateStatus } from './settings.js';
 let pipelineActive = false;
 let pendingInjection = null;
 let lastProcessedMessageIndex = -1;
-let isMemoryUpdateRunning = false;
 let interceptedGeneration = false;
 let isInternalCall = false; // Guard: true when our agents are making LLM calls
 let isOurAbort = false; // Guard: true when WE called /abort (so GENERATION_STOPPED ignores it)
@@ -101,15 +100,18 @@ function hideWorkingIndicator() {
     if (indicator) indicator.style.display = 'none';
 }
 
-// --- Phase 1+2: Pre-generation (blocking) ---
+// --- Pre-generation: Agent 3 (memory) + Agent 1 (draft) in parallel, then fact retrieval ---
 
 async function runPreGeneration() {
     const settings = getSettings();
     if (!settings || !settings.enabled) return null;
 
     const startTime = Date.now();
-    addDebugLog('info', 'Phase 1: Running draft agent...');
-    updateStatus('running', 'Running draft agent...');
+    const context = SillyTavern.getContext();
+    const chat = context.chat;
+    const charName = context.characters?.[context.characterId]?.name || '(unknown)';
+    const characterInfo = getCharacterInfo();
+    const userPersona = getUserPersona();
 
     const recentMessages = getRecentMessages(settings.contextMessages || 5);
     if (recentMessages.length === 0) {
@@ -117,42 +119,105 @@ async function runPreGeneration() {
         return null;
     }
 
-    const formattedChat = formatMessagesForDraft(recentMessages);
-    const characterInfo = getCharacterInfo();
-    const userPersona = getUserPersona();
-
-    const context = SillyTavern.getContext();
-    const charName = context.characters?.[context.characterId]?.name || '(unknown)';
     addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Profile: ${settings.memoryProfile || '(default)'}`);
-    // Log all messages being sent to Agent 1
     for (let i = 0; i < recentMessages.length; i++) {
         const msg = recentMessages[i];
         const role = msg.is_user ? 'USER' : 'AI';
         addDebugLog('info', `  [${i + 1}/${recentMessages.length}] ${role}: ${msg.mes}`);
     }
 
-    // Agent 1: Draft (runs on memory profile)
-    let draftResult;
+    // Find the last AI message to process for memory (the one before the user's new message)
+    let memoryTargetIndex = -1;
+    for (let i = chat.length - 2; i >= 0; i--) {
+        if (chat[i] && !chat[i].is_user && chat[i].mes) {
+            memoryTargetIndex = i;
+            break;
+        }
+    }
+
+    const formattedChat = formatMessagesForDraft(recentMessages);
+
+    // --- Run Agent 3 + Agent 1 in PARALLEL (single profile switch) ---
+    updateStatus('running', 'Updating memory + drafting...');
+    addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) in parallel...');
+
+    let draftResult = null;
+    let memoryResult = null;
+
     try {
-        draftResult = await runWithMemoryProfile(async () => {
-            return await runDraftAgent(formattedChat, characterInfo, userPersona);
+        await runWithMemoryProfile(async () => {
+            const promises = [];
+
+            // Agent 1: Draft
+            promises.push(
+                runDraftAgent(formattedChat, characterInfo, userPersona)
+                    .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
+            );
+
+            // Agent 3: Memory update (if there's a valid target)
+            if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
+                const targetMessage = chat[memoryTargetIndex];
+                const role = targetMessage.is_user ? 'USER' : 'AI';
+                addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}: ${targetMessage.mes}`);
+
+                const databases = await getAllDatabases();
+                promises.push(
+                    runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases)
+                        .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
+                );
+            } else {
+                addDebugLog('info', `Agent 3: no new AI message to process (target=${memoryTargetIndex}, last=${lastProcessedMessageIndex})`);
+                promises.push(Promise.resolve(null));
+            }
+
+            [draftResult, memoryResult] = await Promise.all(promises);
         }, settings);
     } catch (error) {
-        addDebugLog('fail', `Agent 1 exception: ${error.message}`);
-        addDebugLog('fail', `Stack: ${(error.stack || '').split('\n').slice(0, 3).join(' | ')}`);
+        addDebugLog('fail', `Pipeline exception: ${error.message}`);
         return null;
     }
 
-    if (draftResult.error) {
-        addDebugLog('fail', `Agent 1 returned error: ${draftResult.error}`);
+    // --- Process Agent 3 results ---
+    if (memoryResult && !memoryResult.error) {
+        addDebugLog('info', `Agent 3: ${memoryResult.updates.length} updates. ${memoryResult.summary}`);
+        for (const update of memoryResult.updates) {
+            trackUpdate(update);
+        }
+        lastProcessedMessageIndex = memoryTargetIndex;
+
+        // Check if review popup is due
+        if (tickMessageCounter(settings.reviewInterval || 10)) {
+            addDebugLog('info', 'Review interval reached, showing popup');
+            await showReviewPopup(
+                () => addDebugLog('info', 'User accepted all memory updates'),
+                async (editedItems) => {
+                    addDebugLog('info', `User edited ${editedItems.length} items`);
+                    const dbs = await getAllDatabases();
+                    for (const item of editedItems) {
+                        if (!dbs[item.category]) {
+                            dbs[item.category] = createEmptyDatabase(item.category);
+                        }
+                        upsertFact(dbs[item.category], item);
+                        await saveDatabase(dbs[item.category]);
+                    }
+                },
+            );
+        }
+    } else if (memoryResult?.error) {
+        addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);
+    }
+
+    // --- Process Agent 1 results ---
+    if (!draftResult || draftResult.error) {
+        addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'}`);
         return null;
     }
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Needed facts: ${draftResult.neededFacts.join('; ')}`);
 
-    // Fact Retrieval (no LLM, pure DB lookup)
-    addDebugLog('info', 'Phase 2: Retrieving facts...');
+    // --- Fact Retrieval (pure DB lookup, uses Agent 3's fresh data) ---
+    addDebugLog('info', 'Retrieving facts...');
     updateStatus('running', 'Retrieving facts...');
 
     const contextKeywords = extractContextKeywords(recentMessages);
@@ -165,84 +230,6 @@ async function runPreGeneration() {
     addDebugLog('info', `Injection ready (${injection.length} chars) in ${Date.now() - startTime}ms`);
 
     return injection;
-}
-
-// --- Phase 3: Post-generation (non-blocking) ---
-
-async function runPostGeneration(currentMessageIndex) {
-    const settings = getSettings();
-    if (!settings || !settings.enabled) return;
-
-    // Only process message BEFORE current (N-1 for swipe safety)
-    const targetIndex = currentMessageIndex - 1;
-    if (targetIndex < 0) return;
-    if (targetIndex <= lastProcessedMessageIndex) return;
-    if (isMemoryUpdateRunning) {
-        addDebugLog('info', 'Memory update already running, skipping');
-        return;
-    }
-
-    const context = SillyTavern.getContext();
-    const targetMessage = context.chat?.[targetIndex];
-    if (!targetMessage || !targetMessage.mes) return;
-
-    const role = targetMessage.is_user ? 'USER' : 'AI';
-    addDebugLog('info', `Agent 3 target message [${role}]: ${targetMessage.mes}`);
-
-    isMemoryUpdateRunning = true;
-    isInternalCall = true;
-    addDebugLog('info', `Phase 3: Updating memory for message ${targetIndex}...`);
-
-    try {
-        const characterInfo = getCharacterInfo();
-        const databases = await getAllDatabases();
-
-        const result = await runWithMemoryProfile(async () => {
-            return await runMemoryUpdater(
-                targetMessage.mes,
-                targetIndex,
-                characterInfo,
-                databases,
-            );
-        }, settings);
-
-        if (result.error) {
-            addDebugLog('fail', `Agent 3 error: ${result.error}`);
-        } else {
-            addDebugLog('info', `Agent 3: ${result.updates.length} updates. ${result.summary}`);
-            for (const update of result.updates) {
-                trackUpdate(update);
-            }
-        }
-
-        lastProcessedMessageIndex = targetIndex;
-
-        // Check if review popup is due
-        if (tickMessageCounter(settings.reviewInterval || 10)) {
-            addDebugLog('info', 'Review interval reached, showing popup');
-            await showReviewPopup(
-                () => addDebugLog('info', 'User accepted all memory updates'),
-                async (editedItems) => {
-                    addDebugLog('info', `User edited ${editedItems.length} items`);
-                    const dbs = await getAllDatabases();
-                    for (const item of editedItems) {
-                        if (!dbs[item.category]) {
-                            const { createEmptyDatabase } = await import('./database.js');
-                            dbs[item.category] = createEmptyDatabase(item.category);
-                        }
-                        const { upsertFact } = await import('./database.js');
-                        upsertFact(dbs[item.category], item);
-                        await saveDatabase(dbs[item.category]);
-                    }
-                },
-            );
-        }
-    } catch (error) {
-        addDebugLog('fail', `Memory update error: ${error.message}`);
-    } finally {
-        isMemoryUpdateRunning = false;
-        isInternalCall = false;
-    }
 }
 
 // --- Main Pipeline Init ---
@@ -343,18 +330,10 @@ export function initPipeline() {
         }
     });
 
-    // AFTER generation complete: run memory updater in background
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, async (messageIndex) => {
+    // AFTER generation complete: reset pipeline state
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, async () => {
         pipelineActive = false;
         updateStatus('idle');
-
-        const settings = getSettings();
-        if (!settings || !settings.enabled) return;
-
-        // Delay to let message fully commit
-        setTimeout(() => {
-            runPostGeneration(messageIndex);
-        }, 1000);
     });
 
     // Handle generation stopped/aborted
@@ -380,7 +359,6 @@ export function initPipeline() {
         isInternalCall = false;
         isOurAbort = false;
         lastProcessedMessageIndex = -1;
-        isMemoryUpdateRunning = false;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
