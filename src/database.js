@@ -264,7 +264,7 @@ async function deleteAttachmentFile(url) {
 
 /**
  * @typedef {Object} FactSchema
- * @property {string} key - Fact identifier (e.g. "apple", "BigRamenSan")
+ * @property {string} key - Fact identifier (e.g. "coffee_preference", "first_meeting")
  * @property {string} value - Fact content
  * @property {string[]} tags - Cross-reference tags (e.g. ["allergy", "food"])
  * @property {string[]} knownBy - Characters who know this fact

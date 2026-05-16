@@ -103,7 +103,7 @@ function buildProfileDropdown(selectedId) {
     for (const profile of profiles) {
         const selected = profile.id === selectedId ? 'selected' : '';
         const name = profile.name || profile.id;
-        options += `<option value="${profile.id}" ${selected}>${name}</option>`;
+        options += `<option value="${escapeHtml(profile.id)}" ${selected}>${escapeHtml(name)}</option>`;
     }
     return options;
 }

@@ -30,9 +30,9 @@ For each fact, output a JSON object:
 }
 
 RELATIONSHIP RULES:
-- Primary: Direct logical connection (apple -> Food, apartment -> Location)
-- Secondary: Contextual connection (restaurant -> Food_Preferences, apartment -> Furniture)
-- Tertiary: Distant/thematic (food mention -> that restaurant they went to once)
+- Primary: Direct logical connection (e.g. a specific item -> its category)
+- Secondary: Contextual connection (e.g. a location -> things typically found there)
+- Tertiary: Distant/thematic connection (e.g. a topic is mentioned -> a past event involving that topic)
 
 OUTPUT FORMAT:
 #Facts:
