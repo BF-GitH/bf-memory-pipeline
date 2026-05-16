@@ -18,6 +18,7 @@ let lastProcessedMessageIndex = -1;
 let isMemoryUpdateRunning = false;
 let interceptedGeneration = false;
 let isInternalCall = false; // Guard: true when our agents are making LLM calls
+let isOurAbort = false; // Guard: true when WE called /abort (so GENERATION_STOPPED ignores it)
 let chatChangedAt = 0; // Timestamp of last chat change (cooldown)
 
 /**
@@ -272,9 +273,11 @@ export function initPipeline() {
         addDebugLog('info', '--- Pipeline triggered: intercepting generation ---');
 
         // Stop the current generation immediately
+        isOurAbort = true;
         try {
             await runner('/abort');
         } catch { /* may fail if nothing running yet, that's ok */ }
+        isOurAbort = false;
 
         showWorkingIndicator();
         updateStatus('running', 'Preparing facts...');
@@ -350,13 +353,16 @@ export function initPipeline() {
 
     // Handle generation stopped/aborted
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
+        // Ignore if WE called /abort (we're about to /trigger)
+        if (isOurAbort) return;
+
         if (pipelineActive && !interceptedGeneration) {
             // User aborted during our pipeline work
             pipelineActive = false;
             pendingInjection = null;
             hideWorkingIndicator();
             updateStatus('idle', 'Aborted');
-            addDebugLog('info', 'Generation stopped during pipeline');
+            addDebugLog('info', 'Generation stopped by user during pipeline');
         }
     });
 
@@ -366,6 +372,7 @@ export function initPipeline() {
         pendingInjection = null;
         interceptedGeneration = false;
         isInternalCall = false;
+        isOurAbort = false;
         lastProcessedMessageIndex = -1;
         isMemoryUpdateRunning = false;
         chatChangedAt = Date.now();

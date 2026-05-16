@@ -75,17 +75,17 @@ export async function saveDatabase(db) {
     const base64Data = btoa(unescape(encodeURIComponent(content)));
 
     const context = getContext();
-    const { extension_settings } = context;
+    const extensionSettings = context.extensionSettings;
 
     // Ensure character attachments array exists
-    if (!extension_settings.character_attachments) {
-        extension_settings.character_attachments = {};
+    if (!extensionSettings.character_attachments) {
+        extensionSettings.character_attachments = {};
     }
-    if (!extension_settings.character_attachments[avatar]) {
-        extension_settings.character_attachments[avatar] = [];
+    if (!extensionSettings.character_attachments[avatar]) {
+        extensionSettings.character_attachments[avatar] = [];
     }
 
-    const attachments = extension_settings.character_attachments[avatar];
+    const attachments = extensionSettings.character_attachments[avatar];
 
     // Remove existing attachment with same name
     const existingIdx = attachments.findIndex(a => a.name === fileName);
@@ -122,7 +122,7 @@ export async function deleteDatabase(category) {
     if (!avatar) return;
 
     const context = getContext();
-    const attachments = context.extension_settings?.character_attachments?.[avatar] || [];
+    const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
     const fileName = `${DB_PREFIX}${category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
 
     const idx = attachments.findIndex(a => a.name === fileName);
