@@ -43,7 +43,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona) {
 
     try {
         const resultStr = await callAgentLLM(systemPrompt, userPrompt);
-        addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 300)}${resultStr.length > 300 ? '...' : ''}"`);
+        addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars):\n${resultStr}`);
         return parseDraftResult(resultStr);
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);

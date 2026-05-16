@@ -123,10 +123,13 @@ async function runPreGeneration() {
 
     const context = SillyTavern.getContext();
     const charName = context.characters?.[context.characterId]?.name || '(unknown)';
-    const lastMsg = recentMessages[recentMessages.length - 1];
-    const lastMsgPreview = lastMsg ? `${lastMsg.is_user ? 'USER' : 'AI'}: "${lastMsg.mes.substring(0, 60)}..."` : '(none)';
-    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Last: ${lastMsgPreview}`);
-    addDebugLog('info', `Profile: ${settings.memoryProfile || '(default)'}`);
+    addDebugLog('info', `Character: ${charName} | Messages: ${recentMessages.length} | Profile: ${settings.memoryProfile || '(default)'}`);
+    // Log all messages being sent to Agent 1
+    for (let i = 0; i < recentMessages.length; i++) {
+        const msg = recentMessages[i];
+        const role = msg.is_user ? 'USER' : 'AI';
+        addDebugLog('info', `  [${i + 1}/${recentMessages.length}] ${role}: ${msg.mes}`);
+    }
 
     // Agent 1: Draft (runs on memory profile)
     let draftResult;
@@ -182,6 +185,9 @@ async function runPostGeneration(currentMessageIndex) {
     const context = SillyTavern.getContext();
     const targetMessage = context.chat?.[targetIndex];
     if (!targetMessage || !targetMessage.mes) return;
+
+    const role = targetMessage.is_user ? 'USER' : 'AI';
+    addDebugLog('info', `Agent 3 target message [${role}]: ${targetMessage.mes}`);
 
     isMemoryUpdateRunning = true;
     isInternalCall = true;

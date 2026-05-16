@@ -69,7 +69,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 
     try {
         const resultStr = await callAgentLLM(systemPrompt, userPrompt);
-        addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars): "${resultStr.substring(0, 400)}${resultStr.length > 400 ? '...' : ''}"`);
+        addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars):\n${resultStr}`);
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
 
