@@ -7,7 +7,18 @@ function getMeta() {
     try {
         const md = SillyTavern.getContext().chatMetadata || SillyTavern.getContext().chat_metadata;
         if (!md) return null;
-        if (!md[META_KEY]) md[META_KEY] = { messagesSinceLastReview: 0, pendingReviewItems: [] };
+        // Shape-check the existing entry — not just falsiness. If it's a non-object
+        // (string from a corrupt write, array, primitive) or missing required arrays,
+        // reinitialize. Otherwise downstream .push() crashes (T1.13 from suite v3.2).
+        const existing = md[META_KEY];
+        const isValid = existing
+            && typeof existing === 'object'
+            && !Array.isArray(existing)
+            && Array.isArray(existing.pendingReviewItems)
+            && typeof existing.messagesSinceLastReview === 'number';
+        if (!isValid) {
+            md[META_KEY] = { messagesSinceLastReview: 0, pendingReviewItems: [] };
+        }
         // Drain any fallback state accumulated before chat metadata was available
         // (e.g. during extension boot, before the user opened a chat). Without this,
         // those items would be permanently stranded outside any chat's persistence.

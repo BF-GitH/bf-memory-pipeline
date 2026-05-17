@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] - 2026-05-17
+
+### Fixed (caught by Tier 1 v3.2)
+- **`getMeta()` now shape-checks `chatMetadata.bf_mem_review` before use**: previously the guard was `if (!md[META_KEY])`, which treats a corrupted string value as truthy and skips reinitialization. The subsequent `.push()` on a non-array would throw `TypeError: Cannot read properties of undefined (reading 'push')`. Now validates: object, not array, with `pendingReviewItems: Array` and `messagesSinceLastReview: number`. Otherwise reinitializes to the empty shape.
+
 ## [0.4.0] - 2026-05-17
 
 ### Fixed (8 critical issues surfaced by Test Suite v3.2 research)
