@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0] - 2026-05-17
+
+### Fixed (8 critical issues surfaced by Test Suite v3.2 research)
+
+#### HIGH — write integrity / no-data-loss
+- **Stop button now actually stops Agent 3 writes**: previously, when the user clicked Stop, in-flight Agent 1/Agent 3 CMRS calls finished and wrote to the DB anyway. Now a `pipelineCancelled` flag is set on `GENERATION_STOPPED`; checked before Agent 3's `trackUpdate`/`saveCurrentToActiveProfile` and before the injection step. CMRS calls themselves can't be aborted (no AbortSignal exposed by ST), but their results are discarded.
+- **Character-switch mid-pipeline no longer contaminates the new character**: the v0.3.0 capture-at-write fix protected the profile-snapshot layer; v0.4.0 adds the deeper-layer guard. `capturedCharAvatar` is captured at pipeline start; if the live avatar differs when Agent 3 returns, the writes are discarded with a toast warning.
+- **`/cut` no longer breaks the pipeline**: previously, deleting a message left `lastTriggeredUserMsgIndex` stale, so the next genuine user message (re-using the deleted index) got silently skipped by the "already triggered" guard. Added a `MESSAGE_DELETED` listener that recomputes the index.
+- **Group chats now skip the pipeline cleanly**: previously, the pipeline ran with `characterId` = active speaker (not addressee), causing fact cross-contamination between group members. Now detects `ctx.groupId || ctx.selected_group` and short-circuits with a show-once toast: "BF Memory: group chats not supported — memory pipeline disabled for this chat."
+- **`is_system` / extension-injected messages excluded from Agent 3**: previously, the memoryTargetIndex walkback grabbed any non-user message, including synthetic system messages injected by other extensions (Auto-Summarize, Tracker, etc.), polluting our DB with second-order data. Now skips `msg.is_system` and `msg.extra?.type`.
+- **MAX_FACTS_PER_DB now uses LRU eviction** instead of FIFO: when a database exceeds 50 facts, the **least-recently-updated** facts are evicted (not the oldest-by-insertion-order). Foundational identity facts that get reinforced by `upsertFact` survive; throwaway tertiary facts get pruned. Prevents losing `user_name` after long campaigns.
+
+#### MED→HIGH — UX correctness
+- **Review popup no longer fires for the wrong chat**: previously, the `setTimeout(..., 2000)` for the deferred popup could fire after the user switched chats, popping in chat B while the user was in chat C. Now captures `chatId` at schedule time and aborts the popup if it changed.
+- **First message after chat-open is no longer silently dropped**: the 5-second cooldown previously blocked ALL pipeline runs in that window, including legitimate first sends. Now the cooldown only blocks when there's NO new user message (spurious chat-load events); genuine new user messages always fire.
+
+### Test Suite v3.2 (94 checks, tiered)
+Bumped from v3.1 (58 checks) after deep research by 3 agents (Detailed code analysis + Contrarian breakage modes + Edge case enumeration). New coverage includes group chat behavior, Stop-button cancellation, /cut handling, char-switch races, MAX_FACTS eviction, /sendas filtering, /preset switching, parser injection, knownBy filter, internationalization, cache invalidation, profile-delete races, etc.
+
+### Internal
+- New module-scope flags: `pipelineCancelled`, `groupSkipToastShown` (resets on CHAT_CHANGED).
+- New listener: `MESSAGE_DELETED`.
+- Nesting depth in Agent 3 result handler is now 5 levels deep — readable but a future refactor candidate.
+
+### Known limitations
+- Cancellation flag is module-scope; theoretical race if two pipelines could overlap. In practice prevented by `isInternalCall` and index guards.
+- Group chat support is a future enhancement (v0.5+). Today the pipeline skips groups with a toast.
+- Facts without a `lastUpdated` field (legacy pre-v0.2.0 data) get sorted as `lastUpdated=0` by the LRU comparator and are evicted first.
+
 ## [0.3.2] - 2026-05-17
 
 ### Fixed (HIGH — caught by Tier 1 smoke test)

@@ -66,8 +66,15 @@ export async function saveDatabase(db) {
 
     // Enforce max facts limit
     if (db.facts.length > MAX_FACTS_PER_DB) {
-        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length} facts, trimming to ${MAX_FACTS_PER_DB}`);
-        db.facts = db.facts.slice(-MAX_FACTS_PER_DB);
+        const evictCount = db.facts.length - MAX_FACTS_PER_DB;
+        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length} facts, evicting ${evictCount} least-recently-updated`);
+        // Sort by lastUpdated DESC (most-recently-updated first), keep top MAX_FACTS_PER_DB.
+        // upsertFact bumps lastUpdated on every touch, so foundational facts (re-mentioned
+        // by the user / model) survive while one-off tertiary facts get evicted.
+        db.facts = db.facts
+            .slice() // copy to avoid mutating in-place during sort
+            .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0))
+            .slice(0, MAX_FACTS_PER_DB);
     }
 
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;

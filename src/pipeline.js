@@ -18,6 +18,8 @@ let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
 let lastInjection = null; // cached injection text for swipes/regens
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
+let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
+let groupSkipToastShown = false; // show-once toast when skipping group chats
 
 /**
  * Get recent chat messages
@@ -105,6 +107,19 @@ function shouldRunPipeline(data) {
     const settings = getSettings();
     if (!settings || !settings.enabled) return false;
 
+    // Skip group chats: characterId in a group = active speaker, not addressee.
+    // Writing facts to the speaker's attachments would cross-contaminate characters.
+    // Group support is planned for a future release.
+    const ctx = SillyTavern.getContext();
+    if (ctx.groupId || ctx.selected_group) {
+        addDebugLog('info', 'Skipping pipeline (group chat — not supported in this version)');
+        if (!groupSkipToastShown && typeof toastr !== 'undefined') {
+            toastr.info('BF Memory: group chats not supported — memory pipeline disabled for this chat.', 'BF Memory', { timeOut: 6000 });
+            groupSkipToastShown = true;
+        }
+        return false;
+    }
+
     // Skip our own internal LLM calls (Agent 1, Agent 3)
     if (isInternalCall) {
         addDebugLog('info', 'Skipping pipeline (internal agent call)');
@@ -114,13 +129,8 @@ function shouldRunPipeline(data) {
     // Skip dry runs
     if (data?.dryRun) return false;
 
-    // Cooldown after chat change
-    if (Date.now() - chatChangedAt < 5000) {
-        addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown active)');
-        return false;
-    }
-
-    // Only run for new user messages we haven't processed
+    // Compute lastUserMsgIndex first — needed to distinguish "real user send" from
+    // "spurious chat-load event"
     const freshChat = SillyTavern.getContext().chat;
     if (!freshChat || freshChat.length === 0) return false;
 
@@ -134,8 +144,16 @@ function shouldRunPipeline(data) {
 
     if (lastUserMsgIndex < 0) return false;
 
-    if (lastUserMsgIndex <= lastTriggeredUserMsgIndex) {
-        addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
+    // If a genuine NEW user message exists, fire regardless of cooldown.
+    // The cooldown only protects against spurious chat-load events (no new user msg).
+    const isNewUserMsg = lastUserMsgIndex > lastTriggeredUserMsgIndex;
+
+    if (!isNewUserMsg) {
+        if (Date.now() - chatChangedAt < 5000) {
+            addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown, no new user msg)');
+        } else {
+            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
+        }
         return false;
     }
 
@@ -150,6 +168,11 @@ async function runPipelineInline(data) {
     // user switches chat/profile mid-run, our Agent 3 save still lands in the
     // correct slot (the profile this pipeline was reading from).
     const capturedDbProfile = settings?.activeDbProfile;
+    // Also capture the character's avatar — if the user switches character before
+    // Agent 3 finishes, writing facts would land on the wrong character's
+    // attachments (database.js keys storage on the LIVE characterId/avatar).
+    const capturedCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
+    pipelineCancelled = false; // fresh run, start uncancelled
     const context = SillyTavern.getContext();
     const chat = context.chat;
     const charName = context.characters?.[context.characterId]?.name || '(unknown)';
@@ -188,10 +211,15 @@ async function runPipelineInline(data) {
     // so explicit user disclosures (e.g. "I work at Google") get extracted from the user side directly.
     let memoryTargetIndex = -1;
     for (let i = chat.length - 2; i >= 0; i--) {
-        if (chat[i] && !chat[i].is_user && chat[i].mes) {
-            memoryTargetIndex = i;
-            break;
-        }
+        const msg = chat[i];
+        if (!msg || msg.is_user || !msg.mes) continue;
+        // Skip system messages and extension-injected synthetic messages
+        // (Auto-Summarize, Tracker, etc.) — these aren't genuine character utterances
+        // and extracting "facts" from them pollutes the DB with second-order data.
+        if (msg.is_system) continue;
+        if (msg.extra?.type) continue; // 'narrator', 'comment', 'summary', etc.
+        memoryTargetIndex = i;
+        break;
     }
 
     const formattedChat = formatMessagesForDraft(recentMessages);
@@ -270,38 +298,58 @@ async function runPipelineInline(data) {
 
     // --- Process Agent 3 results ---
     if (memoryResult && !memoryResult.error) {
-        addDebugLog('info', `Agent 3: ${memoryResult.updates.length} updates. ${memoryResult.summary}`);
-        for (const update of memoryResult.updates) {
-            trackUpdate(update);
-        }
-        lastProcessedMessageIndex = memoryTargetIndex;
+        if (pipelineCancelled) {
+            addDebugLog('info', `Pipeline cancelled — discarding ${memoryResult.updates.length} Agent 3 updates`);
+        } else {
+            const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
+            if (currentCharAvatar !== capturedCharAvatar) {
+                addDebugLog('fail', `Character changed mid-pipeline (${capturedCharAvatar} -> ${currentCharAvatar}) — discarding ${memoryResult.updates.length} Agent 3 updates to avoid cross-character contamination`);
+                if (typeof toastr !== 'undefined') {
+                    toastr.warning('BF Memory: extraction discarded — you switched characters mid-generation');
+                }
+            } else {
+                addDebugLog('info', `Agent 3: ${memoryResult.updates.length} updates. ${memoryResult.summary}`);
+                for (const update of memoryResult.updates) {
+                    trackUpdate(update);
+                }
+                lastProcessedMessageIndex = memoryTargetIndex;
 
-        // Check if review popup is due (defer to after generation to avoid blocking)
-        if (tickMessageCounter(settings.reviewInterval || 10)) {
-            addDebugLog('info', 'Review interval reached, will show popup after generation');
-            // Schedule popup after generation completes
-            setTimeout(async () => {
-                await showReviewPopup(
-                    () => addDebugLog('info', 'User accepted all memory updates'),
-                    async (editedItems) => {
-                        addDebugLog('info', `User edited ${editedItems.length} items`);
-                        const dbs = await getAllDatabases();
-                        for (const item of editedItems) {
-                            if (!dbs[item.category]) {
-                                dbs[item.category] = createEmptyDatabase(item.category);
-                            }
-                            upsertFact(dbs[item.category], item);
-                            await saveDatabase(dbs[item.category]);
+                // Check if review popup is due (defer to after generation to avoid blocking)
+                if (tickMessageCounter(settings.reviewInterval || 10)) {
+                    addDebugLog('info', 'Review interval reached, will show popup after generation');
+                    // Schedule popup after generation completes
+                    // Capture chat ID at schedule time. If the user switches chats during
+                    // the 2s delay, the popup must not pop in the wrong chat or write to
+                    // the wrong character's DB.
+                    const targetChatIdForPopup = SillyTavern.getContext().chatId;
+                    setTimeout(async () => {
+                        if (SillyTavern.getContext().chatId !== targetChatIdForPopup) {
+                            addDebugLog('info', 'Skipping review popup: chat changed since pipeline finished');
+                            return;
                         }
-                    },
-                );
-            }, 2000);
-        }
-        // Persist to active DB profile immediately after Agent 3 writes
-        // Use the profile captured at pipeline start, not whatever is active now —
-        // user may have switched chats while Agent 3 was running.
-        if (memoryResult.updates.length > 0) {
-            await saveCurrentToActiveProfile(capturedDbProfile);
+                        await showReviewPopup(
+                            () => addDebugLog('info', 'User accepted all memory updates'),
+                            async (editedItems) => {
+                                addDebugLog('info', `User edited ${editedItems.length} items`);
+                                const dbs = await getAllDatabases();
+                                for (const item of editedItems) {
+                                    if (!dbs[item.category]) {
+                                        dbs[item.category] = createEmptyDatabase(item.category);
+                                    }
+                                    upsertFact(dbs[item.category], item);
+                                    await saveDatabase(dbs[item.category]);
+                                }
+                            },
+                        );
+                    }, 2000);
+                }
+                // Persist to active DB profile immediately after Agent 3 writes
+                // Use the profile captured at pipeline start, not whatever is active now —
+                // user may have switched chats while Agent 3 was running.
+                if (memoryResult.updates.length > 0) {
+                    await saveCurrentToActiveProfile(capturedDbProfile);
+                }
+            }
         }
     } else if (memoryResult?.error) {
         addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);
@@ -362,6 +410,12 @@ async function runPipelineInline(data) {
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);
 
     // --- Build & Inject ---
+    if (pipelineCancelled) {
+        addDebugLog('info', 'Pipeline cancelled — skipping injection');
+        hideWorkingIndicator();
+        updateStatus('idle');
+        return;
+    }
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted);
     lastInjection = injection; // Cache for swipes/regens
     addDebugLog('info', `Injection ready (${injection.length} chars) in ${Date.now() - startTime}ms`);
@@ -448,10 +502,34 @@ export function initPipeline() {
         updateStatus('idle');
     });
 
-    // Also reset on generation stop/failure (user clicks Stop, or error)
+    // Also reset on generation stop/failure (user clicks Stop, or error).
+    // Set pipelineCancelled so in-flight Agent 3 writes are discarded — we
+    // can't abort the CMRS calls themselves (no AbortSignal exposed by ST),
+    // but we can refuse to commit their results.
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
+        pipelineCancelled = true;
         pipelineJustInjected = false;
+        hideWorkingIndicator();
         updateStatus('idle');
+        addDebugLog('info', 'Generation stopped — in-flight agent writes will be discarded');
+    });
+
+    // Recompute lastTriggeredUserMsgIndex when messages are deleted (e.g. /cut).
+    // Otherwise the index becomes stale and the next genuine user message
+    // (which may now land at the same numeric index as the deleted one) gets
+    // silently skipped by the "already triggered" guard.
+    eventSource.on(eventTypes.MESSAGE_DELETED, () => {
+        const currentChat = SillyTavern.getContext().chat;
+        lastTriggeredUserMsgIndex = -1;
+        if (currentChat && currentChat.length > 0) {
+            for (let i = currentChat.length - 1; i >= 0; i--) {
+                if (currentChat[i] && currentChat[i].is_user) {
+                    lastTriggeredUserMsgIndex = i;
+                    break;
+                }
+            }
+        }
+        addDebugLog('info', `Message deleted — recomputed lastUserMsg=${lastTriggeredUserMsgIndex}`);
     });
 
     // Reset on chat change
@@ -460,6 +538,7 @@ export function initPipeline() {
         lastProcessedMessageIndex = -1;
         lastInjection = null;
         pipelineJustInjected = false;
+        groupSkipToastShown = false;
         chatChangedAt = Date.now();
         hideWorkingIndicator();
         updateStatus('idle');
