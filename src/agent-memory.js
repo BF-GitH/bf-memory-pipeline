@@ -35,10 +35,10 @@ RULES:
 
 EXAMPLES:
 
-Input: Felix pushes hair back revealing a jagged scar. "Got it at seven. Greenhouse roof." Naoto stares.
+Input: Character A pushes hair back revealing a jagged scar. "Got it at seven. Greenhouse roof." Character B stares.
 
 #MEM
-+ Identity/felix_facial_scar = Jagged scar temple to jaw, childhood greenhouse accident age 7 | @Felix,Naoto | #appearance,injury,backstory
++ Identity/char_a_facial_scar = Jagged scar temple to jaw, childhood greenhouse accident age 7 | @CharA,CharB | #appearance,injury,backstory
 .
 
 #WHY
@@ -56,11 +56,11 @@ No lasting facts.
 
 ---
 
-Input: Naoto admits she already knew about Felix's past. Trust between them deepens.
+Input: Character B admits she already knew about Character A's past. Trust between them deepens.
 
 #MEM
-+ Relationships/naoto_knew_felix_past = Naoto already knew about Felix's past before he told her | @Felix,Naoto | #trust,secrets
-+ Relationships/felix_naoto_trust = Deepened after mutual honesty about his past | @Felix,Naoto | #trust,bond
++ Relationships/b_knew_a_past = B already knew about A's past before he told her | @CharA,CharB | #trust,secrets
++ Relationships/a_b_trust = Deepened after mutual honesty about his past | @CharA,CharB | #trust,bond
 .
 
 #WHY
