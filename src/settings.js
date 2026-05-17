@@ -866,6 +866,17 @@ export async function initSettings() {
 
     $('#extensions_settings').append(html);
 
+    // Populate version label from manifest (single source of truth — no risk of drift).
+    // If the fetch fails, the placeholder "v?.?.?" remains so testers can see it didn't load.
+    try {
+        const manifest = await $.getJSON(`${path}/manifest.json`);
+        if (manifest?.version) {
+            $('#bf_mem_version').text(`v${manifest.version}`);
+        }
+    } catch (err) {
+        console.warn('[BFMemory] Could not load manifest for version label:', err?.message);
+    }
+
     // --- Setup Tabs ---
     setupTabs();
 

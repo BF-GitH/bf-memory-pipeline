@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.3.1] - 2026-05-17
+
+### Added
+- **Version label in extension header**: the drawer title "BF's Memory Pipeline" now displays the installed version (`v0.3.1`) next to the name, fetched live from `manifest.json` (single source of truth). Lets testers/users instantly verify which version is loaded — critical for catching stale browser caches where a patched file on disk hasn't replaced the in-memory copy.
+
 ## [0.3.0] - 2026-05-17
 
 ### Fixed (HIGH — behavior bugs surfaced by test suite v2)
