@@ -479,3 +479,66 @@
     padding: 20px;
     font-style: italic;
 }
+
+/* Linked Chats */
+.bf-mem-linked-chats-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.bf-mem-linked-display {
+    flex: 1;
+    font-size: 11px;
+    color: #999;
+    background: var(--SmartThemeBlurTintColor, #111);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    padding: 5px 8px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bf-mem-linked-popup h4 {
+    margin: 0 0 8px;
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-linked-popup p {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: #999;
+}
+
+.bf-mem-linked-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.bf-mem-linked-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: var(--SmartThemeBlurTintColor, #1a1a2e);
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 4px;
+}
+
+.bf-mem-linked-name {
+    font-size: 12px;
+    color: var(--SmartThemeBodyColor, #ccc);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bf-mem-linked-remove {
+    padding: 2px 6px !important;
+    font-size: 11px !important;
+    color: #f44336 !important;
+}

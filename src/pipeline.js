@@ -9,7 +9,7 @@ import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { getMemoryProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, updatePipelineSummary } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, updatePipelineSummary, saveCurrentToActiveProfile } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -282,6 +282,10 @@ async function runPipelineInline(data) {
                     },
                 );
             }, 2000);
+        }
+        // Persist to active DB profile immediately after Agent 3 writes
+        if (memoryResult.updates.length > 0) {
+            await saveCurrentToActiveProfile();
         }
     } else if (memoryResult?.error) {
         addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);

@@ -534,6 +534,29 @@ function linkChatToProfile(profileName, chatId) {
     saveSettings();
 }
 
+/** Save current databases to the active profile (call after DB changes) */
+export async function saveCurrentToActiveProfile() {
+    const profileName = extensionSettings?.activeDbProfile;
+    if (!profileName) return;
+    try {
+        const { getAllDatabases } = await import('./database.js');
+        const databases = await getAllDatabases();
+        const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
+        if (totalFacts === 0) return;
+
+        if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+        extensionSettings.dbProfiles[profileName] = {
+            ...extensionSettings.dbProfiles[profileName],
+            databases: JSON.parse(JSON.stringify(databases)),
+            savedAt: Date.now(),
+        };
+        saveSettings();
+        addDebugLog('info', `Saved to active profile "${profileName}" (${totalFacts} facts)`);
+    } catch (err) {
+        addDebugLog('fail', `Failed to save active profile: ${err.message}`);
+    }
+}
+
 async function autoSaveDbProfile() {
     try {
         const context = getContext();
@@ -617,17 +640,119 @@ async function autoSaveDbProfile() {
 }
 
 function refreshLinkedChatsField() {
-    const input = document.getElementById('bf_mem_db_linked_chats');
-    if (!input) return;
-    // Show linked chats for whichever profile is selected in the dropdown
+    const display = document.getElementById('bf_mem_db_linked_chats');
+    if (!display) return;
     const selected = document.getElementById('bf_mem_db_profile_select')?.value;
     const profileName = selected || extensionSettings?.activeDbProfile;
     if (!profileName || !extensionSettings?.dbProfiles?.[profileName]) {
-        input.value = '';
+        display.textContent = '(none)';
         return;
     }
     const profile = extensionSettings.dbProfiles[profileName];
-    input.value = (profile.linkedChats || []).join(', ');
+    const chats = profile.linkedChats || [];
+    display.textContent = chats.length > 0 ? chats.join(', ') : '(none)';
+}
+
+async function showLinkedChatsPopup() {
+    const selected = document.getElementById('bf_mem_db_profile_select')?.value;
+    const profileName = selected || extensionSettings?.activeDbProfile;
+    if (!profileName || !extensionSettings?.dbProfiles?.[profileName]) {
+        toastr.warning('No profile selected', 'BF Memory');
+        return;
+    }
+
+    const profile = extensionSettings.dbProfiles[profileName];
+    const linkedChats = [...(profile.linkedChats || [])];
+    const currentChatId = getCurrentChatId();
+
+    let html = `<div class="bf-mem-linked-popup">
+        <h4>Linked Chats for "${escapeHtml(profileName)}"</h4>
+        <p>These chats will auto-load this DB profile when opened.</p>
+        <div class="bf-mem-linked-list" id="bf_mem_linked_list">`;
+
+    if (linkedChats.length === 0) {
+        html += '<div class="bf-mem-empty">No chats linked yet.</div>';
+    } else {
+        for (const chatId of linkedChats) {
+            const isCurrent = chatId === currentChatId;
+            html += `<div class="bf-mem-linked-item">
+                <span class="bf-mem-linked-name">${escapeHtml(chatId)}${isCurrent ? ' (current)' : ''}</span>
+                <button class="bf-mem-linked-remove menu_button" data-chat="${escapeHtml(chatId)}" title="Remove">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>`;
+        }
+    }
+
+    html += `</div>
+        <div class="bf-mem-linked-add-row" style="margin-top: 10px;">
+            <button id="bf_mem_link_current" class="menu_button">
+                <i class="fa-solid fa-plus"></i> Link Current Chat
+            </button>
+        </div>
+    </div>`;
+
+    await ensurePopup();
+    if (!Popup) {
+        toastr.error('Popup not available', 'BF Memory');
+        return;
+    }
+
+    const popup = new Popup(html, POPUP_TYPE.TEXT, '', { allowVerticalScrolling: true });
+    await popup.show();
+
+    // Bind remove buttons
+    document.querySelectorAll('.bf-mem-linked-remove').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const chatId = btn.dataset.chat;
+            const idx = profile.linkedChats.indexOf(chatId);
+            if (idx >= 0) {
+                profile.linkedChats.splice(idx, 1);
+                saveSettings();
+                refreshLinkedChatsField();
+                refreshDbProfileDropdown();
+                btn.closest('.bf-mem-linked-item').remove();
+                toastr.success(`Unlinked "${chatId}"`, 'BF Memory');
+            }
+        });
+    });
+
+    // Bind "Link Current Chat" button
+    document.getElementById('bf_mem_link_current')?.addEventListener('click', () => {
+        const chatId = getCurrentChatId();
+        if (!chatId) {
+            toastr.warning('No chat currently open', 'BF Memory');
+            return;
+        }
+        if (!profile.linkedChats) profile.linkedChats = [];
+        if (profile.linkedChats.includes(chatId)) {
+            toastr.info('Current chat is already linked', 'BF Memory');
+            return;
+        }
+        // Remove from other profiles first
+        for (const [name, p] of Object.entries(extensionSettings.dbProfiles)) {
+            if (name !== profileName && p.linkedChats) {
+                p.linkedChats = p.linkedChats.filter(id => id !== chatId);
+            }
+        }
+        profile.linkedChats.push(chatId);
+        saveSettings();
+        refreshLinkedChatsField();
+        refreshDbProfileDropdown();
+        toastr.success(`Linked current chat to "${profileName}"`, 'BF Memory');
+        // Refresh the popup list
+        const listEl = document.getElementById('bf_mem_linked_list');
+        if (listEl) {
+            const item = document.createElement('div');
+            item.className = 'bf-mem-linked-item';
+            item.innerHTML = `<span class="bf-mem-linked-name">${escapeHtml(chatId)} (current)</span>
+                <button class="bf-mem-linked-remove menu_button" data-chat="${escapeHtml(chatId)}" title="Remove">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>`;
+            listEl.querySelector('.bf-mem-empty')?.remove();
+            listEl.appendChild(item);
+        }
+    });
 }
 
 // --- Init ---
@@ -821,23 +946,10 @@ export async function initSettings() {
         deleteDbProfile(selected);
     });
 
-    // Linked chats field
+    // Linked chats display + manage button
     refreshLinkedChatsField();
     $('#bf_mem_db_profile_select').on('change', () => refreshLinkedChatsField());
-
-    $('#bf_mem_db_linked_save').on('click', () => {
-        const profileName = $('#bf_mem_db_profile_select').val() || extensionSettings?.activeDbProfile;
-        if (!profileName || !extensionSettings?.dbProfiles?.[profileName]) {
-            toastr.warning('No profile selected', 'BF Memory');
-            return;
-        }
-        const raw = $('#bf_mem_db_linked_chats').val() || '';
-        const chatIds = raw.split(',').map(s => s.trim()).filter(Boolean);
-        extensionSettings.dbProfiles[profileName].linkedChats = chatIds;
-        saveSettings();
-        toastr.success(`Updated linked chats for "${profileName}"`, 'BF Memory');
-        addDebugLog('info', `Profile "${profileName}" linked to: ${chatIds.join(', ') || '(none)'}`);
-    });
+    $('#bf_mem_db_linked_manage').on('click', () => showLinkedChatsPopup());
 
     // --- Database Tab ---
     $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
@@ -895,6 +1007,21 @@ export async function initSettings() {
     // --- Auto-save DB profile on chat change (named after current chat) ---
     context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
         await autoSaveDbProfile();
+    });
+
+    // Save to active profile on page close/refresh
+    window.addEventListener('beforeunload', () => {
+        // Synchronous best-effort save to settings (no async file ops)
+        const profileName = extensionSettings?.activeDbProfile;
+        if (profileName && extensionSettings?.dbProfiles?.[profileName]) {
+            // Can't do async here, but saveSettings is synchronous (debounced flush)
+            saveSettings();
+        }
+    });
+
+    // Also save after each successful generation (catches Agent 3 DB updates)
+    context.eventSource?.on(context.eventTypes?.MESSAGE_RECEIVED, async () => {
+        await saveCurrentToActiveProfile();
     });
 
     // --- Initial state ---

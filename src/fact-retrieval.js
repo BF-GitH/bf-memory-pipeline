@@ -153,6 +153,36 @@ function formatFactsForWriter(results) {
  * @param {Array} messages - Recent chat messages
  * @returns {string[]}
  */
+// Common English words that get capitalized at start of sentences but aren't proper nouns
+const STOP_WORDS = new Set([
+    'the', 'she', 'her', 'his', 'him', 'they', 'them', 'their', 'its',
+    'was', 'were', 'has', 'had', 'have', 'are', 'been', 'being',
+    'this', 'that', 'these', 'those', 'what', 'which', 'who', 'whom',
+    'will', 'would', 'could', 'should', 'might', 'must', 'shall',
+    'not', 'but', 'and', 'for', 'nor', 'yet', 'with', 'from',
+    'you', 'your', 'yours', 'our', 'ours', 'mine',
+    'here', 'there', 'where', 'when', 'then', 'than', 'how', 'why',
+    'all', 'each', 'every', 'both', 'few', 'more', 'most', 'some', 'any',
+    'just', 'very', 'too', 'also', 'still', 'even', 'only', 'now',
+    'said', 'says', 'told', 'asked', 'looked', 'went', 'came', 'got',
+    'like', 'just', 'know', 'think', 'make', 'made', 'take', 'took',
+    'see', 'saw', 'come', 'want', 'give', 'gave', 'use', 'used',
+    'did', 'does', 'done', 'get', 'gets', 'let', 'say', 'try',
+    'one', 'two', 'first', 'last', 'new', 'old', 'good', 'bad',
+    'long', 'little', 'big', 'small', 'much', 'well', 'back',
+    'down', 'over', 'after', 'before', 'between', 'under', 'again',
+    'into', 'through', 'about', 'around', 'against', 'along',
+    'something', 'anything', 'nothing', 'everything', 'someone', 'anyone',
+    'way', 'day', 'time', 'thing', 'man', 'woman', 'hand', 'head',
+    'eye', 'eyes', 'face', 'voice', 'door', 'room', 'floor', 'side',
+    'moment', 'mouth', 'words', 'word', 'thought', 'felt', 'found',
+    'turned', 'pulled', 'pushed', 'stood', 'sat', 'held', 'left',
+    'right', 'looked', 'nodded', 'closed', 'opened', 'moved', 'watched',
+    'kept', 'heard', 'reached', 'stepped', 'stopped', 'started',
+    'seemed', 'meant', 'tried', 'knew', 'felt', 'ran', 'set',
+    'may', 'can', 'own', 'off', 'out', 'away', 'else', 'ever',
+]);
+
 export function extractContextKeywords(messages) {
     if (!messages || messages.length === 0) return [];
 
@@ -160,7 +190,7 @@ export function extractContextKeywords(messages) {
     const originalText = messages.map(m => m.mes || '').join(' ');
     const lowerText = originalText.toLowerCase();
 
-    // Extract proper nouns (capitalized words) and significant terms
+    // Extract proper nouns: capitalized words that aren't common English
     const words = originalText.split(/\s+/);
     const keywords = new Set();
 
@@ -168,9 +198,13 @@ export function extractContextKeywords(messages) {
         const clean = word.replace(/[^a-zA-Z0-9]/g, '');
         if (clean.length < 3) continue;
 
-        // Add words that are capitalized (likely names, locations, proper nouns)
+        // Must be capitalized (proper noun candidate)
         if (clean[0] === clean[0].toUpperCase() && clean[0] !== clean[0].toLowerCase()) {
-            keywords.add(clean.toLowerCase());
+            const lower = clean.toLowerCase();
+            // Filter out stop words (common sentence starters)
+            if (!STOP_WORDS.has(lower)) {
+                keywords.add(lower);
+            }
         }
     }
 

@@ -119,7 +119,7 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
     }
 
     dataParts.push(`## Message to Analyze\n${messageText}`);
-    dataParts.push('\nNow output ONLY #Facts: and #Summary: sections.');
+    dataParts.push('\nNow output ONLY #MEM and #WHY sections.');
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
@@ -162,8 +162,13 @@ function parseMemoryUpdateResult(response, messageIndex) {
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim());
     text = text.replace(/```/g, '');
 
-    // Extract #WHY section
-    const whyMatch = text.match(/#WHY\s*([\s\S]*?)$/i);
+    // LEGACY FALLBACK: if response uses old #Facts: JSON format, parse that instead
+    if (text.includes('#Facts:') && text.includes('"category"')) {
+        return parseLegacyJsonFormat(text, messageIndex);
+    }
+
+    // Extract #WHY / #SUMMARY section
+    const whyMatch = text.match(/#(?:WHY|SUMMARY)\s*([\s\S]*?)$/i);
     if (whyMatch) {
         result.summary = whyMatch[1].trim();
     }
@@ -311,6 +316,51 @@ async function applyUpdates(updates, existingDatabases) {
             addDebugLog('fail', `Failed to save database "${category}": ${error.message}`);
         }
     }
+}
+
+/**
+ * Legacy fallback: parse old #Facts: JSON format (for cached prompts that haven't been reset)
+ */
+function parseLegacyJsonFormat(response, messageIndex) {
+    const result = { updates: [], summary: '', raw: response, error: null };
+
+    const summaryMatch = response.match(/#Summary:?\s*([\s\S]*?)$/i);
+    if (summaryMatch) result.summary = summaryMatch[1].trim();
+
+    const factsMatch = response.match(/#Facts:?\s*([\s\S]*?)(?=#Summary|$)/i);
+    if (!factsMatch || factsMatch[1].trim() === '(none)') return result;
+
+    // Extract JSON objects via brace counting
+    const text = factsMatch[1].trim();
+    let i = 0;
+    while (i < text.length) {
+        if (text[i] === '{') {
+            let depth = 0, start = i;
+            while (i < text.length) {
+                if (text[i] === '{') depth++;
+                else if (text[i] === '}') { depth--; if (depth === 0) break; }
+                i++;
+            }
+            try {
+                const fact = JSON.parse(text.substring(start, i + 1));
+                if (fact.category && fact.key) {
+                    result.updates.push({
+                        action: 'add',
+                        category: fact.category,
+                        key: fact.key,
+                        value: fact.value || '',
+                        tags: fact.tags || [],
+                        knownBy: fact.knownBy || [],
+                        source: `msg_${messageIndex}`,
+                    });
+                }
+            } catch { /* skip malformed */ }
+        }
+        i++;
+    }
+
+    addDebugLog('info', `Parsed legacy JSON format (${result.updates.length} facts). Reset your Memory Updater prompt for the new compact format.`);
+    return result;
 }
 
 /**
