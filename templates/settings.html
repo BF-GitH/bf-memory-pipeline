@@ -21,6 +21,7 @@
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_pipeline" tabindex="0">Pipeline</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">Prompts</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_summary" tabindex="-1">Summary</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
@@ -194,6 +195,20 @@
                             <button id="bf_mem_clear_db" class="menu_button redWarningBG">
                                 <i class="fa-solid fa-trash"></i> Clear All
                             </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Summary (Debug Light) -->
+            <div id="bf_mem_tab_summary" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-list-check"></i> Pipeline Summary
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <div id="bf_mem_summary" class="bf-mem-summary">
+                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see the workflow summary.</div>
                         </div>
                     </div>
                 </div>

@@ -34,6 +34,7 @@ const EXTENSION_NAME = (() => {
 let extensionSettings = null;
 let debugLog = [];
 const MAX_DEBUG_ENTRIES = 200;
+let lastPipelineSummary = null;
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -118,6 +119,82 @@ function renderDebugLog() {
             <span class="bf-mem-log-time">[${entry.timestamp}]</span> ${escapeHtml(entry.message).replace(/\n/g, '<br>')}
         </div>
     `).join('');
+}
+
+// --- Pipeline Summary (Debug Light) ---
+
+export function updatePipelineSummary(summary) {
+    lastPipelineSummary = summary;
+    renderSummary();
+}
+
+function renderSummary() {
+    const container = document.getElementById('bf_mem_summary');
+    if (!container) return;
+
+    if (!lastPipelineSummary) {
+        container.innerHTML = '<div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see the workflow summary.</div>';
+        return;
+    }
+
+    const s = lastPipelineSummary;
+    const lines = [];
+
+    lines.push(`### Pipeline Run`);
+    lines.push(`**Time:** ${s.timestamp} | **Duration:** ${s.durationMs}ms`);
+    lines.push('');
+
+    // Agent 1
+    lines.push(`#### Agent 1 — Draft`);
+    if (s.agent1Error) {
+        lines.push(`- Status: **FAILED** (${s.agent1Error})`);
+    } else {
+        lines.push(`- Status: **OK**`);
+        lines.push(`- Draft: *${s.draftSnippet || '(empty)'}*`);
+        lines.push(`- Needed facts: ${s.neededFacts?.length ? s.neededFacts.join(', ') : '(none)'}`);
+    }
+    lines.push('');
+
+    // Agent 3
+    lines.push(`#### Agent 3 — Memory`);
+    if (s.agent3Skipped) {
+        lines.push(`- Status: **Skipped** (no new message to process)`);
+    } else if (s.agent3Error) {
+        lines.push(`- Status: **FAILED** (${s.agent3Error})`);
+    } else {
+        lines.push(`- Status: **OK** — ${s.memoryUpdates} update(s)`);
+        if (s.memorySummary) lines.push(`- Summary: ${s.memorySummary}`);
+    }
+    lines.push('');
+
+    // Retrieval
+    lines.push(`#### Fact Retrieval`);
+    lines.push(`- Primary: **${s.stats?.primary || 0}** | Secondary: **${s.stats?.secondary || 0}** | Tertiary: **${s.stats?.tertiary || 0}**`);
+    if (s.contextKeywords?.length) lines.push(`- Context keywords: ${s.contextKeywords.join(', ')}`);
+    if (s.deltaKeywords?.length) lines.push(`- Delta keywords: ${s.deltaKeywords.join(', ')}`);
+    lines.push('');
+
+    // Injection
+    lines.push(`#### Injection`);
+    lines.push(`- Characters injected: **${s.injectionChars || 0}**`);
+    lines.push(`- Status: ${s.injected ? '**Injected**' : '**Failed**'}`);
+
+    // Convert markdown-like to HTML (simple)
+    const html = lines.map(line => {
+        if (line.startsWith('### ')) return `<h3>${line.slice(4)}</h3>`;
+        if (line.startsWith('#### ')) return `<h4>${line.slice(5)}</h4>`;
+        if (line.startsWith('- ')) return `<div class="bf-mem-summary-item">${formatInline(line.slice(2))}</div>`;
+        if (line === '') return '';
+        return `<p>${formatInline(line)}</p>`;
+    }).join('\n');
+
+    container.innerHTML = html;
+}
+
+function formatInline(text) {
+    return escapeHtml(text)
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\*(.+?)\*/g, '<em>$1</em>');
 }
 
 function exportLogs() {
@@ -408,6 +485,69 @@ async function deleteDbProfile(profileName) {
     toastr.success(`Deleted profile "${profileName}"`, 'BF Memory');
 }
 
+// --- Auto-save DB as chat-named profile ---
+
+let lastAutoSavedChat = '';
+
+async function autoSaveDbProfile() {
+    try {
+        const context = getContext();
+        // Get current chat name from ST context
+        const chatName = context.characters?.[context.characterId]?.name
+            || context.groups?.find(g => g.id === context.groupId)?.name
+            || '';
+
+        if (!chatName) return;
+        if (chatName === lastAutoSavedChat) return; // same chat, already saved
+
+        // Save previous chat's databases before switching
+        if (lastAutoSavedChat) {
+            const { getAllDatabases } = await import('./database.js');
+            const databases = await getAllDatabases();
+            const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
+
+            // Only save if there are actual facts
+            if (totalFacts > 0) {
+                if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+                extensionSettings.dbProfiles[lastAutoSavedChat] = {
+                    databases: JSON.parse(JSON.stringify(databases)),
+                    savedAt: Date.now(),
+                };
+                extensionSettings.activeDbProfile = lastAutoSavedChat;
+                saveSettings();
+                refreshDbProfileDropdown();
+                addDebugLog('info', `Auto-saved DB profile "${lastAutoSavedChat}" (${totalFacts} facts)`);
+            }
+        }
+
+        // Load the new chat's profile if it exists
+        if (extensionSettings.dbProfiles?.[chatName]) {
+            const profile = extensionSettings.dbProfiles[chatName];
+            const { getAllDatabases, deleteDatabase, saveDatabase } = await import('./database.js');
+
+            // Clear existing
+            const existing = await getAllDatabases();
+            for (const category of Object.keys(existing)) {
+                await deleteDatabase(category);
+            }
+
+            // Load saved
+            for (const [category, db] of Object.entries(profile.databases || {})) {
+                await saveDatabase({ ...db, category });
+            }
+
+            extensionSettings.activeDbProfile = chatName;
+            saveSettings();
+            refreshDbProfileDropdown();
+            addDebugLog('info', `Auto-loaded DB profile "${chatName}"`);
+        }
+
+        lastAutoSavedChat = chatName;
+    } catch (err) {
+        addDebugLog('fail', `Auto-save DB profile failed: ${err.message}`);
+    }
+}
+
 // --- Init ---
 
 export async function initSettings() {
@@ -651,6 +791,11 @@ export async function initSettings() {
 
     // --- Auto-refresh profiles on change ---
     context.eventSource?.on(context.eventTypes?.CONNECTION_PROFILE_LOADED, () => reloadProfiles());
+
+    // --- Auto-save DB profile on chat change (named after current chat) ---
+    context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
+        await autoSaveDbProfile();
+    });
 
     // --- Initial state ---
     updateStatus('idle');

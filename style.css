@@ -427,3 +427,55 @@
     gap: 8px;
     justify-content: flex-end;
 }
+
+/* Summary Tab (Debug Light) */
+.bf-mem-summary {
+    padding: 10px;
+    background: var(--SmartThemeBlurTintColor, #0a0a14);
+    border: 1px solid var(--SmartThemeBorderColor, #333);
+    border-radius: 4px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--SmartThemeBodyColor, #ccc);
+}
+
+.bf-mem-summary h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+    color: var(--SmartThemeBodyColor, #eee);
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #444);
+    padding-bottom: 6px;
+}
+
+.bf-mem-summary h4 {
+    margin: 10px 0 4px;
+    font-size: 12px;
+    color: #7bb3ff;
+}
+
+.bf-mem-summary p {
+    margin: 0 0 4px;
+    color: #999;
+}
+
+.bf-mem-summary-item {
+    padding: 2px 0 2px 12px;
+    border-left: 2px solid var(--SmartThemeBorderColor, #444);
+    margin: 2px 0;
+}
+
+.bf-mem-summary-item strong {
+    color: var(--SmartThemeBodyColor, #eee);
+}
+
+.bf-mem-summary-item em {
+    color: #999;
+    font-style: italic;
+}
+
+.bf-mem-summary-empty {
+    color: #666;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+}

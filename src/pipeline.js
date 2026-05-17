@@ -9,7 +9,7 @@ import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { getMemoryProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, updatePipelineSummary } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -355,6 +355,24 @@ async function runPipelineInline(data) {
 
     hideWorkingIndicator();
     updateStatus('running', 'Generating with facts...');
+
+    // --- Update Summary (Debug Light) ---
+    updatePipelineSummary({
+        timestamp: new Date().toLocaleTimeString(),
+        durationMs: Date.now() - startTime,
+        agent1Error: draftResult?.error || null,
+        draftSnippet: draftResult?.draft?.substring(0, 100) || '',
+        neededFacts: draftResult?.neededFacts || [],
+        agent3Skipped: !memoryResult,
+        agent3Error: memoryResult?.error || null,
+        memoryUpdates: memoryResult?.updates?.length || 0,
+        memorySummary: memoryResult?.summary || '',
+        stats: retrieval.stats,
+        contextKeywords,
+        deltaKeywords,
+        injectionChars: injection.length,
+        injected: success,
+    });
 }
 
 // --- Main Pipeline Init ---
