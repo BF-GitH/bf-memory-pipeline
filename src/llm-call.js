@@ -5,7 +5,7 @@
 
 import { addDebugLog } from './settings.js';
 
-const LLM_TIMEOUT_MS = 30000; // 30 second timeout for agent LLM calls
+const LLM_TIMEOUT_MS = 60000; // 60s — bumped from 30s for mobile network tolerance
 
 /** Wrap a promise with a timeout */
 function withTimeout(promise, ms) {
@@ -106,18 +106,31 @@ async function callViaCMRS(profileId, messages) {
  * @returns {Promise<string>} The LLM response text
  */
 export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
-    // Single attempt, then retry ONCE on empty response — providers (Deepseek especially)
-    // intermittently return empty completions; one retry usually succeeds and is cheap.
+    // Up to 2 attempts. Retry on:
+    // - Empty response (providers like Deepseek intermittently return empty)
+    // - Network errors (mobile users hit ERR_NETWORK_CHANGED on WiFi↔cellular switch)
+    let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
-        const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId);
-        if (result && result.trim()) return result;
-        if (attempt === 1) {
-            addDebugLog('info', 'LLM returned empty response, retrying once...');
+        try {
+            const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId);
+            if (result && result.trim()) return result;
+            if (attempt === 1) {
+                addDebugLog('info', 'LLM returned empty response, retrying once...');
+            }
+        } catch (err) {
+            lastError = err;
+            if (attempt === 1) {
+                addDebugLog('info', `LLM call threw (${err.message || err}), retrying once...`);
+            }
         }
     }
-    // Both attempts empty — return empty string. Callers (agent-draft, agent-memory)
+    // Both attempts failed — return empty string. Callers (agent-draft, agent-memory)
     // already handle empty defensively and surface an error.
-    addDebugLog('fail', 'LLM returned empty response on both attempts');
+    if (lastError) {
+        addDebugLog('fail', `LLM call failed on both attempts: ${lastError.message || lastError}`);
+    } else {
+        addDebugLog('fail', 'LLM returned empty response on both attempts');
+    }
     return '';
 }
 

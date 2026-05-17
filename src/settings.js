@@ -1082,7 +1082,42 @@ export async function initSettings() {
             await navigator.clipboard.writeText(logText);
             toastr.success('Logs copied to clipboard', 'BF Memory');
         } catch {
-            prompt('Copy logs:', logText);
+            // Mobile-friendly fallback: prompt() truncates and lacks select-all.
+            // Build a textarea overlay that the user can long-press to select-all.
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.7);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;';
+            const card = document.createElement('div');
+            card.style.cssText = 'background:var(--SmartThemeBlurTintColor,#1a1a2e);padding:16px;border-radius:8px;max-width:600px;width:100%;max-height:80vh;display:flex;flex-direction:column;gap:8px;';
+            const title = document.createElement('div');
+            title.textContent = 'Copy debug log';
+            title.style.cssText = 'font-weight:bold;color:#7bb3ff;';
+            const hint = document.createElement('div');
+            hint.textContent = 'Long-press the text area to Select All, then Copy.';
+            hint.style.cssText = 'font-size:12px;opacity:0.7;';
+            const textarea = document.createElement('textarea');
+            textarea.value = logText;
+            textarea.readOnly = true;
+            textarea.style.cssText = 'width:100%;min-height:200px;flex:1;font-family:monospace;font-size:11px;background:#000;color:#eee;padding:8px;';
+            const buttonRow = document.createElement('div');
+            buttonRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;';
+            const selectAllBtn = document.createElement('button');
+            selectAllBtn.textContent = 'Select All';
+            selectAllBtn.className = 'menu_button';
+            selectAllBtn.onclick = () => { textarea.select(); textarea.setSelectionRange(0, textarea.value.length); };
+            const closeBtn = document.createElement('button');
+            closeBtn.textContent = 'Close';
+            closeBtn.className = 'menu_button';
+            closeBtn.onclick = () => overlay.remove();
+            buttonRow.appendChild(selectAllBtn);
+            buttonRow.appendChild(closeBtn);
+            card.appendChild(title);
+            card.appendChild(hint);
+            card.appendChild(textarea);
+            card.appendChild(buttonRow);
+            overlay.appendChild(card);
+            document.body.appendChild(overlay);
+            // Auto-select on open for desktop convenience
+            setTimeout(() => { textarea.focus(); textarea.select(); }, 0);
         }
     });
 

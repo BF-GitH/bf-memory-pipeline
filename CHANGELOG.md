@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.5.0] - 2026-05-17
+
+### Fixed (10 issues surfaced by persona-based research — Test Suite v3.3)
+
+#### Pipeline / state (HIGH)
+- **`/cut` now also resets `lastProcessedMessageIndex`** (not just `lastTriggeredUserMsgIndex` as in v0.4.0). Previously, after a `/cut`, Agent 3 thought it had already processed indices that no longer existed and silently skipped new AI replies. ([src/pipeline.js](src/pipeline.js) MESSAGE_DELETED handler.)
+- **Pipeline now skips quiet/impersonate/continue generations.** Quick Reply scripts that call `/gen`, the Impersonate button, and `/continue` previously burned billable Agent 1 + Agent 3 LLM calls per invocation. Added filters for `data.quiet`, `data.type === 'quiet'`, `'impersonate'`, `'continue'`. ([src/pipeline.js](src/pipeline.js) `shouldRunPipeline`.)
+- **Character card truncation bumped from 500/300/300 → 2000/1000/1000 chars** (description / personality / scenario). Serious roleplay cards have critical lore in the back half. Prior limits caused Agent 1 to plan replies that contradicted established lore. ([src/pipeline.js](src/pipeline.js) `getCharacterInfo`.)
+
+#### Network resilience (HIGH)
+- **LLM_TIMEOUT_MS bumped from 30s → 60s** for mobile network tolerance. Mobile users on 4G/5G or edge-of-WiFi routinely hit cold-OpenRouter routes that take 20–40s. ([src/llm-call.js](src/llm-call.js))
+- **`callAgentLLM` now retries on network errors**, not just empty responses. Mobile users hit `ERR_NETWORK_CHANGED` mid-call on WiFi↔cellular switches. Each attempt wrapped in try/catch; both empty and thrown errors trigger one retry. ([src/llm-call.js](src/llm-call.js))
+
+#### Agent 3 prompt quality (HIGH)
+- **Transient asterisk actions no longer extracted as facts.** `*she smiled*`, `*nods*`, `*brushes hair*` etc. are now explicitly negative-listed in the Agent 3 prompt for BOTH `{{user}}` AND `{{char}}`. Only lasting reveals like `*revealing a scar from childhood*` get extracted.
+- **OOC brackets `[OOC: ...]` no longer extracted.** `[OOC: my real name is X]` is meta-commentary, not in-character disclosure. Three new few-shot examples added to demonstrate.
+- **Quoted historical text not re-extracted.** When user types `Remember when you said "X"?`, the quoted X isn't extracted as a fresh disclosure.
+
+#### Mobile UX (MED→HIGH)
+- **5-tab strip now wraps + scrolls horizontally on narrow viewports** (360px phones with accessibility zoom). Added `flex-wrap: wrap` + `overflow-x: auto` + 36px min touch target to `.bf-mem-tab`. ([style.css](style.css))
+- **Pull-to-refresh disabled inside drawer scroll containers.** Mobile users could accidentally reload the page when scrolling up inside the DB list / debug log / review popup at the top of their scroll range, losing unsaved edits. `overscroll-behavior: contain` applied to all known scroll containers. ([style.css](style.css))
+- **Copy Log fallback now uses a textarea overlay** instead of `prompt()`. The native `prompt()` truncates long text and lacks select-all on mobile. New overlay has Select All / Close buttons and is long-press friendly. ([src/settings.js](src/settings.js))
+
+### Test Suite v3.3 (139 checks, tiered)
+Bumped from v3.2 (94 checks) after deep research by 3 persona agents: Heavy Roleplayer (15 UX gaps), ST Power User (14 integration gaps), Mobile-Termux User (15 mobile gaps). Total 44 new test cases distributed across Tier 1 (smoke +10 = 23), Tier 2 (integration +22 = 58), Tier 3 (behavioral +12 = 57).
+
+### Known limitations / future work
+- No native mobile-themed dialog for `prompt()`/`confirm()` (DB profile save, delete, etc.). Native Chrome dialogs work but look out-of-place.
+- Author's Note / Vector Storage / built-in Summarize co-injection still order-dependent at depth=1. Future: expose `injectionDepth` setting + use `setExtensionPrompt`.
+- Plot-twist updates still create duplicate keys instead of overwriting (e.g., `char_species = human` + new `char_vampire_reveal`). Future: prompt-side instruction to prefer overwrites.
+- The 5-message context window for Agent 1 is too short for long-arc narrative awareness. Future: per-character override.
+
 ## [0.4.1] - 2026-05-17
 
 ### Fixed (caught by Tier 1 v3.2)

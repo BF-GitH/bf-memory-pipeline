@@ -57,11 +57,14 @@ function getCharacterInfo() {
     const char = context.characters?.[context.characterId];
     if (!char) return '';
 
+    // Bumped from 500/300/300 to 2000/1000/1000 — serious roleplay cards have
+    // critical lore in the back half of the description. The prior limits made
+    // Agent 1 plan replies that contradicted established lore beyond 500 chars.
     const parts = [];
     if (char.name) parts.push(`Name: ${char.name}`);
-    if (char.description) parts.push(`Description: ${char.description.substring(0, 500)}`);
-    if (char.personality) parts.push(`Personality: ${char.personality.substring(0, 300)}`);
-    if (char.scenario) parts.push(`Scenario: ${char.scenario.substring(0, 300)}`);
+    if (char.description) parts.push(`Description: ${char.description.substring(0, 2000)}`);
+    if (char.personality) parts.push(`Personality: ${char.personality.substring(0, 1000)}`);
+    if (char.scenario) parts.push(`Scenario: ${char.scenario.substring(0, 1000)}`);
     return parts.join('\n');
 }
 
@@ -126,8 +129,17 @@ function shouldRunPipeline(data) {
         return false;
     }
 
-    // Skip dry runs
+    // Skip dry runs, quiet generations (slash commands like /gen, /sys),
+    // impersonations (when the user clicks the Impersonate button), and any
+    // other non-genuine generation types. Without this, Quick Reply scripts
+    // that call /gen would burn billable Agent 1 + Agent 3 LLM calls per fire.
     if (data?.dryRun) return false;
+    if (data?.quiet) return false;
+    const generationType = data?.type || data?.generationType;
+    if (generationType === 'quiet' || generationType === 'impersonate' || generationType === 'continue') {
+        addDebugLog('info', `Skipping pipeline (generation type: ${generationType})`);
+        return false;
+    }
 
     // Compute lastUserMsgIndex first — needed to distinguish "real user send" from
     // "spurious chat-load event"
@@ -529,7 +541,12 @@ export function initPipeline() {
                 }
             }
         }
-        addDebugLog('info', `Message deleted — recomputed lastUserMsg=${lastTriggeredUserMsgIndex}`);
+        // Also reset the Agent 3 dedup counter — indices shift after deletion,
+        // and the prior "already processed" guard at runPipelineInline (line ~232)
+        // would otherwise silently skip new AI replies that happen to land at
+        // indices ≤ the stale lastProcessedMessageIndex.
+        lastProcessedMessageIndex = -1;
+        addDebugLog('info', `Message deleted — reset lastUserMsg=${lastTriggeredUserMsgIndex}, lastProcessedMessageIndex=-1`);
     });
 
     // Reset on chat change

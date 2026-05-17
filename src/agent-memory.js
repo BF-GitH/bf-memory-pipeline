@@ -13,7 +13,12 @@ function getSettingsSafe() {
 
 export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Most messages have ZERO facts. Max 3.
 
-CRITICAL: Both {{user}} and {{char}} can reveal facts about themselves. Treat first-person statements from {{user}} as FACTUAL self-disclosure (not roleplay) unless wrapped in *asterisks* (which indicate roleplay actions, not facts).
+CRITICAL RULES:
+- Treat first-person statements from {{user}} as FACTUAL self-disclosure (not roleplay).
+- TRANSIENT ACTIONS in *asterisks* are NOT facts — for EITHER {{user}} OR {{char}}. Skip "*smiles*", "*sighs*", "*brushes hair*", "*nods*", etc. They are momentary poses, not lasting traits.
+- LASTING REVEALS in *asterisks* ARE facts: "*revealing a scar from her childhood*", "*pulls out a vampire fang*". The distinction is permanence — does this say something durable about the entity, or is it a one-off action?
+- OOC text in [OOC: ...] or [ooc: ...] brackets is META-COMMENTARY between the human player and the AI. NEVER extract OOC content as facts. Examples: "[OOC: brief replies tonight, busy]", "[OOC: forget what I said earlier]", "[OOC: my real name is X]" — all ignored.
+- Quoted historical text ("Remember when you said 'X'?") is a QUOTE of prior dialogue, not a new disclosure. Don't re-extract the quoted content as a fresh fact.
 
 DO NOT STORE: momentary actions, poses, gestures, emotions, dialogue quotes, obvious context, transient mood.
 ONLY STORE: traits, backstory, identity (name/job/location/age), preferences, allergies, relationship shifts, world reveals, lasting status changes, recurring behaviors.
@@ -78,7 +83,37 @@ Input: [USER:{{user}}] *grins* "I love it when you do that."
 .
 
 #WHY
-Transient emotional reaction, not a lasting trait.`;
+Transient emotional reaction, not a lasting trait.
+
+---
+
+Input: [USER:{{user}}] [OOC: hey, can we slow the pacing? Also my persona name is Lyra but my real name is Bernd]
+
+#MEM
+.
+
+#WHY
+OOC meta-commentary, not in-character disclosure. Ignored per rules.
+
+---
+
+Input: [CHAR:{{char}}] *She brushes a strand of hair behind her ear, then smiles softly.* "Tell me again."
+
+#MEM
+.
+
+#WHY
+Pure transient action in asterisks, no lasting trait revealed.
+
+---
+
+Input: [USER:{{user}}] Remember when you said "I am the heir of Valdris"? Why did you lie?
+
+#MEM
+.
+
+#WHY
+{{user}} is quoting prior {{char}} dialogue, not disclosing a new fact about themselves.`;
 
 /**
  * Run Agent 3: Analyze message and update databases

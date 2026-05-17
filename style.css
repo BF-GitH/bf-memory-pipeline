@@ -41,6 +41,12 @@
     margin-bottom: 12px;
     border-bottom: 2px solid var(--SmartThemeBorderColor, #444);
     padding-bottom: 0;
+    /* Mobile: allow horizontal scroll if tabs don't fit on narrow viewports
+       (e.g. 360px wide phones with 1.2x accessibility zoom).
+       Tabs visually wrap onto a second row instead of clipping off-screen. */
+    flex-wrap: wrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
 }
 
 .bf-mem-tab {
@@ -54,6 +60,8 @@
     font-size: 13px;
     font-weight: 500;
     transition: all 0.15s;
+    flex: 0 1 auto;
+    min-height: 36px; /* touch target — Material guideline minimum */
 }
 
 .bf-mem-tab:hover {
@@ -541,4 +549,18 @@
     padding: 2px 6px !important;
     font-size: 11px !important;
     color: #f44336 !important;
+}
+
+/* Mobile: prevent pull-to-refresh from accidentally firing when user scrolls
+   up inside an internal scroll container that's already at the top.
+   Without this, scrolling DB list / debug log / review popup at the top of
+   their range reloads the entire page and loses in-progress edits. */
+.bf-mem-settings [class*="bf-mem-"][style*="overflow"],
+.bf-mem-db-list,
+.bf-mem-review-list,
+.bf-mem-debug-log,
+.bf-mem-summary,
+.bf-mem-db-browser,
+.bf-mem-linked-popup {
+    overscroll-behavior: contain;
 }
