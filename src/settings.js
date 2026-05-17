@@ -554,7 +554,9 @@ async function deleteDbProfile(profileName) {
 
 // --- Auto-save DB as chat-named profile ---
 
-let lastAutoSavedChat = '';
+// Was named lastAutoSavedChat — kept the variable but the save logic is gone;
+// it now only tracks the last chat we LOADED to skip redundant loads.
+let lastAutoLoadedChat = '';
 
 function getCurrentChatId() {
     const context = getContext();
@@ -601,16 +603,24 @@ function linkChatToProfile(profileName, chatId) {
 }
 
 /** Save current databases to the active profile (call after DB changes) */
-export async function saveCurrentToActiveProfile() {
-    const profileName = extensionSettings?.activeDbProfile;
+export async function saveCurrentToActiveProfile(profileKey = null) {
+    const profileName = profileKey || extensionSettings?.activeDbProfile;
     if (!profileName) return;
+    // Integrity guard: refuse to write to a profile that no longer exists
+    // (prevents resurrecting a deleted profile or clobbering wrong slot after rename)
+    if (!extensionSettings.dbProfiles?.[profileName]) {
+        addDebugLog('fail', `Skipped save: profile "${profileName}" no longer exists (was current profile deleted?)`);
+        if (typeof toastr !== 'undefined') {
+            toastr.warning(`BF Memory: skipped saving facts — profile "${profileName}" was deleted.`);
+        }
+        return;
+    }
     try {
         const { getAllDatabases } = await import('./database.js');
         const databases = await getAllDatabases();
         const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
         if (totalFacts === 0) return;
 
-        if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
         extensionSettings.dbProfiles[profileName] = {
             ...extensionSettings.dbProfiles[profileName],
             databases: JSON.parse(JSON.stringify(databases)),
@@ -630,30 +640,13 @@ async function autoSaveDbProfile() {
         const chatLabel = getCurrentChatLabel();
 
         if (!chatId) return;
-        if (chatId === lastAutoSavedChat) return; // same chat, already saved
+        if (chatId === lastAutoLoadedChat) return; // same chat, already loaded
 
-        // Save previous chat's databases before switching
-        if (lastAutoSavedChat && extensionSettings.activeDbProfile) {
-            const { getAllDatabases } = await import('./database.js');
-            const databases = await getAllDatabases();
-            const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
-
-            // Only save if there are actual facts
-            if (totalFacts > 0) {
-                const profileName = extensionSettings.activeDbProfile;
-                if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
-                extensionSettings.dbProfiles[profileName] = {
-                    ...extensionSettings.dbProfiles[profileName],
-                    databases: JSON.parse(JSON.stringify(databases)),
-                    savedAt: Date.now(),
-                };
-                // Ensure the previous chat is linked
-                linkChatToProfile(profileName, lastAutoSavedChat);
-                saveSettings();
-                refreshDbProfileDropdown();
-                addDebugLog('info', `Auto-saved DB profile "${profileName}" (${totalFacts} facts)`);
-            }
-        }
+        // NOTE: CHAT_CHANGED only LOADS, never SAVES. Saving here is unsafe because
+        // ST may have already mutated state by flush time, causing the in-memory DB
+        // (belonging to the previous chat) to be written into the wrong profile slot.
+        // Persistence is handled at extraction time via saveCurrentToActiveProfile()
+        // called from pipeline.js after every Agent 3 write (capture-at-write).
 
         // Check if this chat has a linked profile
         let profileToLoad = findProfileForChat(chatId);
@@ -699,7 +692,7 @@ async function autoSaveDbProfile() {
             addDebugLog('info', `Auto-loaded DB profile "${profileToLoad}" (linked to chat ${chatId})`);
         }
 
-        lastAutoSavedChat = chatId;
+        lastAutoLoadedChat = chatId;
     } catch (err) {
         addDebugLog('fail', `Auto-save DB profile failed: ${err.message}`);
     }
@@ -1100,10 +1093,10 @@ export async function initSettings() {
         }
     });
 
-    // Also save after each successful generation (catches Agent 3 DB updates)
-    context.eventSource?.on(context.eventTypes?.MESSAGE_RECEIVED, async () => {
-        await saveCurrentToActiveProfile();
-    });
+    // Note: removed MESSAGE_RECEIVED → saveCurrentToActiveProfile() handler.
+    // pipeline.js now persists via saveCurrentToActiveProfile(capturedDbProfile)
+    // after every Agent 3 write, with capture-at-write semantics. The old
+    // unprotected handler here was a residual leak path (same class as Issue #2).
 
     // --- Initial state ---
     updateStatus('idle');

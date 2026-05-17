@@ -164,12 +164,25 @@ export function createEmptyDatabase(category) {
 export function upsertFact(db, fact) {
     const existingIdx = db.facts.findIndex(f => f.key === fact.key);
     if (existingIdx >= 0) {
-        db.facts[existingIdx] = { ...db.facts[existingIdx], ...fact, lastUpdated: Date.now() };
+        const existing = db.facts[existingIdx];
+        // Merge relationships (union) rather than replace, so prior tier links survive.
+        const mergedRels = mergeRelationships(existing.relationships, fact.relationships);
+        db.facts[existingIdx] = { ...existing, ...fact, relationships: mergedRels, lastUpdated: Date.now() };
     } else {
         db.facts.push({ ...fact, lastUpdated: Date.now() });
     }
     db.updatedAt = Date.now();
     return db;
+}
+
+function mergeRelationships(existing, incoming) {
+    const result = { primary: [], secondary: [], tertiary: [] };
+    for (const tier of ['primary', 'secondary', 'tertiary']) {
+        const e = Array.isArray(existing?.[tier]) ? existing[tier] : [];
+        const i = Array.isArray(incoming?.[tier]) ? incoming[tier] : [];
+        result[tier] = Array.from(new Set([...e, ...i]));
+    }
+    return result;
 }
 
 /**

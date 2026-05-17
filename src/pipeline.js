@@ -146,6 +146,10 @@ function shouldRunPipeline(data) {
 
 async function runPipelineInline(data) {
     const settings = getSettings();
+    // Capture-at-write: pin the active profile at pipeline start so that if the
+    // user switches chat/profile mid-run, our Agent 3 save still lands in the
+    // correct slot (the profile this pipeline was reading from).
+    const capturedDbProfile = settings?.activeDbProfile;
     const context = SillyTavern.getContext();
     const chat = context.chat;
     const charName = context.characters?.[context.characterId]?.name || '(unknown)';
@@ -180,6 +184,8 @@ async function runPipelineInline(data) {
     updateStatus('running', 'Preparing facts...');
 
     // Find memory target (last AI message before the new user message)
+    // TODO: consider running Agent 3 on the previous USER message as well, not only the AI message,
+    // so explicit user disclosures (e.g. "I work at Google") get extracted from the user side directly.
     let memoryTargetIndex = -1;
     for (let i = chat.length - 2; i >= 0; i--) {
         if (chat[i] && !chat[i].is_user && chat[i].mes) {
@@ -222,15 +228,23 @@ async function runPipelineInline(data) {
                 .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
         );
 
-        // Agent 3: Memory update
+        // Agent 3: Memory update — single call that sees BOTH the latest user message
+        // (just-sent, safe to extract from) AND the N-1 AI message (already committed).
+        // This captures user disclosures ("I'm Bernd, I work at Google") that the prior
+        // AI-only target missed entirely.
         if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
             const targetMessage = chat[memoryTargetIndex];
             const role = targetMessage.is_user ? 'USER' : 'AI';
-            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}: ${targetMessage.mes}`);
+            // Find latest user message; pass to Agent 3 alongside the AI target.
+            // Skip if it IS the target (avoids duplicating same message).
+            const prevUserMsg = (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex)
+                ? chat[lastUserMsgIndex]?.mes
+                : null;
+            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}${prevUserMsg ? ` + user msg ${lastUserMsgIndex}` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
 
             const databases = await getAllDatabases();
             promises.push(
-                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, memoryProfileId)
+                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, memoryProfileId, !!targetMessage.is_user, userPersona, prevUserMsg)
                     .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
             );
         } else {
@@ -284,8 +298,10 @@ async function runPipelineInline(data) {
             }, 2000);
         }
         // Persist to active DB profile immediately after Agent 3 writes
+        // Use the profile captured at pipeline start, not whatever is active now —
+        // user may have switched chats while Agent 3 was running.
         if (memoryResult.updates.length > 0) {
-            await saveCurrentToActiveProfile();
+            await saveCurrentToActiveProfile(capturedDbProfile);
         }
     } else if (memoryResult?.error) {
         addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);

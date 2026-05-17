@@ -1,51 +1,96 @@
 // BF Memory Pipeline - Review Popup
 // Every N messages, shows user all new/changed facts for review
 
-let pendingReviewItems = [];
-let messagesSinceLastReview = 0;
+const META_KEY = 'bf_mem_review';
+
+function getMeta() {
+    try {
+        const md = SillyTavern.getContext().chatMetadata || SillyTavern.getContext().chat_metadata;
+        if (!md) return null;
+        if (!md[META_KEY]) md[META_KEY] = { messagesSinceLastReview: 0, pendingReviewItems: [] };
+        // Drain any fallback state accumulated before chat metadata was available
+        // (e.g. during extension boot, before the user opened a chat). Without this,
+        // those items would be permanently stranded outside any chat's persistence.
+        if (fallbackPending.length > 0) {
+            md[META_KEY].pendingReviewItems.push(...fallbackPending);
+            fallbackPending = [];
+        }
+        if (fallbackCounter > 0) {
+            md[META_KEY].messagesSinceLastReview = (md[META_KEY].messagesSinceLastReview || 0) + fallbackCounter;
+            fallbackCounter = 0;
+        }
+        return md[META_KEY];
+    } catch { return null; }
+}
+
+function saveMeta() {
+    try { SillyTavern.getContext().saveMetadata?.(); } catch { /* best-effort */ }
+}
+
+// In-memory fallback if chat_metadata is unavailable (extension boot, no chat yet)
+let fallbackPending = [];
+let fallbackCounter = 0;
 
 /**
  * Track a new fact update for eventual review
- * @param {Object} update - Fact update from Agent 3
  */
 export function trackUpdate(update) {
-    pendingReviewItems.push({
-        ...update,
-        timestamp: Date.now(),
-        reviewed: false,
-    });
+    const entry = { ...update, timestamp: Date.now(), reviewed: false };
+    const meta = getMeta();
+    if (meta) {
+        meta.pendingReviewItems.push(entry);
+        saveMeta();
+    } else {
+        fallbackPending.push(entry);
+    }
 }
 
 /**
  * Increment message counter and check if review is due
- * @param {number} reviewInterval - How many messages between reviews
- * @returns {boolean} True if review popup should show
  */
 export function tickMessageCounter(reviewInterval) {
-    messagesSinceLastReview++;
-    return messagesSinceLastReview >= reviewInterval && pendingReviewItems.length > 0;
+    const meta = getMeta();
+    if (meta) {
+        meta.messagesSinceLastReview = (meta.messagesSinceLastReview || 0) + 1;
+        saveMeta();
+        return meta.messagesSinceLastReview >= reviewInterval && (meta.pendingReviewItems?.length || 0) > 0;
+    }
+    fallbackCounter++;
+    return fallbackCounter >= reviewInterval && fallbackPending.length > 0;
 }
 
 /**
  * Reset the message counter (after review is shown)
  */
 export function resetCounter() {
-    messagesSinceLastReview = 0;
+    const meta = getMeta();
+    if (meta) {
+        meta.messagesSinceLastReview = 0;
+        saveMeta();
+    } else {
+        fallbackCounter = 0;
+    }
 }
 
 /**
- * Get pending items and clear the queue
- * @returns {Array}
+ * Get pending items
  */
 export function getPendingItems() {
-    return [...pendingReviewItems];
+    const meta = getMeta();
+    return [...(meta ? meta.pendingReviewItems || [] : fallbackPending)];
 }
 
 /**
  * Clear all pending items (after user accepts)
  */
 export function clearPendingItems() {
-    pendingReviewItems = [];
+    const meta = getMeta();
+    if (meta) {
+        meta.pendingReviewItems = [];
+        saveMeta();
+    } else {
+        fallbackPending = [];
+    }
 }
 
 /**

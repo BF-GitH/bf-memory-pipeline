@@ -110,22 +110,39 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         return false;
     });
 
+    // Filter by knownBy: only include facts the current character knows.
+    // Empty knownBy means "everyone knows" (no filter).
+    const ctx = SillyTavern.getContext();
+    const currentCharName = ctx.characters?.[ctx.characterId]?.name || '';
+    const currentUserName = ctx.name1 || '';
+    const visibleResults = filteredResults.filter(({ fact }) => {
+        const kb = fact.knownBy || [];
+        if (kb.length === 0) return true; // everyone knows
+        return kb.some(name => {
+            const n = String(name).toLowerCase();
+            return n === currentCharName.toLowerCase()
+                || n === currentUserName.toLowerCase()
+                || n === '{{char}}' || n === '{{user}}'
+                || n === 'everyone' || n === 'all';
+        });
+    });
+
     // Format for Agent 2
-    const formatted = formatFactsForWriter(filteredResults);
+    const formatted = formatFactsForWriter(visibleResults);
 
     const stats = {
-        primary: filteredResults.filter(r => r.tier === 'primary').length,
-        secondary: filteredResults.filter(r => r.tier === 'secondary').length,
-        tertiary: filteredResults.filter(r => r.tier === 'tertiary').length,
+        primary: visibleResults.filter(r => r.tier === 'primary').length,
+        secondary: visibleResults.filter(r => r.tier === 'secondary').length,
+        tertiary: visibleResults.filter(r => r.tier === 'tertiary').length,
     };
 
-    addDebugLog('info', `Retrieval result: ${filteredResults.length} facts (P:${stats.primary} S:${stats.secondary} T:${stats.tertiary})`);
-    if (filteredResults.length > 0) {
-        const factSummary = filteredResults.slice(0, 5).map(r => `[${r.tier[0].toUpperCase()}] ${r.category}:${r.fact.key}`).join(', ');
-        addDebugLog('info', `Top facts: ${factSummary}${filteredResults.length > 5 ? ` (+${filteredResults.length - 5} more)` : ''}`);
+    addDebugLog('info', `Retrieval result: ${visibleResults.length} facts (P:${stats.primary} S:${stats.secondary} T:${stats.tertiary})`);
+    if (visibleResults.length > 0) {
+        const factSummary = visibleResults.slice(0, 5).map(r => `[${r.tier[0].toUpperCase()}] ${r.category}:${r.fact.key}`).join(', ');
+        addDebugLog('info', `Top facts: ${factSummary}${visibleResults.length > 5 ? ` (+${visibleResults.length - 5} more)` : ''}`);
     }
 
-    return { facts: filteredResults, formatted, stats };
+    return { facts: visibleResults, formatted, stats };
 }
 
 /**
@@ -181,6 +198,12 @@ const STOP_WORDS = new Set([
     'kept', 'heard', 'reached', 'stepped', 'stopped', 'started',
     'seemed', 'meant', 'tried', 'knew', 'felt', 'ran', 'set',
     'may', 'can', 'own', 'off', 'out', 'away', 'else', 'ever',
+    // Contractions (apostrophes stripped upstream)
+    'ive', 'ill', 'youre', 'whats', 'dont', 'isnt', 'wasnt', 'hes', 'shes',
+    'weve', 'theyre', 'youve', 'theyve', 'cant', 'couldnt', 'wouldnt',
+    'shouldnt', 'hasnt', 'havent', 'didnt', 'doesnt', 'arent', 'werent',
+    'thats', 'whos', 'lets', 'im', 'youll', 'hell', 'shell', 'well',
+    'theyll', 'thatll', 'heres', 'theres', 'wheres',
 ]);
 
 export function extractContextKeywords(messages) {

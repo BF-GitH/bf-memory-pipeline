@@ -11,42 +11,58 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages. Most messages have ZERO facts. Max 3.
+export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Most messages have ZERO facts. Max 3.
 
-DO NOT STORE: momentary actions, poses, gestures, emotions, dialogue quotes, obvious context.
-ONLY STORE: traits, backstory, relationship shifts, world reveals, lasting status changes, recurring behaviors.
+CRITICAL: Both {{user}} and {{char}} can reveal facts about themselves. Treat first-person statements from {{user}} as FACTUAL self-disclosure (not roleplay) unless wrapped in *asterisks* (which indicate roleplay actions, not facts).
+
+DO NOT STORE: momentary actions, poses, gestures, emotions, dialogue quotes, obvious context, transient mood.
+ONLY STORE: traits, backstory, identity (name/job/location/age), preferences, allergies, relationship shifts, world reveals, lasting status changes, recurring behaviors.
 
 CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 
 OUTPUT FORMAT:
 #MEM
-+ Category/key_name = concise fact value | @WhoKnows1,WhoKnows2 | #tag1,tag2
++ Category/key_name = concise fact value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_key1,related_key2
 .
 
 RULES:
 - One fact per line, starting with +
-- key_name: short snake_case (e.g. apple_allergy, arm_scar, trust_level)
+- key_name: short snake_case (e.g. user_employer, char_arm_scar, trust_level)
 - value: plain text, concise as possible
-- @: characters who know/witnessed this (comma-separated, no spaces)
+- @: characters who know/witnessed this. Use {{user}} for the human player, {{char}} for the AI character (comma-separated, no spaces)
 - #: search tags (comma-separated, no spaces)
+- rel: (optional) keys or topic words for facts that should co-activate when this fact matches. Use snake_case keys, comma-separated, no spaces. Skip the segment entirely if no clear relationships exist.
 - End fact list with a single . on its own line
 - If NOTHING worth storing, just write . immediately
 - After facts write #WHY with one sentence explaining your reasoning
 
 EXAMPLES:
 
-Input: Character A pushes hair back revealing a jagged scar. "Got it at seven. Greenhouse roof." Character B stares.
+Input: [USER:{{user}}] "Hi! I'm Bernd. I work at Google in Berlin as a software engineer. I love pizza and I'm allergic to peanuts."
 
 #MEM
-+ Identity/char_a_facial_scar = Jagged scar temple to jaw, childhood greenhouse accident age 7 | @CharA,CharB | #appearance,injury,backstory
++ Identity/user_name = Bernd | @{{user}},{{char}} | #identity,name,user | rel:user_employer_location
++ Identity/user_employer_location = Software engineer at Google in Berlin | @{{user}},{{char}} | #identity,job,location,user | rel:user_name,berlin,google
++ Status/user_peanut_allergy = Allergic to peanuts | @{{user}},{{char}} | #health,allergy,user | rel:user_name
 .
 
 #WHY
-Permanent physical trait with backstory revealed.
+{{user}} disclosed durable identity facts: name, employer, location, occupation, allergy.
 
 ---
 
-Input: They chat about the weather and eat lunch.
+Input: [CHAR:{{char}}] *She pushes her hair back, revealing a jagged scar.* "Got it at seven. Greenhouse roof."
+
+#MEM
++ Identity/char_facial_scar = Jagged scar, childhood greenhouse accident age 7 | @{{char}},{{user}} | #appearance,injury,backstory
+.
+
+#WHY
+{{char}} revealed a permanent physical trait with backstory.
+
+---
+
+Input: [CHAR:{{char}}] They chat about the weather and eat lunch.
 
 #MEM
 .
@@ -56,15 +72,13 @@ No lasting facts.
 
 ---
 
-Input: Character B admits she already knew about Character A's past. Trust between them deepens.
+Input: [USER:{{user}}] *grins* "I love it when you do that."
 
 #MEM
-+ Relationships/b_knew_a_past = B already knew about A's past before he told her | @CharA,CharB | #trust,secrets
-+ Relationships/a_b_trust = Deepened after mutual honesty about his past | @CharA,CharB | #trust,bond
 .
 
 #WHY
-Relationship shift - mutual trust established.`;
+Transient emotional reaction, not a lasting trait.`;
 
 /**
  * Run Agent 3: Analyze message and update databases
@@ -74,8 +88,8 @@ Relationship shift - mutual trust established.`;
  * @param {Object} existingDatabases - Current state of all databases
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null) {
-    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases);
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', prevUserMessage = null) {
+    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, prevUserMessage);
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -101,16 +115,21 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 /**
  * Build the prompt for Agent 3
  */
-function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
+function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, prevUserMessage = null) {
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
-    // System message: pure instruction
-    const systemPrompt = sysPrompt;
+    // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
+    const ctx = SillyTavern.getContext();
+    const substitute = ctx.substituteParams || ctx.substituteParamsExtended || (s => s);
+    const systemPrompt = substitute(sysPrompt);
 
     // User message: data to analyze
     const dataParts = [];
     if (characterInfo) {
-        dataParts.push(`## Character Info\n${characterInfo}`);
+        dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
+    }
+    if (userPersona) {
+        dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
     }
 
     const dbSummary = summarizeDatabases(existingDatabases);
@@ -118,10 +137,19 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
         dataParts.push(`## Existing Databases\n${dbSummary}`);
     }
 
-    dataParts.push(`## Message to Analyze\n${messageText}`);
-    dataParts.push('\nNow output ONLY #MEM and #WHY sections.');
+    // Tag the source role so the model can't collapse user disclosures into RP narrative.
+    // If a prior user message is given, include BOTH messages in the analyzed block so
+    // user-side self-disclosures get captured (otherwise Agent 3 only sees the AI's N-1
+    // message and misses things like "I'm Bernd, I work at Google").
+    const roleTag = isUserMessage ? '[USER:{{user}}]' : '[CHAR:{{char}}]';
+    const messageBlock = prevUserMessage
+        ? `[USER:{{user}}] ${prevUserMessage}\n\n${roleTag} ${messageText}`
+        : `${roleTag} ${messageText}`;
+    dataParts.push(`## Messages to Analyze\n${messageBlock}`);
+    dataParts.push('\nExtract facts from EITHER message. Now output ONLY #MEM and #WHY sections.');
 
-    return { systemPrompt, userPrompt: dataParts.join('\n\n') };
+    // Resolve macros in the data block too
+    return { systemPrompt, userPrompt: substitute(dataParts.join('\n\n')) };
 }
 
 /**
@@ -230,6 +258,7 @@ function parseMemoryUpdateResult(response, messageIndex) {
         const value = segments[0] || '';
         let knownBy = [];
         let tags = [];
+        let relationships = [];
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -243,6 +272,12 @@ function parseMemoryUpdateResult(response, messageIndex) {
             // #tags
             if (seg.startsWith('#')) {
                 tags = seg.slice(1).split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // rel:keywords (optional relationship hints)
+            if (seg.startsWith('rel:')) {
+                relationships = seg.slice(4).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
                 continue;
             }
 
@@ -265,6 +300,7 @@ function parseMemoryUpdateResult(response, messageIndex) {
             value,
             tags,
             knownBy,
+            relationships,
             source: `msg_${messageIndex}`,
         });
     }
@@ -298,10 +334,15 @@ async function applyUpdates(updates, existingDatabases) {
             value: update.value || '',
             tags: update.tags || [],
             knownBy: update.knownBy || [],
-            relationships: { primary: [], secondary: [], tertiary: [] },
+            relationships: {
+                primary: Array.isArray(update.relationships) ? update.relationships : [],
+                secondary: [],
+                tertiary: [],
+            },
             source: update.source,
         });
-        addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"`);
+        const relCount = update.relationships?.length || 0;
+        addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
 
         modified.add(category);
     }
