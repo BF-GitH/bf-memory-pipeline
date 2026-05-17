@@ -416,7 +416,8 @@ function refreshDbProfileDropdown() {
         option.value = name;
         const factCount = Object.values(profile.databases || {}).reduce((sum, db) => sum + (db.facts?.length || 0), 0);
         const dbCount = Object.keys(profile.databases || {}).length;
-        option.textContent = `${name} (${dbCount} dbs, ${factCount} facts)`;
+        const linkCount = (profile.linkedChats || []).length;
+        option.textContent = `${name} (${dbCount} dbs, ${factCount} facts${linkCount ? `, ${linkCount} chats` : ''})`;
         select.appendChild(option);
     }
 
@@ -489,40 +490,106 @@ async function deleteDbProfile(profileName) {
 
 let lastAutoSavedChat = '';
 
+function getCurrentChatId() {
+    const context = getContext();
+    // ST stores the current chat filename (unique per chat)
+    return context.getCurrentChatId?.() || context.chatId || '';
+}
+
+function getCurrentChatLabel() {
+    const context = getContext();
+    const charName = context.characters?.[context.characterId]?.name || '';
+    const chatId = getCurrentChatId();
+    // Use character name as the default profile name
+    return charName || chatId || '';
+}
+
+/** Find which profile is linked to a given chat ID */
+function findProfileForChat(chatId) {
+    if (!chatId || !extensionSettings?.dbProfiles) return null;
+    for (const [name, profile] of Object.entries(extensionSettings.dbProfiles)) {
+        if ((profile.linkedChats || []).includes(chatId)) return name;
+    }
+    return null;
+}
+
+/** Link a chat to a profile */
+function linkChatToProfile(profileName, chatId) {
+    if (!profileName || !chatId) return;
+    const profile = extensionSettings?.dbProfiles?.[profileName];
+    if (!profile) return;
+
+    if (!profile.linkedChats) profile.linkedChats = [];
+
+    // Remove this chat from any other profile first
+    for (const [name, p] of Object.entries(extensionSettings.dbProfiles)) {
+        if (name !== profileName && p.linkedChats) {
+            p.linkedChats = p.linkedChats.filter(id => id !== chatId);
+        }
+    }
+
+    if (!profile.linkedChats.includes(chatId)) {
+        profile.linkedChats.push(chatId);
+    }
+    saveSettings();
+}
+
 async function autoSaveDbProfile() {
     try {
         const context = getContext();
-        // Get current chat name from ST context
-        const chatName = context.characters?.[context.characterId]?.name
-            || context.groups?.find(g => g.id === context.groupId)?.name
-            || '';
+        const chatId = getCurrentChatId();
+        const chatLabel = getCurrentChatLabel();
 
-        if (!chatName) return;
-        if (chatName === lastAutoSavedChat) return; // same chat, already saved
+        if (!chatId) return;
+        if (chatId === lastAutoSavedChat) return; // same chat, already saved
 
         // Save previous chat's databases before switching
-        if (lastAutoSavedChat) {
+        if (lastAutoSavedChat && extensionSettings.activeDbProfile) {
             const { getAllDatabases } = await import('./database.js');
             const databases = await getAllDatabases();
             const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
 
             // Only save if there are actual facts
             if (totalFacts > 0) {
+                const profileName = extensionSettings.activeDbProfile;
                 if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
-                extensionSettings.dbProfiles[lastAutoSavedChat] = {
+                extensionSettings.dbProfiles[profileName] = {
+                    ...extensionSettings.dbProfiles[profileName],
                     databases: JSON.parse(JSON.stringify(databases)),
                     savedAt: Date.now(),
                 };
-                extensionSettings.activeDbProfile = lastAutoSavedChat;
+                // Ensure the previous chat is linked
+                linkChatToProfile(profileName, lastAutoSavedChat);
                 saveSettings();
                 refreshDbProfileDropdown();
-                addDebugLog('info', `Auto-saved DB profile "${lastAutoSavedChat}" (${totalFacts} facts)`);
+                addDebugLog('info', `Auto-saved DB profile "${profileName}" (${totalFacts} facts)`);
             }
         }
 
-        // Load the new chat's profile if it exists
-        if (extensionSettings.dbProfiles?.[chatName]) {
-            const profile = extensionSettings.dbProfiles[chatName];
+        // Check if this chat has a linked profile
+        let profileToLoad = findProfileForChat(chatId);
+
+        // If no linked profile exists, create one named after the chat/character
+        if (!profileToLoad && chatLabel) {
+            // Only auto-create if we're entering a chat for the first time
+            if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+            if (!extensionSettings.dbProfiles[chatLabel]) {
+                extensionSettings.dbProfiles[chatLabel] = {
+                    databases: {},
+                    savedAt: Date.now(),
+                    linkedChats: [chatId],
+                };
+                addDebugLog('info', `Auto-created DB profile "${chatLabel}" for chat ${chatId}`);
+            } else {
+                // Profile with that name exists, link this chat to it
+                linkChatToProfile(chatLabel, chatId);
+            }
+            profileToLoad = chatLabel;
+        }
+
+        // Load the linked profile
+        if (profileToLoad && extensionSettings.dbProfiles?.[profileToLoad]) {
+            const profile = extensionSettings.dbProfiles[profileToLoad];
             const { getAllDatabases, deleteDatabase, saveDatabase } = await import('./database.js');
 
             // Clear existing
@@ -536,16 +603,31 @@ async function autoSaveDbProfile() {
                 await saveDatabase({ ...db, category });
             }
 
-            extensionSettings.activeDbProfile = chatName;
+            extensionSettings.activeDbProfile = profileToLoad;
             saveSettings();
             refreshDbProfileDropdown();
-            addDebugLog('info', `Auto-loaded DB profile "${chatName}"`);
+            refreshLinkedChatsField();
+            addDebugLog('info', `Auto-loaded DB profile "${profileToLoad}" (linked to chat ${chatId})`);
         }
 
-        lastAutoSavedChat = chatName;
+        lastAutoSavedChat = chatId;
     } catch (err) {
         addDebugLog('fail', `Auto-save DB profile failed: ${err.message}`);
     }
+}
+
+function refreshLinkedChatsField() {
+    const input = document.getElementById('bf_mem_db_linked_chats');
+    if (!input) return;
+    // Show linked chats for whichever profile is selected in the dropdown
+    const selected = document.getElementById('bf_mem_db_profile_select')?.value;
+    const profileName = selected || extensionSettings?.activeDbProfile;
+    if (!profileName || !extensionSettings?.dbProfiles?.[profileName]) {
+        input.value = '';
+        return;
+    }
+    const profile = extensionSettings.dbProfiles[profileName];
+    input.value = (profile.linkedChats || []).join(', ');
 }
 
 // --- Init ---
@@ -737,6 +819,24 @@ export async function initSettings() {
             return;
         }
         deleteDbProfile(selected);
+    });
+
+    // Linked chats field
+    refreshLinkedChatsField();
+    $('#bf_mem_db_profile_select').on('change', () => refreshLinkedChatsField());
+
+    $('#bf_mem_db_linked_save').on('click', () => {
+        const profileName = $('#bf_mem_db_profile_select').val() || extensionSettings?.activeDbProfile;
+        if (!profileName || !extensionSettings?.dbProfiles?.[profileName]) {
+            toastr.warning('No profile selected', 'BF Memory');
+            return;
+        }
+        const raw = $('#bf_mem_db_linked_chats').val() || '';
+        const chatIds = raw.split(',').map(s => s.trim()).filter(Boolean);
+        extensionSettings.dbProfiles[profileName].linkedChats = chatIds;
+        saveSettings();
+        toastr.success(`Updated linked chats for "${profileName}"`, 'BF Memory');
+        addDebugLog('info', `Profile "${profileName}" linked to: ${chatIds.join(', ') || '(none)'}`);
     });
 
     // --- Database Tab ---
