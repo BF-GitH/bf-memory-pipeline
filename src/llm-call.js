@@ -106,6 +106,22 @@ async function callViaCMRS(profileId, messages) {
  * @returns {Promise<string>} The LLM response text
  */
 export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
+    // Single attempt, then retry ONCE on empty response — providers (Deepseek especially)
+    // intermittently return empty completions; one retry usually succeeds and is cheap.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId);
+        if (result && result.trim()) return result;
+        if (attempt === 1) {
+            addDebugLog('info', 'LLM returned empty response, retrying once...');
+        }
+    }
+    // Both attempts empty — return empty string. Callers (agent-draft, agent-memory)
+    // already handle empty defensively and surface an error.
+    addDebugLog('fail', 'LLM returned empty response on both attempts');
+    return '';
+}
+
+async function callAgentLLMOnce(systemPrompt, userPrompt, profileId) {
     const messages = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },

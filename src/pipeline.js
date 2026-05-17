@@ -308,11 +308,12 @@ async function runPipelineInline(data) {
     }
 
     // --- Process Agent 1 results + merge with speculative retrieval ---
+    // GRACEFUL DEGRADATION: if Agent 1 errored (e.g. provider returned empty completion
+    // even after retry), don't abort the whole pipeline — the writer can still inject
+    // the retrieved facts with no draft. Memory > nothing.
     if (!draftResult || draftResult.error) {
-        addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'}`);
-        hideWorkingIndicator();
-        updateStatus('error', 'Draft agent failed');
-        return;
+        addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
+        draftResult = { draft: '', neededFacts: [], raw: '' };
     }
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
