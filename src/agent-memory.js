@@ -11,54 +11,60 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You are a selective fact extraction agent for a roleplay. Extract ONLY facts that will still matter 10+ messages from now.
+export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages. Most messages have ZERO facts. Max 3.
 
-STRICT RULES - DO NOT STORE:
-- Momentary positions/gestures ("sat down", "stood up", "turned around")
-- Transient scene choreography ("pulled stool closer", "blanket on cot")
-- Exact dialogue quotes (unless they reveal a LASTING truth)
-- Momentary emotions/reactions ("surprised", "smiled")
-- Things already obvious from context
+DO NOT STORE: momentary actions, poses, gestures, emotions, dialogue quotes, obvious context.
+ONLY STORE: traits, backstory, relationship shifts, world reveals, lasting status changes, recurring behaviors.
 
-ONLY STORE facts that are:
-- Character traits, abilities, backstory, or identity
-- Relationship changes (trust gained, conflict started, promises made)
-- World/lore reveals (locations, rules, history)
-- Lasting status changes (new injury, new possession, living situation change)
-- Key decisions or turning points
-
-BUDGET: Most messages have 0 facts worth storing. Rarely 1-2. Maximum 3 per message. When in doubt, store NOTHING.
-
-FIXED CATEGORIES (use ONLY these):
-- Identity: name, species, appearance, age, abilities, personality traits
-- Relationships: how characters feel about each other, promises, conflicts, trust levels
-- World: locations, lore, rules, important objects, organizations
-- History: backstory reveals, key past events, turning points
-- Status: lasting state changes (injuries, possessions, living situation)
-- Behavior: recurring habits, speech patterns, coping mechanisms, routines (NOT one-time actions)
-- Dialogue: significant promises, confessions, lies, recurring phrases, important reveals (NOT ordinary conversation)
-
-FACT FORMAT:
-{
-  "action": "add" | "update" | "delete",
-  "category": "Identity" | "Relationships" | "World" | "History" | "Status" | "Behavior" | "Dialogue",
-  "key": "fact_identifier",
-  "value": "concise fact description",
-  "tags": ["tag1", "tag2"],
-  "knownBy": ["Character1", "Character2"],
-  "relationships": {
-    "primary": ["DirectlyRelatedCategory"],
-    "secondary": ["SomewhatRelatedCategory"],
-    "tertiary": ["DistantlyRelatedCategory"]
-  }
-}
+CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 
 OUTPUT FORMAT:
-#Facts:
-[One JSON object per line, or (none)]
+#MEM
++ Category/key_name = concise fact value | @WhoKnows1,WhoKnows2 | #tag1,tag2
+.
 
-#Summary:
-[1-2 sentences, or "No new facts to record."]`;
+RULES:
+- One fact per line, starting with +
+- key_name: short snake_case (e.g. apple_allergy, arm_scar, trust_level)
+- value: plain text, concise as possible
+- @: characters who know/witnessed this (comma-separated, no spaces)
+- #: search tags (comma-separated, no spaces)
+- End fact list with a single . on its own line
+- If NOTHING worth storing, just write . immediately
+- After facts write #WHY with one sentence explaining your reasoning
+
+EXAMPLES:
+
+Input: Felix pushes hair back revealing a jagged scar. "Got it at seven. Greenhouse roof." Naoto stares.
+
+#MEM
++ Identity/felix_facial_scar = Jagged scar temple to jaw, childhood greenhouse accident age 7 | @Felix,Naoto | #appearance,injury,backstory
+.
+
+#WHY
+Permanent physical trait with backstory revealed.
+
+---
+
+Input: They chat about the weather and eat lunch.
+
+#MEM
+.
+
+#WHY
+No lasting facts.
+
+---
+
+Input: Naoto admits she already knew about Felix's past. Trust between them deepens.
+
+#MEM
++ Relationships/naoto_knew_felix_past = Naoto already knew about Felix's past before he told her | @Felix,Naoto | #trust,secrets
++ Relationships/felix_naoto_trust = Deepened after mutual honesty about his past | @Felix,Naoto | #trust,bond
+.
+
+#WHY
+Relationship shift - mutual trust established.`;
 
 /**
  * Run Agent 3: Analyze message and update databases
@@ -119,21 +125,25 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases) {
 }
 
 /**
- * Summarize databases for the prompt (keep it compact)
+ * Summarize databases for the prompt (compact, mirrors output format)
  */
 function summarizeDatabases(databases) {
     if (!databases || Object.keys(databases).length === 0) return '(No databases yet)';
 
     const lines = [];
     for (const [category, db] of Object.entries(databases)) {
-        const factKeys = db.facts.map(f => f.key).join(', ');
-        lines.push(`[${category}] (${db.facts.length} facts): ${factKeys}`);
+        for (const fact of db.facts) {
+            const known = fact.knownBy?.length ? ` | @${fact.knownBy.join(',')}` : '';
+            const tags = fact.tags?.length ? ` | #${fact.tags.join(',')}` : '';
+            lines.push(`${category}/${fact.key} = ${fact.value}${known}${tags}`);
+        }
     }
     return lines.join('\n');
 }
 
 /**
- * Parse Agent 3's response
+ * Parse Agent 3's compact #MEM format response
+ * Format: + Category/key = value | @KnownBy | #tags
  */
 function parseMemoryUpdateResult(response, messageIndex) {
     const result = {
@@ -148,66 +158,114 @@ function parseMemoryUpdateResult(response, messageIndex) {
         return result;
     }
 
-    // Extract summary
-    const summaryMatch = response.match(/#Summary:?\s*([\s\S]*?)$/i);
-    if (summaryMatch) {
-        result.summary = summaryMatch[1].trim();
+    // Strip markdown code fences if model wraps output
+    let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim());
+    text = text.replace(/```/g, '');
+
+    // Extract #WHY section
+    const whyMatch = text.match(/#WHY\s*([\s\S]*?)$/i);
+    if (whyMatch) {
+        result.summary = whyMatch[1].trim();
     }
 
-    // Extract facts section
-    const factsMatch = response.match(/#Facts:?\s*([\s\S]*?)(?=#Summary|$)/i);
-    if (!factsMatch || factsMatch[1].trim() === '(none)') {
+    // Extract #MEM section
+    const memMatch = text.match(/#MEM\s*([\s\S]*?)(?=\n\s*#WHY|\n\s*#SUMMARY|$)/i);
+    if (!memMatch) return result;
+
+    const memBlock = memMatch[1].trim();
+
+    // If just "." or "(none)" or empty — nothing to store
+    if (!memBlock || memBlock === '.' || /^\(none\)$/i.test(memBlock)) {
         return result;
     }
 
-    // Parse each JSON object (handles nested braces via brace counting)
-    const factsRaw = factsMatch[1].trim();
-    const jsonObjects = extractJsonObjects(factsRaw);
+    const VALID_CATEGORIES = ['identity', 'relationships', 'world', 'history', 'status', 'behavior'];
 
-    for (const jsonStr of jsonObjects) {
-        try {
-            const fact = JSON.parse(jsonStr);
-            if (fact.category && fact.key) {
-                fact.source = `msg_${messageIndex}`;
-                result.updates.push(fact);
-            }
-        } catch {
-            console.warn('[BFMemory] Failed to parse fact JSON:', jsonStr.substring(0, 100));
-            addDebugLog('fail', `JSON parse error: ${jsonStr.substring(0, 80)}`);
+    for (const rawLine of memBlock.split('\n')) {
+        // Strip leading bullets, numbering, whitespace
+        let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
+        if (!line || line === '.') continue;
+
+        // Must start with +
+        if (!line.startsWith('+')) continue;
+        line = line.slice(1).trim();
+
+        // Parse: Category/key = value | @KnownBy | #tags
+        // Split on = first (rejoin if value contains =)
+        const eqIdx = line.indexOf('=');
+        if (eqIdx < 0) continue;
+
+        const pathPart = line.slice(0, eqIdx).trim();
+        const rest = line.slice(eqIdx + 1).trim();
+
+        // Parse category/key from path
+        const slashIdx = pathPart.indexOf('/');
+        let category, key;
+        if (slashIdx >= 0) {
+            category = pathPart.slice(0, slashIdx).trim();
+            key = pathPart.slice(slashIdx + 1).trim();
+        } else {
+            // No slash — treat whole thing as key, default to Status
+            category = 'Status';
+            key = pathPart;
         }
+
+        // Normalize category (capitalize first letter)
+        category = category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
+        if (!VALID_CATEGORIES.includes(category.toLowerCase())) {
+            category = 'Status'; // fallback
+        }
+
+        // Clean key to snake_case
+        key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+        if (!key) continue;
+
+        // Split rest on | to get value, @knownBy, #tags
+        const segments = rest.split('|').map(s => s.trim());
+        const value = segments[0] || '';
+        let knownBy = [];
+        let tags = [];
+
+        for (let i = 1; i < segments.length; i++) {
+            const seg = segments[i].trim();
+
+            // @KnownBy
+            if (seg.startsWith('@')) {
+                knownBy = seg.slice(1).split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // #tags
+            if (seg.startsWith('#')) {
+                tags = seg.slice(1).split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // Fallback: try known patterns
+            const knowsMatch = seg.match(/^(?:knows|knownby|known\s*by)\s*:\s*(.+)/i);
+            if (knowsMatch) {
+                knownBy = knowsMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+            const tagsMatch = seg.match(/^(?:tags?)\s*:\s*(.+)/i);
+            if (tagsMatch) {
+                tags = tagsMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+            }
+        }
+
+        result.updates.push({
+            action: 'add',
+            category,
+            key,
+            value,
+            tags,
+            knownBy,
+            source: `msg_${messageIndex}`,
+        });
     }
 
     console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
     return result;
-}
-
-/**
- * Extract JSON objects from text, handling nested braces correctly.
- * @param {string} text
- * @returns {string[]} Array of JSON object strings
- */
-function extractJsonObjects(text) {
-    const objects = [];
-    let i = 0;
-    while (i < text.length) {
-        if (text[i] === '{') {
-            let depth = 0;
-            let start = i;
-            while (i < text.length) {
-                if (text[i] === '{') depth++;
-                else if (text[i] === '}') {
-                    depth--;
-                    if (depth === 0) {
-                        objects.push(text.substring(start, i + 1));
-                        break;
-                    }
-                }
-                i++;
-            }
-        }
-        i++;
-    }
-    return objects;
 }
 
 /**
@@ -228,23 +286,17 @@ async function applyUpdates(updates, existingDatabases) {
         }
 
         const db = existingDatabases[category];
+        const isNew = !db.facts.some(f => f.key === update.key);
 
-        if (update.action === 'delete') {
-            db.facts = db.facts.filter(f => f.key !== update.key);
-            db.updatedAt = Date.now();
-            addDebugLog('info', `Deleted fact: [${category}] ${update.key}`);
-        } else {
-            const isNew = !db.facts.some(f => f.key === update.key);
-            upsertFact(db, {
-                key: update.key,
-                value: update.value || '',
-                tags: update.tags || [],
-                knownBy: update.knownBy || [],
-                relationships: update.relationships || { primary: [], secondary: [], tertiary: [] },
-                source: update.source,
-            });
-            addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"`);
-        }
+        upsertFact(db, {
+            key: update.key,
+            value: update.value || '',
+            tags: update.tags || [],
+            knownBy: update.knownBy || [],
+            relationships: { primary: [], secondary: [], tertiary: [] },
+            source: update.source,
+        });
+        addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"`);
 
         modified.add(category);
     }
