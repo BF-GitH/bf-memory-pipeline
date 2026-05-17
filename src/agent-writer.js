@@ -32,9 +32,21 @@ export function buildWriterInjection(draft, factsFormatted) {
     const factsText = (factsFormatted && factsFormatted !== '(No stored facts available)') ? factsFormatted : '(none available)';
     const draftText = draft || '(no direction)';
 
-    return template
-        .replace('{facts}', factsText)
-        .replace('{draft}', draftText);
+    // Single-pass regex substitution: avoids order-dependent re-substitution
+    // (e.g. factsText containing literal "{draft}" can't get re-replaced)
+    const vars = { facts: factsText, draft: draftText };
+    let rendered = template.replace(/\{(facts|draft)\}/g, (_, key) => vars[key]);
+
+    // Safety guard: if EITHER placeholder is missing, append the missing parts
+    // rather than silently dropping content
+    const missing = [];
+    if (!template.includes('{facts}')) missing.push(`#Established Facts:\n${factsText}`);
+    if (!template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
+    if (missing.length > 0) {
+        rendered = `${rendered}\n\n${missing.join('\n\n')}`;
+    }
+
+    return rendered;
 }
 
 /**

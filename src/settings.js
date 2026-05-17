@@ -51,6 +51,9 @@ const DEFAULT_SETTINGS = {
     writerFormat: '',
     dbProfiles: {},
     activeDbProfile: '',
+    // schemaVersion intentionally NOT in defaults: the merge-missing-defaults loop
+    // would otherwise pre-fill it for existing users and short-circuit the migration.
+    // migrateLegacySettings() sets it after running.
 };
 
 function getContext() {
@@ -68,9 +71,68 @@ function saveSettings() {
 }
 
 function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function clamp(value, lo, hi, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.min(hi, Math.max(lo, n));
+}
+
+function validateSettings(s) {
+    s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
+    s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
+    s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
+    s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
+    if (typeof s.enabled !== 'boolean')          s.enabled = false;
+    if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
+    if (typeof s.showToast !== 'boolean')        s.showToast = true;
+    if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
+    if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
+    if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
+    if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
+    if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
+    if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
+    if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
+        s.dbProfiles = {};
+    }
+    return s;
+}
+
+function migrateLegacySettings(s) {
+    // Skip if already migrated
+    if ((s.schemaVersion ?? 0) >= 2) return;
+
+    const context = getContext();
+    const legacy = context.extensionSettings?.bf_memory;
+    if (legacy && typeof legacy === 'object' && !Array.isArray(legacy)) {
+        // Copy renamed fields ONLY if current is empty (don't clobber user's newer values)
+        if (legacy.recentMessageCount !== undefined && (s.contextMessages === undefined || s.contextMessages === 5)) {
+            const n = Number(legacy.recentMessageCount);
+            if (Number.isFinite(n)) s.contextMessages = n;
+        }
+        if (typeof legacy.customExtractorPrompt === 'string' && !s.memoryPrompt) {
+            s.memoryPrompt = legacy.customExtractorPrompt;
+        }
+        if (typeof legacy.customWriterRule === 'string' && !s.writerFormat) {
+            s.writerFormat = legacy.customWriterRule;
+        }
+        if (typeof legacy.extractorProfileId === 'string' && !s.memoryProfile) {
+            s.memoryProfile = legacy.extractorProfileId;
+        }
+        if (typeof legacy.useExtractorProfile === 'boolean' && s.useMemoryProfile === undefined) {
+            s.useMemoryProfile = legacy.useExtractorProfile;
+        }
+        console.log('[BFMemory] Migrated legacy bf_memory settings (old key preserved for rollback)');
+    }
+
+    s.schemaVersion = 2;
 }
 
 // --- Status ---
@@ -462,7 +524,11 @@ async function saveDbProfile(profileName) {
     const databases = await getAllDatabases();
 
     if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+    const existing = (extensionSettings.dbProfiles[profileName] && typeof extensionSettings.dbProfiles[profileName] === 'object')
+        ? extensionSettings.dbProfiles[profileName]
+        : {};
     extensionSettings.dbProfiles[profileName] = {
+        ...existing,
         databases: JSON.parse(JSON.stringify(databases)),
         savedAt: Date.now(),
     };
@@ -760,19 +826,34 @@ async function showLinkedChatsPopup() {
 export async function initSettings() {
     const context = getContext();
 
-    // Load saved settings
+    // Load saved settings (guard against null, arrays, primitives, or corrupted blobs)
     if (!context.extensionSettings) context.extensionSettings = {};
-    if (!context.extensionSettings[EXTENSION_NAME]) {
-        context.extensionSettings[EXTENSION_NAME] = { ...DEFAULT_SETTINGS };
+    try {
+        const current = context.extensionSettings[EXTENSION_NAME];
+        if (!current || typeof current !== 'object' || Array.isArray(current)) {
+            context.extensionSettings[EXTENSION_NAME] = structuredClone(DEFAULT_SETTINGS);
+        }
+    } catch (err) {
+        console.error('[BFMemory] corrupt settings, resetting:', err);
+        context.extensionSettings[EXTENSION_NAME] = structuredClone(DEFAULT_SETTINGS);
+        if (typeof toastr !== 'undefined') {
+            toastr.warning('BF Memory settings were corrupt and have been reset.');
+        }
     }
     extensionSettings = context.extensionSettings[EXTENSION_NAME];
 
     // Merge missing defaults
     for (const [key, value] of Object.entries(DEFAULT_SETTINGS)) {
-        if (extensionSettings[key] === undefined) {
+        if (!Object.hasOwn(extensionSettings, key)) {
             extensionSettings[key] = value;
         }
     }
+
+    // Migrate legacy settings keys (soft migration — leaves old key for rollback)
+    migrateLegacySettings(extensionSettings);
+
+    // Type-coerce and clamp values (defends against persisted garbage)
+    validateSettings(extensionSettings);
 
     // Load HTML template
     let path = `scripts/extensions/third-party/${EXTENSION_NAME}`;
@@ -867,20 +948,20 @@ export async function initSettings() {
     });
 
     // --- Prompts Tab ---
-    $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).on('change', function () {
-        const val = $(this).val().trim();
+    $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).off('input').on('input', function () {
+        const val = $(this).val();
         extensionSettings.draftPrompt = (val === DEFAULT_DRAFT_PROMPT) ? '' : val;
         saveSettings();
     });
 
-    $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || DEFAULT_MEMORY_PROMPT).on('change', function () {
-        const val = $(this).val().trim();
+    $('#bf_mem_memory_prompt').val(extensionSettings.memoryPrompt || DEFAULT_MEMORY_PROMPT).off('input').on('input', function () {
+        const val = $(this).val();
         extensionSettings.memoryPrompt = (val === DEFAULT_MEMORY_PROMPT) ? '' : val;
         saveSettings();
     });
 
-    $('#bf_mem_writer_format').val(extensionSettings.writerFormat || DEFAULT_WRITER_FORMAT).on('change', function () {
-        const val = $(this).val().trim();
+    $('#bf_mem_writer_format').val(extensionSettings.writerFormat || DEFAULT_WRITER_FORMAT).off('input').on('input', function () {
+        const val = $(this).val();
         extensionSettings.writerFormat = (val === DEFAULT_WRITER_FORMAT) ? '' : val;
         saveSettings();
     });
