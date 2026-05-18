@@ -157,13 +157,43 @@ export function updateStatus(status, message = '') {
     }
 }
 
-// --- Debug Log ---
+// --- Debug Log (persistent — stored in chat_metadata.bf_mem_log so it survives page reload) ---
+
+const LOG_META_KEY = 'bf_mem_log';
+
+function loadDebugLogFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return [];
+        const stored = md[LOG_META_KEY];
+        // Shape-check: must be array of {type, message, timestamp}
+        if (!Array.isArray(stored)) return [];
+        return stored.filter(e => e && typeof e === 'object' && typeof e.message === 'string');
+    } catch { return []; }
+}
+
+function saveDebugLogToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return; // no chat loaded — log lives in-memory only until a chat opens
+        md[LOG_META_KEY] = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+/** Re-load the debug log from the current chat's metadata. Called on CHAT_CHANGED. */
+export function reloadDebugLogFromChat() {
+    debugLog = loadDebugLogFromMeta();
+    renderDebugLog();
+}
 
 export function addDebugLog(type, message) {
     const timestamp = new Date().toLocaleTimeString();
     debugLog.unshift({ type, message, timestamp });
     if (debugLog.length > MAX_DEBUG_ENTRIES) debugLog = debugLog.slice(0, MAX_DEBUG_ENTRIES);
 
+    saveDebugLogToMeta(); // persist to chat_metadata so logs survive page reload
     renderDebugLog();
 
     if (extensionSettings?.debugMode) {
@@ -1073,6 +1103,7 @@ export async function initSettings() {
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];
+        saveDebugLogToMeta(); // also clear the persistent copy
         renderDebugLog();
     });
 
@@ -1127,7 +1158,13 @@ export async function initSettings() {
     // --- Auto-save DB profile on chat change (named after current chat) ---
     context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
         await autoSaveDbProfile();
+        // Reload the persistent debug log from the new chat's metadata so each chat
+        // shows its own history (not a stale cross-chat snapshot).
+        reloadDebugLogFromChat();
     });
+
+    // Initial load: pull any previously-persisted log entries for the current chat
+    reloadDebugLogFromChat();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

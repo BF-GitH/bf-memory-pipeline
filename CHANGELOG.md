@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.1] - 2026-05-17
+
+### Changed (HIGH impact — Agent 3 extraction quality)
+- **DEFAULT_MEMORY_PROMPT rewritten for atomic facts.** The previous prompt produced prose values like `"Rebecca owns a Braixen, stored in a black Pokeball, knows Will-O-Wisp"` — a single bloated fact mashing 3 properties together. Real transcript test showed only 8 facts stored from a rich 14-message Pokémon roleplay scene when ~25–30 atomic facts should have been captured.
+- The new prompt locks the model into **1–5 word values, one property per fact**. Adds a STRICT format block, a WRONG→RIGHT splitting demo, a DO NOT STORE list (negative facts, transient emotions, atmosphere, generic biology, items-momentarily-in-hand), and 6 generic placeholder-based few-shot examples (no real names/locations to bias extraction).
+- Expected outcome: ~3× more retrievable facts per scene at roughly the SAME token cost (atomic values are shorter than prose).
+
+### Added
+- **Persistent debug logs.** The debug log is now stored in `chat_metadata.bf_mem_log` (same pattern as the review counter). Logs survive page reload. On chat-change → log view reloads from the new chat's metadata. Cap remains 200 entries per chat. "Clear Log" button clears the persistent copy too.
+  - New helpers: `loadDebugLogFromMeta()`, `saveDebugLogToMeta()`, `reloadDebugLogFromChat()` (exported)
+  - Shape-checked on load — malformed entries silently dropped
+  - `addDebugLog()` writes to chat_metadata on every entry
+
+### Internal
+- Synthesized from 3 parallel research agents: atomic-format-rules / few-shot-examples-designer / anti-patterns-and-negative-examples.
+
 ## [0.5.0] - 2026-05-17
 
 ### Fixed (10 issues surfaced by persona-based research — Test Suite v3.3)

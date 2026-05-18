@@ -11,109 +11,125 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Most messages have ZERO facts. Max 3.
+export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Most messages have ZERO facts. Max 5.
 
-CRITICAL RULES:
-- Treat first-person statements from {{user}} as FACTUAL self-disclosure (not roleplay).
-- TRANSIENT ACTIONS in *asterisks* are NOT facts — for EITHER {{user}} OR {{char}}. Skip "*smiles*", "*sighs*", "*brushes hair*", "*nods*", etc. They are momentary poses, not lasting traits.
-- LASTING REVEALS in *asterisks* ARE facts: "*revealing a scar from her childhood*", "*pulls out a vampire fang*". The distinction is permanence — does this say something durable about the entity, or is it a one-off action?
-- OOC text in [OOC: ...] or [ooc: ...] brackets is META-COMMENTARY between the human player and the AI. NEVER extract OOC content as facts. Examples: "[OOC: brief replies tonight, busy]", "[OOC: forget what I said earlier]", "[OOC: my real name is X]" — all ignored.
-- Quoted historical text ("Remember when you said 'X'?") is a QUOTE of prior dialogue, not a new disclosure. Don't re-extract the quoted content as a fresh fact.
+# CRITICAL RULES
 
-DO NOT STORE: momentary actions, poses, gestures, emotions, dialogue quotes, obvious context, transient mood.
-ONLY STORE: traits, backstory, identity (name/job/location/age), preferences, allergies, relationship shifts, world reveals, lasting status changes, recurring behaviors.
+ATOMIC VALUES ONLY:
+- Value is 1–5 words. NO sentences. NO connectives (and / with / who / that).
+- One property per fact. Multi-attribute statements → multiple facts.
+- Encode verbs in the KEY, not the value:
+    BAD:  some_thing = uses a red one that smells nice
+    GOOD: some_thing_color = red | some_thing_scent = pleasant
+- Booleans/states: \`true\`, \`false\`, \`none\`, \`missing\`, \`unknown\`.
+- Lists: comma-separated, no "and": \`tags = a, b, c\`.
+- Never restate the key inside the value: \`hair = blue\`, NOT \`hair = user has blue hair\`.
+
+ROLEPLAY MARKUP:
+- *asterisk transient actions* are NOT facts — for EITHER party. Skip *smiles*, *nods*, *brushes hair*.
+- *asterisk lasting reveals* ARE facts (a scar revealed, a species shown).
+- [OOC: ...] is meta-commentary. NEVER extract.
+- Quoted historical text ("Remember when you said 'X'?") is reported speech. Skip.
+
+DO NOT STORE:
+- Negative/absence facts ("no favorite color revealed") — just omit.
+- Transient emotions (one-off "felt scared"). Only store if recurring 2+ scenes.
+- Sensory atmosphere (light, smell, weather).
+- Verbatim dialogue unless it encodes a concrete fact.
+- Generic biology ("breathing", "heart beat").
+- Items momentarily in hand. Only \`carries / owns / wears\` persists.
 
 CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 
-OUTPUT FORMAT:
-#MEM
-+ Category/key_name = concise fact value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_key1,related_key2
-.
-
-RULES:
-- One fact per line, starting with +
-- key_name: short snake_case (e.g. user_employer, char_arm_scar, trust_level)
-- value: plain text, concise as possible
-- @: characters who know/witnessed this. Use {{user}} for the human player, {{char}} for the AI character (comma-separated, no spaces)
-- #: search tags (comma-separated, no spaces)
-- rel: (optional) keys or topic words for facts that should co-activate when this fact matches. Use snake_case keys, comma-separated, no spaces. Skip the segment entirely if no clear relationships exist.
-- End fact list with a single . on its own line
-- If NOTHING worth storing, just write . immediately
-- After facts write #WHY with one sentence explaining your reasoning
-
-EXAMPLES:
-
-Input: [USER:{{user}}] "Hi! I'm Bernd. I work at Google in Berlin as a software engineer. I love pizza and I'm allergic to peanuts."
+# OUTPUT FORMAT
 
 #MEM
-+ Identity/user_name = Bernd | @{{user}},{{char}} | #identity,name,user | rel:user_employer_location
-+ Identity/user_employer_location = Software engineer at Google in Berlin | @{{user}},{{char}} | #identity,job,location,user | rel:user_name,berlin,google
-+ Status/user_peanut_allergy = Allergic to peanuts | @{{user}},{{char}} | #health,allergy,user | rel:user_name
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys
 .
+#WHY <one sentence>
 
-#WHY
-{{user}} disclosed durable identity facts: name, employer, location, occupation, allergy.
+If nothing: just \`.\` immediately.
+
+# WRONG → RIGHT (atomic splitting)
+
+PROSE FORMAT — never write this:
++ Something/possession  = owns X, stored in Y, knows ability Z
++ Something/appearance  = tall wiry person with grey eyes in red clothing
++ Something/item_status = item is currently missing after some event
++ Something/tell        = tugs accessory when defensive
+
+ATOMIC FORMAT — always write this instead:
++ Something/possession_1         = X
++ Something/possession_1_storage = Y
++ Something/possession_1_ability = Z
+
++ Something/height = tall
++ Something/build  = wiry
++ Something/eyes   = grey
++ Something/outfit = red
+
++ Something/item_status = missing
+
++ Behavior/tell_name = defensive tell
+
+# EXAMPLES (6)
+
+---
+Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD> and I'm allergic to <ALLERGEN>."
+
+#MEM
++ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity
++ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job
++ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role
++ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location
++ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food
++ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy
+.
+#WHY Rich self-disclosure → split each property into its own atomic fact.
+
+---
+Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
+
+#MEM
++ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance
++ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory
+.
+#WHY Lasting reveal in asterisks → atomic split: existence + origin.
+
+---
+Input: [USER:{{user}}] *grins and shrugs.*
+
+#MEM
+.
+#WHY Transient emotion in asterisks — no lasting trait revealed.
+
+---
+Input: [USER:{{user}}] [OOC: can we slow the pacing down?]
+
+#MEM
+.
+#WHY OOC meta-commentary. Never extract.
+
+---
+Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too close.*
+
+#MEM
++ Behavior/char_collar_tug = defensive tell | @{{char}},{{user}} | #tell,mannerism
+.
+#WHY Recurring mannerism with explicit trigger — distinct from one-off transient pose.
+
+---
+Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place is wrong."
+
+#MEM
++ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location
++ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event
+.
+#WHY Same existing key user_location → value OVERWRITES (don't invent a second key). Add History fact for the move event.
 
 ---
 
-Input: [CHAR:{{char}}] *She pushes her hair back, revealing a jagged scar.* "Got it at seven. Greenhouse roof."
-
-#MEM
-+ Identity/char_facial_scar = Jagged scar, childhood greenhouse accident age 7 | @{{char}},{{user}} | #appearance,injury,backstory
-.
-
-#WHY
-{{char}} revealed a permanent physical trait with backstory.
-
----
-
-Input: [CHAR:{{char}}] They chat about the weather and eat lunch.
-
-#MEM
-.
-
-#WHY
-No lasting facts.
-
----
-
-Input: [USER:{{user}}] *grins* "I love it when you do that."
-
-#MEM
-.
-
-#WHY
-Transient emotional reaction, not a lasting trait.
-
----
-
-Input: [USER:{{user}}] [OOC: hey, can we slow the pacing? Also my persona name is Lyra but my real name is Bernd]
-
-#MEM
-.
-
-#WHY
-OOC meta-commentary, not in-character disclosure. Ignored per rules.
-
----
-
-Input: [CHAR:{{char}}] *She brushes a strand of hair behind her ear, then smiles softly.* "Tell me again."
-
-#MEM
-.
-
-#WHY
-Pure transient action in asterisks, no lasting trait revealed.
-
----
-
-Input: [USER:{{user}}] Remember when you said "I am the heir of Valdris"? Why did you lie?
-
-#MEM
-.
-
-#WHY
-{{user}} is quoting prior {{char}} dialogue, not disclosing a new fact about themselves.`;
+When uncertain whether something is a persistent fact, SKIP. A missing atomic fact is recoverable next turn; a wrong/verbose fact poisons future retrieval.`;
 
 /**
  * Run Agent 3: Analyze message and update databases
