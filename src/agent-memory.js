@@ -139,8 +139,8 @@ When uncertain whether something is a persistent fact, SKIP. A missing atomic fa
  * @param {Object} existingDatabases - Current state of all databases
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', prevUserMessage = null) {
-    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, prevUserMessage);
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = []) {
+    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages);
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -166,7 +166,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 /**
  * Build the prompt for Agent 3
  */
-function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, prevUserMessage = null) {
+function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages = []) {
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
     // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
@@ -189,13 +189,20 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
     }
 
     // Tag the source role so the model can't collapse user disclosures into RP narrative.
-    // If a prior user message is given, include BOTH messages in the analyzed block so
-    // user-side self-disclosures get captured (otherwise Agent 3 only sees the AI's N-1
-    // message and misses things like "I'm Bernd, I work at Google").
+    // If prior context messages are given, include them in the analyzed block so
+    // user-side self-disclosures and earlier reveals get captured (otherwise Agent 3
+    // only sees the AI's N-1 message and misses things like "I'm Bernd, I work at Google").
     const roleTag = isUserMessage ? '[USER:{{user}}]' : '[CHAR:{{char}}]';
-    const messageBlock = prevUserMessage
-        ? `[USER:{{user}}] ${prevUserMessage}\n\n${roleTag} ${messageText}`
-        : `${roleTag} ${messageText}`;
+    let messageBlock = '';
+    if (Array.isArray(priorMessages) && priorMessages.length > 0) {
+        // Render prior context messages tagged by role
+        const priorBlock = priorMessages
+            .map(m => `${m.role === 'USER' ? '[USER:{{user}}]' : '[CHAR:{{char}}]'} ${m.text}`)
+            .join('\n\n');
+        messageBlock = `${priorBlock}\n\n${roleTag} ${messageText}`;
+    } else {
+        messageBlock = `${roleTag} ${messageText}`;
+    }
     dataParts.push(`## Messages to Analyze\n${messageBlock}`);
     dataParts.push('\nExtract facts from EITHER message. Now output ONLY #MEM and #WHY sections.');
 

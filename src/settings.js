@@ -40,8 +40,16 @@ let lastInserted = { runId: null, timestamp: null, updates: [] };
 const DEFAULT_SETTINGS = {
     enabled: false,
     useMemoryProfile: true,
-    memoryProfile: '',
-    contextMessages: 5,
+    // Per-agent connection profiles (replacing single memoryProfile).
+    // Old `memoryProfile` is kept on the stored object for rollback safety
+    // and migrated forward in migrateLegacySettings().
+    agent1Profile: '',
+    agent3Profile: '',
+    // Per-agent context message counts (replacing single contextMessages).
+    // Agent 3 default = 2 preserves the prior behavior of looking at the
+    // latest user + AI exchange.
+    agent1ContextMessages: 5,
+    agent3ContextMessages: 2,
     reviewInterval: 10,
     secondaryChance: 50,
     tertiaryChance: 15,
@@ -88,6 +96,8 @@ function clamp(value, lo, hi, fallback) {
 
 function validateSettings(s) {
     s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
+    s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
+    s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 2));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
@@ -96,6 +106,8 @@ function validateSettings(s) {
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
+    if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
+    if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.writerFormat !== 'string')      s.writerFormat = '';
@@ -131,6 +143,16 @@ function migrateLegacySettings(s) {
             s.useMemoryProfile = legacy.useExtractorProfile;
         }
         console.log('[BFMemory] Migrated legacy bf_memory settings (old key preserved for rollback)');
+    }
+
+    // v0.7: split single memoryProfile/contextMessages into per-agent settings.
+    // Old fields are intentionally KEPT on the stored object for rollback safety.
+    if (typeof s.memoryProfile === 'string' && s.memoryProfile && !s.agent1Profile && !s.agent3Profile) {
+        s.agent1Profile = s.memoryProfile;
+        s.agent3Profile = s.memoryProfile;
+    }
+    if (typeof s.contextMessages === 'number' && s.contextMessages !== 5 && !s.agent1ContextMessages) {
+        s.agent1ContextMessages = s.contextMessages;
     }
 
     s.schemaVersion = 2;
@@ -330,27 +352,32 @@ function exportLogs() {
 // --- Profile Dropdown ---
 
 function reloadProfiles() {
-    const select = document.getElementById('bf_mem_profile');
-    if (!select) return;
-
-    const currentValue = select.value;
-    select.innerHTML = '<option value="">-- Select Memory Profile --</option>';
+    const agent1Select = document.getElementById('bf_mem_agent1_profile');
+    const agent3Select = document.getElementById('bf_mem_agent3_profile');
+    if (!agent1Select && !agent3Select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
 
-    profiles.forEach(profile => {
-        const option = document.createElement('option');
-        option.value = profile.id;
-        option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
-        select.appendChild(option);
-    });
+    const populate = (select, savedValue) => {
+        if (!select) return;
+        const currentValue = select.value;
+        select.innerHTML = '<option value="">-- Use default profile --</option>';
+        profiles.forEach(profile => {
+            const option = document.createElement('option');
+            option.value = profile.id;
+            option.textContent = profile.name + (profile.id === activeProfile ? ' (current)' : '');
+            select.appendChild(option);
+        });
+        if (currentValue && profiles.find(p => p.id === currentValue)) {
+            select.value = currentValue;
+        } else if (savedValue) {
+            select.value = savedValue;
+        }
+    };
 
-    if (currentValue && profiles.find(p => p.id === currentValue)) {
-        select.value = currentValue;
-    } else if (extensionSettings?.memoryProfile) {
-        select.value = extensionSettings.memoryProfile;
-    }
+    populate(agent1Select, extensionSettings?.agent1Profile);
+    populate(agent3Select, extensionSettings?.agent3Profile);
 }
 
 // --- Tabs ---
@@ -957,8 +984,12 @@ export async function initSettings() {
     $('#bf_mem_profile_section').toggle(extensionSettings.useMemoryProfile);
 
     reloadProfiles();
-    $('#bf_mem_profile').val(extensionSettings.memoryProfile || '').on('change', function () {
-        extensionSettings.memoryProfile = $(this).val() || '';
+    $('#bf_mem_agent1_profile').val(extensionSettings.agent1Profile || '').on('change', function () {
+        extensionSettings.agent1Profile = $(this).val() || '';
+        saveSettings();
+    });
+    $('#bf_mem_agent3_profile').val(extensionSettings.agent3Profile || '').on('change', function () {
+        extensionSettings.agent3Profile = $(this).val() || '';
         saveSettings();
     });
 
@@ -967,13 +998,23 @@ export async function initSettings() {
         toastr.info('Profiles refreshed', 'BF Memory');
     });
 
-    // Context slider
-    $('#bf_mem_context').val(extensionSettings.contextMessages);
-    $('#bf_mem_context_val').text(extensionSettings.contextMessages);
-    $('#bf_mem_context').on('input', function () {
+    // Agent 1 context slider
+    $('#bf_mem_agent1_context').val(extensionSettings.agent1ContextMessages);
+    $('#bf_mem_agent1_context_val').text(extensionSettings.agent1ContextMessages);
+    $('#bf_mem_agent1_context').on('input', function () {
         const val = parseInt($(this).val());
-        extensionSettings.contextMessages = val;
-        $('#bf_mem_context_val').text(val);
+        extensionSettings.agent1ContextMessages = val;
+        $('#bf_mem_agent1_context_val').text(val);
+        saveSettings();
+    });
+
+    // Agent 3 context slider
+    $('#bf_mem_agent3_context').val(extensionSettings.agent3ContextMessages);
+    $('#bf_mem_agent3_context_val').text(extensionSettings.agent3ContextMessages);
+    $('#bf_mem_agent3_context').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.agent3ContextMessages = val;
+        $('#bf_mem_agent3_context_val').text(val);
         saveSettings();
     });
 

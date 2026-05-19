@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.7.0] - 2026-05-17
+
+### Added — per-agent configuration
+- **Separate connection profile per agent.** Agent 1 (Draft) and Agent 3 (Memory Updater) can now run on DIFFERENT connection profiles instead of sharing one. Use cases:
+  - A cheap fast model for Agent 3 extraction (Deepseek), a stronger reasoning model for Agent 1 drafting (Sonnet).
+  - Each agent tunable independently for cost/quality trade-offs.
+  - Writer (Agent 2) still always uses your default/active profile.
+  - Leave either dropdown blank → uses default profile for that agent.
+- **Separate context-message count per agent.** Agent 1 and Agent 3 can each have their own window:
+  - **Agent 1 (Draft):** slider 1–50, default 5 (how many recent messages to plan the reply from)
+  - **Agent 3 (Memory):** slider 1–20, default 2 (default 2 = current behavior: just the latest user msg + AI msg. Higher = more context for better extraction at higher token cost.)
+
+### Migration
+- Existing `memoryProfile` (single shared profile) → copied to BOTH `agent1Profile` AND `agent3Profile` on first load. Old key preserved for rollback safety.
+- Existing `contextMessages` (single shared count) → copied to `agent1ContextMessages` if the user had changed it from default. Old key preserved.
+- Schema version unchanged — additive migration only.
+
+### Internal
+- New exports in [src/profiler.js](src/profiler.js): `getAgent1ProfileId()`, `getAgent3ProfileId()`. Old `getMemoryProfileId()` kept as alias returning the Agent 1 profile.
+- [src/agent-memory.js](src/agent-memory.js) `runMemoryUpdater()` last param renamed `prevUserMessage → priorMessages` (now an array of `{role, text}` for richer Agent 3 context). Backward-compatible: default empty array = no extra context, same as before.
+- [src/pipeline.js](src/pipeline.js) now gathers up to `agent3ContextMessages` prior messages from chat (excluding the target itself), tags them USER/CHAR, passes as array.
+
 ## [0.6.0] - 2026-05-17
 
 ### Fixed (HIGH — mobile UX)

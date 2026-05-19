@@ -7,7 +7,7 @@ import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
-import { getMemoryProfileId } from './profiler.js';
+import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile } from './settings.js';
 
@@ -202,7 +202,7 @@ async function runPipelineInline(data) {
     lastTriggeredUserMsgIndex = lastUserMsgIndex;
 
     const startTime = Date.now();
-    const recentMessages = getRecentMessages(settings.contextMessages || 5);
+    const recentMessages = getRecentMessages(settings.agent1ContextMessages || 5);
     if (recentMessages.length === 0) {
         addDebugLog('info', 'No messages in chat, skipping pipeline');
         return;
@@ -243,11 +243,12 @@ async function runPipelineInline(data) {
     updateStatus('running', 'Updating memory + drafting...');
     addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) + speculative retrieval in parallel...');
 
-    const memoryProfileId = getMemoryProfileId(settings);
-    if (memoryProfileId) {
-        addDebugLog('info', `Using memory profile "${memoryProfileId}" via CMRS (no profile switching)`);
+    const agent1ProfileId = getAgent1ProfileId(settings);
+    const agent3ProfileId = getAgent3ProfileId(settings);
+    if (agent1ProfileId || agent3ProfileId) {
+        addDebugLog('info', `Profiles: Agent 1 = "${agent1ProfileId || 'default'}", Agent 3 = "${agent3ProfileId || 'default'}"`);
     } else {
-        addDebugLog('info', 'No memory profile configured, agents will use current connection');
+        addDebugLog('info', 'No memory profiles configured, agents will use current connection');
     }
 
     let draftResult = null;
@@ -264,7 +265,7 @@ async function runPipelineInline(data) {
 
         // Agent 1: Draft
         promises.push(
-            runDraftAgent(formattedChat, characterInfo, userPersona, memoryProfileId)
+            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId)
                 .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
         );
 
@@ -275,16 +276,25 @@ async function runPipelineInline(data) {
         if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
             const targetMessage = chat[memoryTargetIndex];
             const role = targetMessage.is_user ? 'USER' : 'AI';
-            // Find latest user message; pass to Agent 3 alongside the AI target.
-            // Skip if it IS the target (avoids duplicating same message).
-            const prevUserMsg = (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex)
-                ? chat[lastUserMsgIndex]?.mes
-                : null;
-            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}${prevUserMsg ? ` + user msg ${lastUserMsgIndex}` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
+            // Gather up to agent3ContextMessages prior messages for richer Agent 3 context.
+            // Default = 2 means just the latest user + AI exchange (current behavior preserved).
+            const agent3Count = Math.max(1, settings.agent3ContextMessages || 2);
+            const agent3StartIdx = Math.max(0, chat.length - agent3Count - 1); // -1 to exclude memoryTargetIndex itself if it's the latest AI msg
+            const agent3PriorMessages = [];
+            for (let i = agent3StartIdx; i < chat.length; i++) {
+                if (i === memoryTargetIndex) continue; // exclude target, it's passed separately
+                if (chat[i] && chat[i].mes) {
+                    agent3PriorMessages.push({
+                        role: chat[i].is_user ? 'USER' : 'CHAR',
+                        text: chat[i].mes,
+                    });
+                }
+            }
+            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
 
             const databases = await getAllDatabases();
             promises.push(
-                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, memoryProfileId, !!targetMessage.is_user, userPersona, prevUserMsg)
+                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId, !!targetMessage.is_user, userPersona, agent3PriorMessages)
                     .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
             );
         } else {

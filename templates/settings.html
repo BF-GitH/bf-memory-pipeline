@@ -40,13 +40,24 @@
                             <input type="checkbox" id="bf_mem_use_profile" />
                             <span>Use separate profile for Draft + Memory agents</span>
                         </label>
-                        <div id="bf_mem_profile_section" class="bf-mem-profile-row">
-                            <select id="bf_mem_profile" class="text_pole"></select>
-                            <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
-                                <i class="fa-solid fa-arrows-rotate"></i>
-                            </button>
+                        <div id="bf_mem_profile_section">
+                            <div class="bf-mem-field">
+                                <label>Agent 1 (Draft Planner) Profile</label>
+                                <div class="bf-mem-profile-row">
+                                    <select id="bf_mem_agent1_profile" class="text_pole"></select>
+                                </div>
+                            </div>
+                            <div class="bf-mem-field">
+                                <label>Agent 3 (Memory Updater) Profile</label>
+                                <div class="bf-mem-profile-row">
+                                    <select id="bf_mem_agent3_profile" class="text_pole"></select>
+                                    <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
+                                        <i class="fa-solid fa-arrows-rotate"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            <small class="bf-mem-hint">Writer (Agent 2) always uses your default/active profile. Leave Agent 1 / Agent 3 blank to use the default profile too.</small>
                         </div>
-                        <small class="bf-mem-hint">Writer (Agent 2) always uses your default/active profile.</small>
                     </div>
                 </div>
 
@@ -57,9 +68,14 @@
                     </div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_context_val">5</span></label>
-                            <input type="range" id="bf_mem_context" min="1" max="50" step="1" value="5" />
-                            <small class="bf-mem-hint">How many recent messages Agent 1 (Drafter) sees</small>
+                            <label>Agent 1 Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
+                            <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
+                            <small class="bf-mem-hint">How many recent messages Agent 1 (Draft) sees when planning the reply</small>
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Agent 3 Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
+                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
+                            <small class="bf-mem-hint">How many recent messages Agent 3 (Memory) sees for extraction. Default 2 = just the latest user + AI exchange. Higher = more context for better extraction but more tokens.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>

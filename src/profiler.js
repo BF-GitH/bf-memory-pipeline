@@ -36,25 +36,55 @@ export function getCurrentProfileId() {
 }
 
 /**
- * Get the memory profile ID from settings, or null if not configured.
+ * Get the Agent 1 (Draft Planner) profile ID from settings, or null if not configured.
  * This does NOT switch any profile - just returns the ID for use with CMRS.
  * @param {object} settings - Extension settings
  * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
  */
-export function getMemoryProfileId(settings) {
-    if (!settings?.useMemoryProfile || !settings?.memoryProfile) {
-        return null;
-    }
+export function getAgent1ProfileId(settings) {
+    if (!settings?.useMemoryProfile) return null;
+    if (!settings?.agent1Profile) return null;
 
     // Verify the profile still exists
     const profiles = getConnectionProfiles();
-    const exists = profiles.some(p => p.id === settings.memoryProfile);
+    const exists = profiles.some(p => p.id === settings.agent1Profile);
     if (!exists) {
-        addDebugLog('fail', `Memory profile "${settings.memoryProfile}" not found in connection manager`);
+        addDebugLog('fail', `Agent 1 profile "${settings.agent1Profile}" not found in connection manager`);
         return null;
     }
 
-    return settings.memoryProfile;
+    return settings.agent1Profile;
+}
+
+/**
+ * Get the Agent 3 (Memory Updater) profile ID from settings, or null if not configured.
+ * This does NOT switch any profile - just returns the ID for use with CMRS.
+ * @param {object} settings - Extension settings
+ * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
+ */
+export function getAgent3ProfileId(settings) {
+    if (!settings?.useMemoryProfile) return null;
+    if (!settings?.agent3Profile) return null;
+
+    // Verify the profile still exists
+    const profiles = getConnectionProfiles();
+    const exists = profiles.some(p => p.id === settings.agent3Profile);
+    if (!exists) {
+        addDebugLog('fail', `Agent 3 profile "${settings.agent3Profile}" not found in connection manager`);
+        return null;
+    }
+
+    return settings.agent3Profile;
+}
+
+/**
+ * @deprecated Use getAgent1ProfileId() or getAgent3ProfileId() instead.
+ * Kept for backward compat. Returns the Agent 1 profile.
+ * @param {object} settings - Extension settings
+ * @returns {string|null}
+ */
+export function getMemoryProfileId(settings) {
+    return getAgent1ProfileId(settings);
 }
 
 /**
