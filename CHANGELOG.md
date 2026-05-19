@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.3] - 2026-05-17
+
+### Docs
+- **Added [README.md](README.md)** with a full walkthrough of how the 3 agents work — uses a fake 10-message chat (Tom + Helper) and shows exactly what each agent sees, what it outputs, and where the Agent 2 trim kicks in. Includes:
+  - Step-by-step trace of one generation cycle
+  - Agent reference table (LLM call? what it sees? output?)
+  - Full settings reference
+  - Tradeoff table for tuning sliders
+  - Starter config for "facts replace history" mode
+
+No code changes — docs only. Manifest version bumped so the in-UI version label confirms the new docs are pulled.
+
 ## [0.7.2] - 2026-05-17
 
 ### Changed — Agent 2 slider now actually does what was wanted
