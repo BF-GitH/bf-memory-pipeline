@@ -348,6 +348,19 @@ async function runPipelineInline(data) {
                 }
                 lastProcessedMessageIndex = memoryTargetIndex;
 
+                // Mark the target AI message as processed so the per-message
+                // icon (and "Run on full chat" skip-already-done) can see it.
+                if (chat[memoryTargetIndex]) {
+                    chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: true };
+                }
+                // If we also processed the latest user message via prevUserMsg / priorMessages,
+                // mark it too (Agent 3 saw it in the same call).
+                if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]) {
+                    chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: true };
+                }
+                // Persist to chat .jsonl
+                SillyTavern.getContext().saveChatDebounced?.();
+
                 // Check if review popup is due (defer to after generation to avoid blocking)
                 if (tickMessageCounter(settings.reviewInterval || 10)) {
                     addDebugLog('info', 'Review interval reached, will show popup after generation');

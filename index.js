@@ -11,6 +11,9 @@ jQuery(async () => {
         const { initPipeline } = await import('./src/pipeline.js');
         initPipeline();
 
+        const { initMessageIcons } = await import('./src/message-icon.js');
+        initMessageIcons();
+
         console.log('[BFMemory] Extension loaded successfully');
     } catch (error) {
         console.error('[BFMemory] Failed to load extension:', error);

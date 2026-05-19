@@ -207,6 +207,29 @@
                     </div>
                 </div>
 
+                <!-- Run Agent 3 on full chat -->
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-arrows-rotate"></i> Process Existing Chat
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Already have a chat going? Run Agent 3 on every message to backfill facts. Slow and uses tokens per message.</small>
+                        <label class="checkbox_label" style="margin-top:6px;">
+                            <input type="checkbox" id="bf_mem_skip_processed" checked />
+                            <span>Skip messages already processed</span>
+                        </label>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_run_full_chat" class="menu_button">
+                                <i class="fa-solid fa-play"></i> Run Agent 3 on full chat
+                            </button>
+                            <button id="bf_mem_run_full_chat_cancel" class="menu_button redWarningBG" style="display:none;">
+                                <i class="fa-solid fa-stop"></i> Cancel
+                            </button>
+                        </div>
+                        <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                    </div>
+                </div>
+
                 <!-- Current Databases -->
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">

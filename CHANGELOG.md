@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.8.0] - 2026-05-17
+
+### Added — backfill + per-message tracking
+- **"Run Agent 3 on full chat" button** in the Database tab. For when you installed the extension after a chat was already going — extracts facts from every existing message sequentially.
+  - Skip-already-processed checkbox (default on) so re-running only hits new messages
+  - Live progress: "Message X/N · Y facts added"
+  - Cancel button to abort mid-run
+  - Per-message LLM token cost — warning confirm before starting
+- **Per-message brain icon** next to each message's edit button (inspired by MemoryBooks extension).
+  - 🧠 **Grey** = Agent 3 has NOT processed this message yet
+  - 🧠 **Green** = already processed
+  - 🧠 **Blue (pulsing)** = currently running
+  - **Click** = force Agent 3 to extract from this specific message (useful if you edited a message and want to re-extract, or if a specific message has facts the normal pipeline missed)
+  - **Editing a message** automatically resets its flag to grey (prior extraction invalidated)
+
+### Shared state convention
+- New per-message flag `message.extra.bf_mem_processed = true` (persisted natively by ST in chat .jsonl)
+- Set automatically:
+  - In the normal pipeline after Agent 3 happy path (both AI target and the user message Agent 3 also saw)
+  - By the full-chat backfill worker
+  - By the per-message icon click handler
+- Cleared automatically:
+  - When a message is edited (the existing extraction is invalidated)
+- Hidden from system/comment/narrator messages — only real chat messages get the icon
+
+### Internal
+- New module: [src/message-icon.js](src/message-icon.js) — self-contained, listens to `CHARACTER_MESSAGE_RENDERED` / `USER_MESSAGE_RENDERED` / `MESSAGE_UPDATED` / `CHAT_CHANGED`, idempotent re-inject
+- New export: `runAgent3OnFullChat({skipAlreadyProcessed, onProgress, shouldCancel})` in [src/settings.js](src/settings.js)
+- [src/pipeline.js](src/pipeline.js) now stamps `extra.bf_mem_processed = true` on both the AI target message and the user message after each successful Agent 3 run
+- [index.js](index.js) wires `initMessageIcons()` alongside `initSettings()` and `initPipeline()`
+- [style.css](style.css) — grey → green → blue (pulse) state transitions for the icon
+
 ## [0.7.3] - 2026-05-17
 
 ### Docs

@@ -729,6 +729,86 @@ export async function saveCurrentToActiveProfile(profileKey = null) {
     }
 }
 
+/**
+ * Process every message in the current chat through Agent 3 sequentially.
+ * Used by the "Run on current chat" button — for users who installed the
+ * extension after their chat was already going.
+ *
+ * @param {object} options
+ * @param {boolean} options.skipAlreadyProcessed - if true, skip messages whose
+ *   extra.bf_mem_processed is already true (default true)
+ * @param {(progress: {current: number, total: number, factsAdded: number}) => void} options.onProgress
+ * @param {() => boolean} options.shouldCancel - return true to abort
+ */
+export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgress, shouldCancel } = {}) {
+    const ctx = getContext();
+    const chat = ctx.chat || [];
+    if (chat.length === 0) {
+        toastr.warning('No messages in current chat', 'BF Memory');
+        return { processed: 0, skipped: 0, factsAdded: 0 };
+    }
+
+    const { runMemoryUpdater } = await import('./agent-memory.js');
+    const { getAgent3ProfileId } = await import('./profiler.js');
+    const { getAllDatabases } = await import('./database.js');
+
+    const profileId = getAgent3ProfileId(extensionSettings);
+    const charInfo = (function() {
+        const char = ctx.characters?.[ctx.characterId];
+        if (!char) return '';
+        const parts = [];
+        if (char.name) parts.push(`Name: ${char.name}`);
+        if (char.description) parts.push(`Description: ${char.description.substring(0, 2000)}`);
+        if (char.personality) parts.push(`Personality: ${char.personality.substring(0, 1000)}`);
+        if (char.scenario) parts.push(`Scenario: ${char.scenario.substring(0, 1000)}`);
+        return parts.join('\n');
+    })();
+    const userPersona = ctx.persona?.description || ctx.name1 || '';
+
+    let processed = 0, skipped = 0, factsAdded = 0;
+    const total = chat.length;
+
+    for (let i = 0; i < chat.length; i++) {
+        if (shouldCancel?.()) {
+            addDebugLog('info', `Full-chat extraction cancelled at message ${i}/${total}`);
+            break;
+        }
+        const msg = chat[i];
+        if (!msg || !msg.mes) { skipped++; continue; }
+        if (msg.is_system) { skipped++; continue; }
+        if (msg.extra?.type) { skipped++; continue; }
+        if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; continue; }
+
+        try {
+            const databases = await getAllDatabases();
+            const result = await runMemoryUpdater(
+                msg.mes,
+                i,
+                charInfo,
+                databases,
+                profileId,
+                !!msg.is_user,
+                userPersona,
+                [],  // no prior context — process each message in isolation for retro extraction
+            );
+            const n = result?.updates?.length || 0;
+            factsAdded += n;
+            msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
+            processed++;
+            onProgress?.({ current: i + 1, total, factsAdded });
+            addDebugLog('info', `Full-chat: msg ${i + 1}/${total} → +${n} facts`);
+        } catch (err) {
+            addDebugLog('fail', `Full-chat: msg ${i + 1} failed: ${err.message || err}`);
+        }
+    }
+
+    // Persist chat (the extra.bf_mem_processed flags) + active DB profile
+    ctx.saveChatDebounced?.();
+    await saveCurrentToActiveProfile();
+
+    return { processed, skipped, factsAdded };
+}
+
 async function autoSaveDbProfile() {
     try {
         const context = getContext();
@@ -1183,6 +1263,45 @@ export async function initSettings() {
         addDebugLog('info', 'All databases cleared');
         toastr.success('All databases cleared', 'BF Memory');
         refreshDatabaseView();
+    });
+
+    // --- Run Agent 3 on full chat (retroactive extraction) ---
+    let fullChatCancel = false;
+    $('#bf_mem_run_full_chat').on('click', async () => {
+        if (!confirm('Run Agent 3 on every message in this chat? This can be slow and costs LLM tokens per message.')) return;
+        const btn = $('#bf_mem_run_full_chat');
+        const progress = $('#bf_mem_full_chat_progress');
+        const cancelBtn = $('#bf_mem_run_full_chat_cancel');
+        const skipDone = $('#bf_mem_skip_processed').is(':checked');
+
+        fullChatCancel = false;
+        btn.prop('disabled', true).text('Running...');
+        cancelBtn.show();
+        progress.show().text('Starting…');
+
+        try {
+            const result = await runAgent3OnFullChat({
+                skipAlreadyProcessed: skipDone,
+                onProgress: ({ current, total, factsAdded }) => {
+                    progress.text(`Message ${current}/${total} · ${factsAdded} facts added`);
+                },
+                shouldCancel: () => fullChatCancel,
+            });
+            const verb = fullChatCancel ? 'cancelled' : 'finished';
+            toastr.success(`Full-chat ${verb}: ${result.processed} processed, ${result.skipped} skipped, ${result.factsAdded} facts added`, 'BF Memory');
+            progress.text(`${verb}: ${result.processed} processed, ${result.skipped} skipped, ${result.factsAdded} facts`);
+        } catch (err) {
+            toastr.error(`Full-chat failed: ${err.message}`, 'BF Memory');
+            progress.text(`Failed: ${err.message}`);
+        } finally {
+            btn.prop('disabled', false).text('Run Agent 3 on full chat');
+            cancelBtn.hide();
+        }
+    });
+
+    $('#bf_mem_run_full_chat_cancel').on('click', () => {
+        fullChatCancel = true;
+        $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
     });
 
     // --- Debug Tab ---

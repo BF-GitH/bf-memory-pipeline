@@ -565,6 +565,25 @@
     color: #f44336 !important;
 }
 
+/* Per-message Agent 3 icon (next to .mes_edit) */
+.bf_mem_msg_icon {
+    color: #888;            /* grey by default = not processed */
+    opacity: 0.6;
+    transition: color 0.2s, opacity 0.2s;
+}
+.bf_mem_msg_icon:hover {
+    opacity: 1;
+}
+.bf_mem_msg_icon.bf_mem_msg_icon_processed {
+    color: #4caf50;         /* green = processed */
+    opacity: 0.9;
+}
+.bf_mem_msg_icon.bf_mem_msg_icon_loading {
+    color: #7bb3ff;         /* blue while running */
+    animation: bf-mem-pulse 1s infinite;
+    pointer-events: none;
+}
+
 /* Mobile: prevent pull-to-refresh from accidentally firing when user scrolls
    up inside an internal scroll container that's already at the top.
    Without this, scrolling DB list / debug log / review popup at the top of
