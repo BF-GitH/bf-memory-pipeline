@@ -78,9 +78,9 @@
                             <small class="bf-mem-hint">How many recent messages Agent 3 (Memory) sees for extraction. Default 2 = just the latest user + AI exchange. Higher = more context for better extraction but more tokens.</small>
                         </div>
                         <div class="bf-mem-field">
-                            <label>Agent 2 Context Messages (force-attention) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
-                            <input type="range" id="bf_mem_agent2_context" min="0" max="20" step="1" value="0" />
-                            <small class="bf-mem-hint">Default 0 = off (the main model already sees full chat history via ST's normal prompt). Set &gt; 0 to ALSO duplicate the last N messages into the injection block, forcing the model's attention onto them. Useful for large chats; costs extra tokens.</small>
+                            <label>Agent 2 Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
+                            <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
+                            <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages from the main model — it only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>

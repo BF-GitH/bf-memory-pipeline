@@ -23,23 +23,19 @@ export const DEFAULT_WRITER_FORMAT = `[Memory Context - Use these established fa
  * This doesn't call an LLM - it prepares context for the main generation
  * @param {string} draft - Draft from Agent 1
  * @param {string} factsFormatted - Formatted facts from retrieval
- * @param {string} [contextBlock=''] - Optional recent-chat context block (last N messages, role-tagged)
- *   Pass empty string (default) to skip. When non-empty, supports {context} placeholder
- *   in the template; otherwise prepended to the injection.
  * @returns {string} Injection text to add to the prompt
  */
-export function buildWriterInjection(draft, factsFormatted, contextBlock = '') {
+export function buildWriterInjection(draft, factsFormatted) {
     const settings = getSettingsSafe();
 
     const template = settings?.writerFormat || DEFAULT_WRITER_FORMAT;
     const factsText = (factsFormatted && factsFormatted !== '(No stored facts available)') ? factsFormatted : '(none available)';
     const draftText = draft || '(no direction)';
-    const ctxText = contextBlock || '';
 
     // Single-pass regex substitution: avoids order-dependent re-substitution
     // (e.g. factsText containing literal "{draft}" can't get re-replaced)
-    const vars = { facts: factsText, draft: draftText, context: ctxText };
-    let rendered = template.replace(/\{(facts|draft|context)\}/g, (_, key) => vars[key]);
+    const vars = { facts: factsText, draft: draftText };
+    let rendered = template.replace(/\{(facts|draft)\}/g, (_, key) => vars[key]);
 
     // Safety guard: if {facts} / {draft} placeholders missing from template, append.
     const missing = [];
@@ -47,13 +43,6 @@ export function buildWriterInjection(draft, factsFormatted, contextBlock = '') {
     if (!template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
     if (missing.length > 0) {
         rendered = `${rendered}\n\n${missing.join('\n\n')}`;
-    }
-
-    // If context was provided but template lacks {context} placeholder, prepend it.
-    // This way users get the benefit of agent2ContextMessages > 0 even with the
-    // default template (which doesn't include {context}).
-    if (ctxText && !template.includes('{context}')) {
-        rendered = `#Recent Context:\n${ctxText}\n\n${rendered}`;
     }
 
     return rendered;
@@ -64,28 +53,54 @@ export function buildWriterInjection(draft, factsFormatted, contextBlock = '') {
  * Called via CHAT_COMPLETION_PROMPT_READY event
  * @param {object} data - Prompt data from ST event
  * @param {string} injection - The memory injection text
+ * @param {object} [options]
+ * @param {number} [options.trimToLast=0] - If > 0, trim the chat history to the last N
+ *   user/assistant messages BEFORE injecting (preserves any system prefix). Lets the
+ *   main model see only a focused window — relies on stored facts to fill the gap.
  * @returns {boolean} True if injection succeeded
  */
-export function injectMemoryContext(data, injection) {
+export function injectMemoryContext(data, injection, options = {}) {
     if (!injection) return false;
+    const trimToLast = Math.max(0, options.trimToLast || 0);
 
     // Try chat completion format (array of messages)
     if (data && data.chat && Array.isArray(data.chat)) {
+        if (trimToLast > 0) trimChatHistory(data.chat, trimToLast);
         return injectIntoMessages(data.chat, injection);
     }
 
     // Try messages array format
     if (data && data.messages && Array.isArray(data.messages)) {
+        if (trimToLast > 0) trimChatHistory(data.messages, trimToLast);
         return injectIntoMessages(data.messages, injection);
     }
 
-    // Try text completion format
+    // Text completion format: prompt is a single string, no per-message trimming possible
     if (data && typeof data.prompt === 'string') {
         data.prompt = injection + '\n\n' + data.prompt;
         return true;
     }
 
     return false;
+}
+
+/**
+ * Trim a messages array IN-PLACE to keep at most `keepLast` user/assistant messages.
+ * System messages at the start (character card, system prompt) are preserved.
+ * Used to hide old chat history from the main model when the user opts into facts-
+ * replace-history mode.
+ */
+function trimChatHistory(messages, keepLast) {
+    // Find where the system-prefix ends and actual chat begins
+    let chatStart = 0;
+    while (chatStart < messages.length && messages[chatStart]?.role === 'system') {
+        chatStart++;
+    }
+    const chatLen = messages.length - chatStart;
+    if (chatLen > keepLast) {
+        const removeCount = chatLen - keepLast;
+        messages.splice(chatStart, removeCount);
+    }
 }
 
 /**

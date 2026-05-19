@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.7.2] - 2026-05-17
+
+### Changed — Agent 2 slider now actually does what was wanted
+v0.7.1's "Agent 2 Context Messages" slider was implemented in the WRONG direction — it duplicated the last N messages INTO the injection (force-attention), which was mostly wasteful since the main model already sees full chat history via ST.
+
+The user wanted the OPPOSITE: **hide old messages from the main model** so it focuses only on the recent exchange + the facts we inject. This makes the facts actually *replace* the hidden chat history (the intended architecture for a memory pipeline).
+
+- **Label changed:** "Agent 2 Context Limit (trim chat)"
+- **Range:** 0–50 (was 0–20)
+- **Behavior when > 0:** before injection, the chat history sent to the main model gets trimmed in-place to the last N user/AI messages. System prefix (character card, system prompt) preserved. Reversible — change slider back to 0 to restore full history.
+- **Tradeoff:** cleaner focus, lower token cost — but the stored facts have to be good enough to replace the hidden history. If your facts are sparse, the model will feel amnesiac.
+
+### Removed
+- `{context}` placeholder support in Writer Format (added speculatively in v0.7.1, no longer needed since we don't duplicate chat into the injection).
+- `contextBlock` parameter in `buildWriterInjection()`.
+
+### Internal
+- New `trimChatHistory(messages, keepLast)` helper in [src/agent-writer.js](src/agent-writer.js) — preserves system prefix, splices oldest user/AI messages.
+- [src/agent-writer.js](src/agent-writer.js) `injectMemoryContext()` now accepts `options.trimToLast`.
+- [src/pipeline.js](src/pipeline.js) reads `settings.agent2ContextMessages`, passes as `{trimToLast: N}` to `injectMemoryContext()`.
+
 ## [0.7.1] - 2026-05-17
 
 ### Added
