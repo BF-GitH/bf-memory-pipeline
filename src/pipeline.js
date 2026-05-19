@@ -451,9 +451,27 @@ async function runPipelineInline(data) {
         updateStatus('idle');
         return;
     }
-    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted);
+    // Optional Agent 2 (Writer) context block: duplicate the last N chat messages
+    // into the injection so the main model has them in the system block. Default 0
+    // = don't duplicate (the model already sees full chat history via ST's normal
+    // prompt assembly). Increase if your chat is large and you want to force the
+    // model's attention onto recent exchanges.
+    const agent2Count = Math.max(0, settings.agent2ContextMessages || 0);
+    let contextBlock = '';
+    if (agent2Count > 0) {
+        const start = Math.max(0, chat.length - agent2Count);
+        const lines = [];
+        for (let i = start; i < chat.length; i++) {
+            const m = chat[i];
+            if (!m || !m.mes) continue;
+            const tag = m.is_user ? '[USER]' : '[CHAR]';
+            lines.push(`${tag} ${m.mes}`);
+        }
+        contextBlock = lines.join('\n\n');
+    }
+    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, contextBlock);
     lastInjection = injection; // Cache for swipes/regens
-    addDebugLog('info', `Injection ready (${injection.length} chars) in ${Date.now() - startTime}ms`);
+    addDebugLog('info', `Injection ready (${injection.length} chars${contextBlock ? `, +${agent2Count} ctx msgs` : ''}) in ${Date.now() - startTime}ms`);
 
     const success = injectMemoryContext(data, injection);
     if (success) {

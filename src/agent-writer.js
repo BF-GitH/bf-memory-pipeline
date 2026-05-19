@@ -23,27 +23,37 @@ export const DEFAULT_WRITER_FORMAT = `[Memory Context - Use these established fa
  * This doesn't call an LLM - it prepares context for the main generation
  * @param {string} draft - Draft from Agent 1
  * @param {string} factsFormatted - Formatted facts from retrieval
+ * @param {string} [contextBlock=''] - Optional recent-chat context block (last N messages, role-tagged)
+ *   Pass empty string (default) to skip. When non-empty, supports {context} placeholder
+ *   in the template; otherwise prepended to the injection.
  * @returns {string} Injection text to add to the prompt
  */
-export function buildWriterInjection(draft, factsFormatted) {
+export function buildWriterInjection(draft, factsFormatted, contextBlock = '') {
     const settings = getSettingsSafe();
 
     const template = settings?.writerFormat || DEFAULT_WRITER_FORMAT;
     const factsText = (factsFormatted && factsFormatted !== '(No stored facts available)') ? factsFormatted : '(none available)';
     const draftText = draft || '(no direction)';
+    const ctxText = contextBlock || '';
 
     // Single-pass regex substitution: avoids order-dependent re-substitution
     // (e.g. factsText containing literal "{draft}" can't get re-replaced)
-    const vars = { facts: factsText, draft: draftText };
-    let rendered = template.replace(/\{(facts|draft)\}/g, (_, key) => vars[key]);
+    const vars = { facts: factsText, draft: draftText, context: ctxText };
+    let rendered = template.replace(/\{(facts|draft|context)\}/g, (_, key) => vars[key]);
 
-    // Safety guard: if EITHER placeholder is missing, append the missing parts
-    // rather than silently dropping content
+    // Safety guard: if {facts} / {draft} placeholders missing from template, append.
     const missing = [];
     if (!template.includes('{facts}')) missing.push(`#Established Facts:\n${factsText}`);
     if (!template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
     if (missing.length > 0) {
         rendered = `${rendered}\n\n${missing.join('\n\n')}`;
+    }
+
+    // If context was provided but template lacks {context} placeholder, prepend it.
+    // This way users get the benefit of agent2ContextMessages > 0 even with the
+    // default template (which doesn't include {context}).
+    if (ctxText && !template.includes('{context}')) {
+        rendered = `#Recent Context:\n${ctxText}\n\n${rendered}`;
     }
 
     return rendered;

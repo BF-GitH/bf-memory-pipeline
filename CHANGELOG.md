@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.1] - 2026-05-17
+
+### Added
+- **Agent 2 (Writer) context-messages slider** for symmetry with Agent 1 / Agent 3 controls. Default 0 = off (current behavior).
+  - **What it does when > 0:** duplicates the last N chat messages into the injection block (as `[USER]` / `[CHAR]` tagged lines).
+  - **Why it's usually unnecessary:** the main model (Agent 2) already sees full chat history via ST's normal prompt assembly. This setting is for FORCING the model's attention onto recent exchanges when the chat is long.
+  - Costs extra tokens (duplicates messages already in the prompt).
+- New `{context}` placeholder support in the Writer Format template. If your custom template includes `{context}`, the chat block is substituted there. Otherwise it's auto-prepended.
+
+### Internal
+- [src/agent-writer.js](src/agent-writer.js) `buildWriterInjection()` gained an optional `contextBlock` parameter (3rd arg, default `''`). Backward-compatible: existing callers without the arg behave exactly as before.
+- [src/pipeline.js](src/pipeline.js) gathers up to `agent2ContextMessages` last messages from chat and passes as the new param.
+
 ## [0.7.0] - 2026-05-17
 
 ### Added — per-agent configuration

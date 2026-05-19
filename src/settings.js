@@ -50,6 +50,10 @@ const DEFAULT_SETTINGS = {
     // latest user + AI exchange.
     agent1ContextMessages: 5,
     agent3ContextMessages: 2,
+    // Agent 2 (Writer) context: default 0 = off. The main model already sees full chat
+    // history via ST's normal prompt assembly; this setting > 0 ALSO duplicates the
+    // last N messages into the injection block to force the model's attention.
+    agent2ContextMessages: 0,
     reviewInterval: 10,
     secondaryChance: 50,
     tertiaryChance: 15,
@@ -98,6 +102,7 @@ function validateSettings(s) {
     s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 2));
+    s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 20, 0));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
@@ -1015,6 +1020,16 @@ export async function initSettings() {
         const val = parseInt($(this).val());
         extensionSettings.agent3ContextMessages = val;
         $('#bf_mem_agent3_context_val').text(val);
+        saveSettings();
+    });
+
+    // Agent 2 context slider (force-attention duplication)
+    $('#bf_mem_agent2_context').val(extensionSettings.agent2ContextMessages);
+    $('#bf_mem_agent2_context_val').text(extensionSettings.agent2ContextMessages);
+    $('#bf_mem_agent2_context').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.agent2ContextMessages = val;
+        $('#bf_mem_agent2_context_val').text(val);
         saveSettings();
     });
 
