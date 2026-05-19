@@ -34,7 +34,8 @@ const EXTENSION_NAME = (() => {
 let extensionSettings = null;
 let debugLog = [];
 const MAX_DEBUG_ENTRIES = 200;
-let lastPipelineSummary = null;
+let lastGenerated = { runId: null, timestamp: null, updates: [] };
+let lastInserted = { runId: null, timestamp: null, updates: [] };
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -213,80 +214,111 @@ function renderDebugLog() {
     `).join('');
 }
 
-// --- Pipeline Summary (Debug Light) ---
+// --- Last Generated / Last Inserted Facts (replaces old Summary tab) ---
 
-export function updatePipelineSummary(summary) {
-    lastPipelineSummary = summary;
-    renderSummary();
+const GENERATED_META_KEY = 'bf_mem_generated';
+const INSERTED_META_KEY = 'bf_mem_inserted';
+
+function loadFactsFromMeta(key) {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        const stored = md[key];
+        if (!stored || typeof stored !== 'object' || !Array.isArray(stored.updates)) return null;
+        return stored;
+    } catch { return null; }
 }
 
-function renderSummary() {
-    const container = document.getElementById('bf_mem_summary');
+function saveFactsToMeta(key, data) {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[key] = data;
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+export function setLastGenerated(updates) {
+    lastGenerated = {
+        runId: Date.now(),
+        timestamp: new Date().toLocaleTimeString(),
+        updates: Array.isArray(updates) ? updates : [],
+    };
+    saveFactsToMeta(GENERATED_META_KEY, lastGenerated);
+    renderGenerated();
+}
+
+export function setLastInserted(updates) {
+    lastInserted = {
+        runId: Date.now(),
+        timestamp: new Date().toLocaleTimeString(),
+        updates: Array.isArray(updates) ? updates : [],
+    };
+    saveFactsToMeta(INSERTED_META_KEY, lastInserted);
+    renderInserted();
+}
+
+export function appendLastInserted(updates) {
+    if (!Array.isArray(updates) || updates.length === 0) return;
+    lastInserted.updates = [...(lastInserted.updates || []), ...updates];
+    lastInserted.timestamp = new Date().toLocaleTimeString();
+    saveFactsToMeta(INSERTED_META_KEY, lastInserted);
+    renderInserted();
+}
+
+export function reloadFactsFromChat() {
+    lastGenerated = loadFactsFromMeta(GENERATED_META_KEY) || { runId: null, timestamp: null, updates: [] };
+    lastInserted = loadFactsFromMeta(INSERTED_META_KEY) || { runId: null, timestamp: null, updates: [] };
+    renderGenerated();
+    renderInserted();
+}
+
+function renderFactList(containerId, data, opts = {}) {
+    const container = document.getElementById(containerId);
     if (!container) return;
 
-    if (!lastPipelineSummary) {
-        container.innerHTML = '<div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see the workflow summary.</div>';
+    if (data.runId === null) {
+        container.innerHTML = `<div class="bf-mem-summary-empty">${escapeHtml(opts.emptyMsg || 'No pipeline runs yet.')}</div>`;
+        return;
+    }
+    if (!data.updates || data.updates.length === 0) {
+        container.innerHTML = `<div class="bf-mem-summary-empty">${escapeHtml(opts.zeroMsg || 'Last run extracted 0 facts.')}</div>`;
         return;
     }
 
-    const s = lastPipelineSummary;
-    const lines = [];
-
-    lines.push(`### Pipeline Run`);
-    lines.push(`**Time:** ${s.timestamp} | **Duration:** ${s.durationMs}ms`);
-    lines.push('');
-
-    // Agent 1
-    lines.push(`#### Agent 1 — Draft`);
-    if (s.agent1Error) {
-        lines.push(`- Status: **FAILED** (${s.agent1Error})`);
-    } else {
-        lines.push(`- Status: **OK**`);
-        lines.push(`- Draft: *${s.draftSnippet || '(empty)'}*`);
-        lines.push(`- Needed facts: ${s.neededFacts?.length ? s.neededFacts.join(', ') : '(none)'}`);
-    }
-    lines.push('');
-
-    // Agent 3
-    lines.push(`#### Agent 3 — Memory`);
-    if (s.agent3Skipped) {
-        lines.push(`- Status: **Skipped** (no new message to process)`);
-    } else if (s.agent3Error) {
-        lines.push(`- Status: **FAILED** (${s.agent3Error})`);
-    } else {
-        lines.push(`- Status: **OK** — ${s.memoryUpdates} update(s)`);
-        if (s.memorySummary) lines.push(`- Summary: ${s.memorySummary}`);
-    }
-    lines.push('');
-
-    // Retrieval
-    lines.push(`#### Fact Retrieval`);
-    lines.push(`- Primary: **${s.stats?.primary || 0}** | Secondary: **${s.stats?.secondary || 0}** | Tertiary: **${s.stats?.tertiary || 0}**`);
-    if (s.contextKeywords?.length) lines.push(`- Context keywords: ${s.contextKeywords.join(', ')}`);
-    if (s.deltaKeywords?.length) lines.push(`- Delta keywords: ${s.deltaKeywords.join(', ')}`);
-    lines.push('');
-
-    // Injection
-    lines.push(`#### Injection`);
-    lines.push(`- Characters injected: **${s.injectionChars || 0}**`);
-    lines.push(`- Status: ${s.injected ? '**Injected**' : '**Failed**'}`);
-
-    // Convert markdown-like to HTML (simple)
-    const html = lines.map(line => {
-        if (line.startsWith('### ')) return `<h3>${line.slice(4)}</h3>`;
-        if (line.startsWith('#### ')) return `<h4>${line.slice(5)}</h4>`;
-        if (line.startsWith('- ')) return `<div class="bf-mem-summary-item">${formatInline(line.slice(2))}</div>`;
-        if (line === '') return '';
-        return `<p>${formatInline(line)}</p>`;
-    }).join('\n');
-
-    container.innerHTML = html;
+    const header = `<div class="bf-mem-fact-header"><b>${escapeHtml(data.timestamp || '')}</b> · ${data.updates.length} fact${data.updates.length === 1 ? '' : 's'}</div>`;
+    const items = data.updates.map(u => {
+        const cat = escapeHtml(u.category || '?');
+        const key = escapeHtml(u.key || '');
+        const value = escapeHtml(String(u.value ?? ''));
+        const knownBy = (u.knownBy || []).map(k => `<span class="bf-mem-chip">@${escapeHtml(k)}</span>`).join(' ');
+        const tags = (u.tags || []).map(t => `<span class="bf-mem-chip bf-mem-chip-tag">#${escapeHtml(t)}</span>`).join(' ');
+        const source = u.source ? `<span class="bf-mem-fact-source">from ${escapeHtml(u.source)}</span>` : '';
+        const status = u.status
+            ? `<span class="bf-mem-fact-status bf-mem-fact-status-${u.status.toLowerCase()}">${escapeHtml(u.status)}</span>`
+            : '';
+        return `
+            <div class="bf-mem-fact-row">
+                <div class="bf-mem-fact-line"><span class="bf-mem-fact-cat">${cat}</span> <code class="bf-mem-fact-key">${key}</code> = <span class="bf-mem-fact-val">${value}</span></div>
+                <div class="bf-mem-fact-meta">${knownBy} ${tags} ${source} ${status}</div>
+            </div>`;
+    }).join('');
+    container.innerHTML = header + items;
 }
 
-function formatInline(text) {
-    return escapeHtml(text)
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.+?)\*/g, '<em>$1</em>');
+function renderGenerated() {
+    renderFactList('bf_mem_generated_list', lastGenerated, {
+        emptyMsg: 'No pipeline runs yet. Send a message to see what Agent 3 extracts.',
+        zeroMsg: 'Last run extracted 0 facts (Agent 3 found nothing worth storing).',
+    });
+}
+
+function renderInserted() {
+    renderFactList('bf_mem_inserted_list', lastInserted, {
+        emptyMsg: 'No pipeline runs yet.',
+        zeroMsg: 'Nothing to insert (Agent 3 returned no facts, or run was cancelled).',
+    });
 }
 
 function exportLogs() {
@@ -1158,13 +1190,15 @@ export async function initSettings() {
     // --- Auto-save DB profile on chat change (named after current chat) ---
     context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
         await autoSaveDbProfile();
-        // Reload the persistent debug log from the new chat's metadata so each chat
-        // shows its own history (not a stale cross-chat snapshot).
+        // Reload the persistent debug log AND fact panels from the new chat's metadata
+        // so each chat shows its own history (not a stale cross-chat snapshot).
         reloadDebugLogFromChat();
+        reloadFactsFromChat();
     });
 
-    // Initial load: pull any previously-persisted log entries for the current chat
+    // Initial load: pull any previously-persisted log entries + facts for the current chat
     reloadDebugLogFromChat();
+    reloadFactsFromChat();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

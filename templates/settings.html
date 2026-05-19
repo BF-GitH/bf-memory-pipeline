@@ -22,7 +22,8 @@
                 <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_pipeline" tabindex="0">Pipeline</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">Prompts</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_summary" tabindex="-1">Summary</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_generated" tabindex="-1">Last Generated</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_inserted" tabindex="-1">Last Inserted</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
@@ -211,15 +212,31 @@
                 </div>
             </div>
 
-            <!-- Tab: Summary (Debug Light) -->
-            <div id="bf_mem_tab_summary" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+            <!-- Tab: Last Generated Facts -->
+            <div id="bf_mem_tab_generated" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-list-check"></i> Pipeline Summary
+                        <i class="fa-solid fa-flask"></i> Last Generated Facts
                     </div>
                     <div class="bf-mem-section-body">
-                        <div id="bf_mem_summary" class="bf-mem-summary">
-                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see the workflow summary.</div>
+                        <small class="bf-mem-hint">Everything Agent 3 extracted in the most recent run, BEFORE dedup / cancellation guards.</small>
+                        <div id="bf_mem_generated_list" class="bf-mem-fact-list">
+                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see what Agent 3 extracts.</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Last Inserted Facts -->
+            <div id="bf_mem_tab_inserted" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-database"></i> Last Inserted Facts
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Facts that actually landed in the database (after dedup / review edits / cancellation guards).</small>
+                        <div id="bf_mem_inserted_list" class="bf-mem-fact-list">
+                            <div class="bf-mem-summary-empty">No pipeline runs yet.</div>
                         </div>
                     </div>
                 </div>

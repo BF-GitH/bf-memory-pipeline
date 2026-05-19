@@ -322,15 +322,19 @@
 /* Review Popup */
 #bf_mem_review_overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
+    inset: 0;
     background: rgba(0, 0, 0, 0.7);
     z-index: 10000;
+    /* Anchor to TOP with safe-area padding; flex still centers HORIZONTALLY.
+       align-items:flex-start keeps the popup reachable when the soft keyboard
+       shrinks the visual viewport — center-aligned content would slide above
+       the visible area with no way to scroll the fixed overlay. */
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
+    padding: max(16px, env(safe-area-inset-top, 16px)) 8px max(16px, env(safe-area-inset-bottom, 16px));
+    overflow-y: auto;            /* fallback scroll if popup taller than viewport */
+    overscroll-behavior: contain;
 }
 
 .bf-mem-review-popup {
@@ -340,9 +344,19 @@
     padding: 20px;
     max-width: 700px;
     width: 90%;
-    max-height: 80vh;
+    /* Prefer JS-set --bf-mem-vv-h (visualViewport.height - 32px); fall back to
+       dynamic viewport units (shrinks with iOS keyboard) then static vh. */
+    max-height: var(--bf-mem-vv-h, min(80dvh, 80vh));
     overflow-y: auto;
+    overscroll-behavior: contain;
     color: var(--SmartThemeBodyColor, #eee);
+    margin: auto 0;              /* vertically centers ONLY when there's slack */
+}
+
+/* Desktop: restore true vertical centering when there's plenty of room
+   and no on-screen keyboard is likely (hover = mouse). */
+@media (hover: hover) and (min-height: 700px) {
+    #bf_mem_review_overlay { align-items: center; }
 }
 
 .bf-mem-review-popup h3 { margin: 0 0 10px; }

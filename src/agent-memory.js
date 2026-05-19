@@ -379,6 +379,8 @@ async function applyUpdates(updates, existingDatabases) {
 
         const db = existingDatabases[category];
         const isNew = !db.facts.some(f => f.key === update.key);
+        // Surface NEW/UPDATED status to pipeline.js so the Last Inserted tab can show it
+        update.wasNew = isNew;
 
         upsertFact(db, {
             key: update.key,

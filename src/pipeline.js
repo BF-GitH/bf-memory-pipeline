@@ -9,7 +9,7 @@ import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { getMemoryProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, updatePipelineSummary, saveCurrentToActiveProfile } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -310,8 +310,13 @@ async function runPipelineInline(data) {
 
     // --- Process Agent 3 results ---
     if (memoryResult && !memoryResult.error) {
+        // Always record what Agent 3 proposed (regardless of guards) for the
+        // Last Generated tab.
+        setLastGenerated(memoryResult.updates || []);
         if (pipelineCancelled) {
             addDebugLog('info', `Pipeline cancelled — discarding ${memoryResult.updates.length} Agent 3 updates`);
+            // Mark all as SKIPPED for Last Inserted tab.
+            setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
         } else {
             const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
             if (currentCharAvatar !== capturedCharAvatar) {
@@ -319,8 +324,15 @@ async function runPipelineInline(data) {
                 if (typeof toastr !== 'undefined') {
                     toastr.warning('BF Memory: extraction discarded — you switched characters mid-generation');
                 }
+                // Mark all as SKIPPED for Last Inserted tab.
+                setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
             } else {
                 addDebugLog('info', `Agent 3: ${memoryResult.updates.length} updates. ${memoryResult.summary}`);
+                // Populate Last Inserted tab — use the wasNew flag set by agent-memory.js applyUpdates
+                setLastInserted((memoryResult.updates || []).map(u => ({
+                    ...u,
+                    status: u.wasNew ? 'NEW' : 'UPDATED',
+                })));
                 for (const update of memoryResult.updates) {
                     trackUpdate(update);
                 }
@@ -343,6 +355,7 @@ async function runPipelineInline(data) {
                             () => addDebugLog('info', 'User accepted all memory updates'),
                             async (editedItems) => {
                                 addDebugLog('info', `User edited ${editedItems.length} items`);
+                                appendLastInserted(editedItems.map(i => ({ ...i, status: 'UPDATED' })));
                                 const dbs = await getAllDatabases();
                                 for (const item of editedItems) {
                                     if (!dbs[item.category]) {
@@ -442,24 +455,6 @@ async function runPipelineInline(data) {
 
     hideWorkingIndicator();
     updateStatus('running', 'Generating with facts...');
-
-    // --- Update Summary (Debug Light) ---
-    updatePipelineSummary({
-        timestamp: new Date().toLocaleTimeString(),
-        durationMs: Date.now() - startTime,
-        agent1Error: draftResult?.error || null,
-        draftSnippet: draftResult?.draft?.substring(0, 100) || '',
-        neededFacts: draftResult?.neededFacts || [],
-        agent3Skipped: !memoryResult,
-        agent3Error: memoryResult?.error || null,
-        memoryUpdates: memoryResult?.updates?.length || 0,
-        memorySummary: memoryResult?.summary || '',
-        stats: retrieval.stats,
-        contextKeywords,
-        deltaKeywords,
-        injectionChars: injection.length,
-        injected: success,
-    });
 }
 
 // --- Main Pipeline Init ---

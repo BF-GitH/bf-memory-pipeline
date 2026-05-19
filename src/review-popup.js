@@ -150,6 +150,52 @@ export async function showReviewPopup(onAccept, onEdit) {
     document.body.appendChild(overlay);
 
     return new Promise((resolve) => {
+        // Keyboard-aware sizing: track visualViewport so the popup never grows
+        // taller than the area NOT covered by the soft keyboard. Without this,
+        // max-height:80vh measures the layout viewport (full screen) and the top
+        // of the popup gets pushed above the visible area on Android Chrome.
+        const popupEl = overlay.querySelector('.bf-mem-review-popup');
+        const syncViewport = () => {
+            const vv = window.visualViewport;
+            const h = vv ? vv.height : window.innerHeight;
+            popupEl.style.setProperty('--bf-mem-vv-h', `${Math.max(200, h - 32)}px`);
+        };
+        syncViewport();
+        if (window.visualViewport) {
+            window.visualViewport.addEventListener('resize', syncViewport);
+            window.visualViewport.addEventListener('scroll', syncViewport);
+        }
+        window.addEventListener('orientationchange', syncViewport);
+
+        // Focus + scroll first editable field into view so mobile users see it.
+        requestAnimationFrame(() => {
+            const first = overlay.querySelector('.bf-mem-key, .bf-mem-value');
+            if (first) {
+                first.focus({ preventScroll: true });
+                first.scrollIntoView({ block: 'center', behavior: 'instant' });
+            }
+        });
+
+        // Centralized cleanup: remove listeners on every dismiss path.
+        const cleanup = () => {
+            if (window.visualViewport) {
+                window.visualViewport.removeEventListener('resize', syncViewport);
+                window.visualViewport.removeEventListener('scroll', syncViewport);
+            }
+            window.removeEventListener('orientationchange', syncViewport);
+            overlay.remove();
+        };
+
+        // Backdrop click closes (was previously impossible to dismiss if buttons
+        // scrolled off-screen on mobile). Ignore clicks inside the popup.
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                cleanup();
+                resetCounter();
+                resolve('dismissed');
+            }
+        });
+
         // Remove item button
         overlay.addEventListener('click', (e) => {
             if (e.target.classList.contains('bf-mem-remove-btn')) {
@@ -161,7 +207,7 @@ export async function showReviewPopup(onAccept, onEdit) {
 
         // Accept all
         overlay.querySelector('#bf_mem_accept_all')?.addEventListener('click', () => {
-            overlay.remove();
+            cleanup();
             clearPendingItems();
             resetCounter();
             onAccept?.();
@@ -187,7 +233,7 @@ export async function showReviewPopup(onAccept, onEdit) {
                 });
             });
 
-            overlay.remove();
+            cleanup();
             clearPendingItems();
             resetCounter();
             onEdit?.(editedItems);
@@ -196,7 +242,7 @@ export async function showReviewPopup(onAccept, onEdit) {
 
         // Dismiss (keep items for next review)
         overlay.querySelector('#bf_mem_dismiss')?.addEventListener('click', () => {
-            overlay.remove();
+            cleanup();
             resetCounter();
             resolve('dismissed');
         });

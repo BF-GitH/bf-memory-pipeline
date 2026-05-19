@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.6.0] - 2026-05-17
+
+### Fixed (HIGH — mobile UX)
+- **Review popup no longer hides above the screen on mobile.** Root cause: the overlay flex-centered vertically against `100%` of the layout viewport (full screen height, unchanged when Android soft keyboard opens). The 80vh popup was pushed off-screen with no scroll recovery.
+- New behavior:
+  - Overlay anchors to TOP (`align-items: flex-start`) on mobile, with `padding: env(safe-area-inset-top)`. Vertical centering restored ONLY on desktop via `@media (hover: hover) and (min-height: 700px)`.
+  - JS-set `--bf-mem-vv-h` CSS var tracks `window.visualViewport.height` so the popup never grows taller than the keyboard-free area. Listens to `visualViewport` resize/scroll + `orientationchange`.
+  - Popup max-height now `var(--bf-mem-vv-h, min(80dvh, 80vh))` — uses dynamic viewport units that shrink with iOS keyboards as fallback.
+  - On open: first editable field gets `.focus()` + `scrollIntoView({block:'center'})` so mobile users see it immediately.
+  - Backdrop click now dismisses the popup (previously only Accept/Save/Dismiss buttons could close it — useless if they scrolled off-screen on a tall popup).
+  - Centralized `cleanup()` removes all listeners on every dismiss path (no leak).
+
+### Changed (UI restructure)
+- **Replaced the "Summary" tab with TWO new tabs: "Last Generated" and "Last Inserted".**
+  - **Last Generated** shows every fact Agent 3 PROPOSED in the most recent pipeline run (raw output, before any guard).
+  - **Last Inserted** shows the subset that ACTUALLY landed in the database, with status badge: `NEW` / `UPDATED` / `SKIPPED` (skipped = pipeline cancelled or char switched mid-run).
+  - Both tabs persist in `chat_metadata` (per-chat) so they survive page reload — same pattern as the debug log + review counter.
+  - Auto-refresh on `CHAT_CHANGED` so each chat shows its own facts (not stale cross-chat data).
+  - Review popup edits append to the "Last Inserted" view in real time.
+- Deleted: `lastPipelineSummary`, `updatePipelineSummary()`, `renderSummary()`, `formatInline()` (all summary-tab plumbing).
+- Added: `setLastGenerated()`, `setLastInserted()`, `appendLastInserted()`, `reloadFactsFromChat()`, `renderFactList()` (exports + helpers in settings.js).
+- Added: `update.wasNew = isNew` in `agent-memory.js applyUpdates()` so pipeline.js can surface NEW vs UPDATED badges per fact.
+
+### Internal
+- Designed by 2 parallel research agents (mobile-popup-fix + tab-redesign-spec). Applied by 2 sequential patch agents (popup + tabs).
+
 ## [0.5.1] - 2026-05-17
 
 ### Changed (HIGH impact — Agent 3 extraction quality)
