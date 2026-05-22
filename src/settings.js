@@ -1188,10 +1188,11 @@ export async function initSettings() {
 
     $('#bf_mem_use_profile').prop('checked', extensionSettings.useMemoryProfile).on('change', function () {
         extensionSettings.useMemoryProfile = $(this).prop('checked');
-        $('#bf_mem_profile_section').toggle(extensionSettings.useMemoryProfile);
+        // Note: profile dropdowns now live in the per-agent tabs (always visible).
+        // This flag still gates whether the agents USE those profiles
+        // (see getAgent1ProfileId / getAgent3ProfileId in profiler.js).
         saveSettings();
     });
-    $('#bf_mem_profile_section').toggle(extensionSettings.useMemoryProfile);
 
     reloadProfiles();
     $('#bf_mem_agent1_profile').val(extensionSettings.agent1Profile || '').on('change', function () {

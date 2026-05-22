@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.10.0] - 2026-05-17
+
+### Changed — settings reorganized into per-agent tabs
+The old type-grouped tabs ("Pipeline" + "Prompts") split a single agent's settings across multiple places. Now each agent has ONE tab with everything for it:
+
+- **Agent 1** tab: its connection profile · its context-messages slider · its draft-planner prompt (+ reset)
+- **Agent 2** tab: a note that it's the main model (no separate profile) · its context-limit/trim slider · fact-retrieval %s (they feed the writer's injection) · the Writer Injection Format template (+ reset)
+- **Agent 3** tab: its connection profile · its context-messages slider · review-interval slider · its memory-updater prompt (+ reset)
+- **General** tab: "use separate profiles" master toggle · show-toast toggle
+- Data tabs unchanged: Database · Last Generated · Last Inserted · Tokens · Debug
+- Enable toggle stays in the always-visible status bar
+
+Every element id was preserved, so all existing handlers/persistence keep working — purely a layout move. The generic `setupTabs()` auto-wires the new tabs.
+
+### Removed
+- Dead `#bf_mem_profile_section` toggle calls in settings.js (the wrapper no longer exists; the `useMemoryProfile` flag still gates whether agents use their profiles, via `getAgent1ProfileId` / `getAgent3ProfileId`).
+
 ## [0.9.0] - 2026-05-17
 
 ### Added — token comparison

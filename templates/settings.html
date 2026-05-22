@@ -19,8 +19,10 @@
 
             <!-- Tabs -->
             <div class="bf-mem-tabs" role="tablist">
-                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_pipeline" tabindex="0">Pipeline</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_prompts" tabindex="-1">Prompts</button>
+                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Agent 1</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent2" tabindex="-1">Agent 2</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent3" tabindex="-1">Agent 3</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_general" tabindex="-1">General</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_generated" tabindex="-1">Last Generated</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_inserted" tabindex="-1">Last Inserted</button>
@@ -28,75 +30,66 @@
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
-            <!-- Tab: Pipeline Settings -->
-            <div id="bf_mem_tab_pipeline" role="tabpanel" class="bf-mem-tabpanel">
-
-                <!-- Connection Profile -->
+            <!-- Tab: Agent 1 (Draft Planner) -->
+            <div id="bf_mem_tab_agent1" role="tabpanel" class="bf-mem-tabpanel">
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-plug"></i> Connection Profile
-                    </div>
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
                     <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_use_profile" />
-                            <span>Use separate profile for Draft + Memory agents</span>
-                        </label>
-                        <div id="bf_mem_profile_section">
-                            <div class="bf-mem-field">
-                                <label>Agent 1 (Draft Planner) Profile</label>
-                                <div class="bf-mem-profile-row">
-                                    <select id="bf_mem_agent1_profile" class="text_pole"></select>
-                                </div>
+                        <div class="bf-mem-field">
+                            <label>Agent 1 (Draft Planner) Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent1_profile" class="text_pole"></select>
                             </div>
-                            <div class="bf-mem-field">
-                                <label>Agent 3 (Memory Updater) Profile</label>
-                                <div class="bf-mem-profile-row">
-                                    <select id="bf_mem_agent3_profile" class="text_pole"></select>
-                                    <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
-                                        <i class="fa-solid fa-arrows-rotate"></i>
-                                    </button>
-                                </div>
-                            </div>
-                            <small class="bf-mem-hint">Writer (Agent 2) always uses your default/active profile. Leave Agent 1 / Agent 3 blank to use the default profile too.</small>
+                            <small class="bf-mem-hint">Leave blank to use your default/active profile.</small>
                         </div>
                     </div>
                 </div>
-
-                <!-- Context & Timing -->
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-sliders"></i> Context & Timing
-                    </div>
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Agent 1 Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
                             <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
-                            <small class="bf-mem-hint">How many recent messages Agent 1 (Draft) sees when planning the reply</small>
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>Agent 3 Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
-                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
-                            <small class="bf-mem-hint">How many recent messages Agent 3 (Memory) sees for extraction. Default 2 = just the latest user + AI exchange. Higher = more context for better extraction but more tokens.</small>
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>Agent 2 Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
-                            <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
-                            <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages from the main model — it only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
-                            <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
-                            <small class="bf-mem-hint">Messages between fact review popups</small>
+                            <small class="bf-mem-hint">How many recent messages Agent 1 sees when planning the reply.</small>
                         </div>
                     </div>
                 </div>
-
-                <!-- Retrieval Probabilities -->
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-dice"></i> Fact Retrieval
+                        <i class="fa-solid fa-pen"></i> Draft Planner Prompt
+                        <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
                     </div>
                     <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Draft agent system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells Agent 1 how to plan a reply and list needed facts.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Agent 2 (Writer) -->
+            <div id="bf_mem_tab_agent2" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-pen-nib"></i> Writer (main model)</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Agent 2 is your MAIN model writing the reply — it always uses your default/active connection profile. There is no separate profile to set.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
+                            <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
+                            <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages — the main model only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-dice"></i> Fact Retrieval</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Controls which stored facts get injected into the writer's prompt.</small>
                         <div class="bf-mem-field">
                             <label>Secondary Fact Chance <span class="bf-mem-val" id="bf_mem_secondary_val">50%</span></label>
                             <input type="range" id="bf_mem_secondary" min="0" max="100" step="5" value="50" />
@@ -109,49 +102,6 @@
                         </div>
                     </div>
                 </div>
-
-                <!-- General -->
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-gear"></i> General
-                    </div>
-                    <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_toast" />
-                            <span>Show toast notifications</span>
-                        </label>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Tab: Prompts -->
-            <div id="bf_mem_tab_prompts" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Agent 1: Draft Planner Prompt
-                        <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
-                            <i class="fa-solid fa-undo"></i>
-                        </button>
-                    </div>
-                    <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Draft agent system prompt..."></textarea>
-                        <small class="bf-mem-hint">This prompt tells Agent 1 how to plan a reply and list needed facts.</small>
-                    </div>
-                </div>
-
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Agent 3: Memory Updater Prompt
-                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
-                            <i class="fa-solid fa-undo"></i>
-                        </button>
-                    </div>
-                    <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Memory updater system prompt..."></textarea>
-                        <small class="bf-mem-hint">This prompt tells Agent 3 how to extract and update facts.</small>
-                    </div>
-                </div>
-
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-pen"></i> Writer Injection Format
@@ -162,6 +112,75 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_writer_format" class="bf-mem-textarea" rows="6" placeholder="Writer injection header/footer..."></textarea>
                         <small class="bf-mem-hint">Template wrapping the facts injected into the main model's prompt. Use {draft} and {facts} placeholders.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Agent 3 (Memory Updater) -->
+            <div id="bf_mem_tab_agent3" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Agent 3 (Memory Updater) Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent3_profile" class="text_pole"></select>
+                                <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
+                                    <i class="fa-solid fa-arrows-rotate"></i>
+                                </button>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to use your default/active profile. A cheap/fast model works well for extraction.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; Review</div>
+                    <div class="bf-mem-section-body">
+                        <div class="bf-mem-field">
+                            <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
+                            <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
+                            <small class="bf-mem-hint">How many recent messages Agent 3 sees for extraction. Default 2 = the latest user + AI exchange. Higher = more context, more tokens.</small>
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
+                            <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
+                            <small class="bf-mem-hint">Messages between fact-review popups (review of Agent 3's extracted facts).</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Memory Updater Prompt
+                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Memory updater system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells Agent 3 how to extract and update facts.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: General -->
+            <div id="bf_mem_tab_general" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profiles</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_use_profile" />
+                            <span>Use separate profiles for Agent 1 + Agent 3</span>
+                        </label>
+                        <small class="bf-mem-hint">When off, all agents use your default/active connection profile. When on, set each agent's profile in its own tab.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-gear"></i> General</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_toast" />
+                            <span>Show toast notifications</span>
+                        </label>
                     </div>
                 </div>
             </div>
