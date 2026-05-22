@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.9.0] - 2026-05-17
+
+### Added — token comparison
+- **New "Tokens" tab** showing a side-by-side comparison of token cost, split INPUT vs OUTPUT:
+  - **Baseline** — what the full chat would have cost the main model (no extension)
+  - **With extension** — main model (trimmed chat + facts) + Agent 1 (Draft) + Agent 3 (Memory), each broken out
+  - **NET vs baseline** — input saved (green) or spent (red), output overhead from agents (amber)
+  - **Last Run** + **This Session** (running totals) views, with a session-reset button
+- **Honesty banner:** if Agent 2 trim is OFF (actual main input ≈ baseline within 3%), the panel says plainly that there are no input savings and the agent calls are pure overhead — pointing you to the Agent 2 Context Limit slider. The NET-input figure turns red (not green) when the extension costs more than it saves, so it can't be misread as a win.
+
+### How tokens are measured
+- Uses ST's local tokenizer (`getTokenCountAsync` / `countTokensOpenAIAsync`). Provider usage isn't exposed to extensions, so counts are **approximate** (exact for OpenAI/Llama, estimated for Claude). The DELTA is what matters and both sides use the same tokenizer, so the comparison is meaningful. UI labels it "approx."
+- Captured in [src/pipeline.js](src/pipeline.js): baseline counted before trim, actual counted after trim+inject. Agent counts threaded out via new `tokensIn`/`tokensOut` fields on the Draft/Memory result objects. Main reply counted on `MESSAGE_RECEIVED`.
+- Persisted in `chat_metadata.bf_mem_tokens` (`{lastRun, session}`) — survives reload, per-chat scoped, auto-reloads on chat change.
+
+### Internal
+- [src/agent-draft.js](src/agent-draft.js) + [src/agent-memory.js](src/agent-memory.js): return `tokensIn`/`tokensOut` (0 on error path)
+- [src/settings.js](src/settings.js): `setRunTokens()`, `setMainOutputTokens()`, `reloadTokensFromChat()`, `renderTokens()`, session-reset handler
+- [src/pipeline.js](src/pipeline.js): `countChatTokens()` helper, baseline/actual capture around injection, MESSAGE_RECEIVED main-output capture
+- New tab auto-wired by the generic `setupTabs()` (no hardcoded tab list)
+
 ## [0.8.0] - 2026-05-17
 
 ### Added — backfill + per-message tracking

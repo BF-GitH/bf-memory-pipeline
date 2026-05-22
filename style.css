@@ -597,3 +597,8 @@
 .bf-mem-linked-popup {
     overscroll-behavior: contain;
 }
+
+/* Token comparison tab */
+.bf-mem-tok-save { color: #4caf50; font-weight: 600; }  /* saved input */
+.bf-mem-tok-cost { color: #ff9800; font-weight: 600; }  /* output / agent overhead */
+.bf-mem-tok-bad  { color: #f44336; font-weight: 600; }  /* net input positive = costing more */

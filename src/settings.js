@@ -36,6 +36,8 @@ let debugLog = [];
 const MAX_DEBUG_ENTRIES = 200;
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
+let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
+let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -348,6 +350,127 @@ function renderInserted() {
         emptyMsg: 'No pipeline runs yet.',
         zeroMsg: 'Nothing to insert (Agent 3 returned no facts, or run was cancelled).',
     });
+}
+
+// --- Token Comparison (persistent — stored in chat_metadata.bf_mem_tokens) ---
+
+const TOKENS_META_KEY = 'bf_mem_tokens';
+
+function loadTokensFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return;
+        const stored = md[TOKENS_META_KEY];
+        if (stored && typeof stored === 'object') {
+            lastRunTokens = (stored.lastRun && typeof stored.lastRun === 'object') ? stored.lastRun : null;
+            sessionTokens = (stored.session && typeof stored.session === 'object')
+                ? stored.session
+                : { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+        }
+    } catch { /* ignore */ }
+}
+
+function saveTokensToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[TOKENS_META_KEY] = { lastRun: lastRunTokens, session: sessionTokens };
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+// Called by pipeline.js after a run's input metrics are known.
+export function setRunTokens(run) {
+    lastRunTokens = { ...run, ts: Date.now(), approx: true };
+    // accumulate session
+    sessionTokens.baselineInput += run.baselineInput || 0;
+    sessionTokens.actualInput   += run.actualInput || 0;
+    sessionTokens.agentInput    += (run.agent1Input || 0) + (run.agent3Input || 0);
+    sessionTokens.agentOutput   += (run.agent1Output || 0) + (run.agent3Output || 0);
+    sessionTokens.runs          += 1;
+    saveTokensToMeta();
+    renderTokens();
+}
+
+// Called by pipeline.js MESSAGE_RECEIVED handler when the main reply lands.
+export function setMainOutputTokens(n) {
+    if (lastRunTokens) lastRunTokens.mainOutput = n || 0;
+    sessionTokens.mainOutput += n || 0;
+    saveTokensToMeta();
+    renderTokens();
+}
+
+export function reloadTokensFromChat() {
+    lastRunTokens = null;
+    sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+    loadTokensFromMeta();
+    renderTokens();
+}
+
+function fmt(n) { return (typeof n === 'number' && Number.isFinite(n)) ? n.toLocaleString() : '—'; }
+
+function renderTokens() {
+    const lastEl = document.getElementById('bf_mem_tokens_lastrun');
+    const sessEl = document.getElementById('bf_mem_tokens_session');
+    const banner = document.getElementById('bf_mem_tokens_banner');
+    if (!lastEl) return;
+
+    if (!lastRunTokens) {
+        lastEl.innerHTML = '<div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div>';
+        if (sessEl) sessEl.innerHTML = '<div class="bf-mem-summary-empty">No generations yet this session.</div>';
+        if (banner) banner.style.display = 'none';
+        return;
+    }
+
+    const L = lastRunTokens;
+    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0);
+    const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0);
+    const netIn = extIn - (L.baselineInput || 0);   // negative = saved
+    const netOut = extOut - (L.mainOutput || 0);     // agent output overhead (always >= 0)
+
+    // Trim-off detection: actual main input ~= baseline (within 3%)
+    const trimOff = (L.baselineInput > 0) && (L.actualInput >= L.baselineInput * 0.97);
+    if (banner) {
+        banner.style.display = trimOff ? 'block' : 'none';
+        banner.textContent = trimOff
+            ? 'Agent 2 trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls below are pure overhead (the tradeoff for memory recall). Turn on "Agent 2 Context Limit" in the Pipeline tab to save input tokens.'
+            : '';
+    }
+
+    const netInClass = netIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
+    const netInStr = (netIn < 0 ? '' : '+') + fmt(netIn);
+
+    lastEl.innerHTML = `
+        <table class="bf-mem-db-table">
+            <thead><tr><th></th><th>Input</th><th>Output</th></tr></thead>
+            <tbody>
+                <tr><td>Baseline (full chat)</td><td>${fmt(L.baselineInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
+                <tr><td>— Main model</td><td>${fmt(L.actualInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
+                <tr><td>— Agent 1 (Draft)</td><td>${fmt(L.agent1Input)}</td><td>${fmt(L.agent1Output)}</td></tr>
+                <tr><td>— Agent 3 (Memory)</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
+                <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
+                <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
+            </tbody>
+        </table>
+        <small class="bf-mem-hint">Approx. token counts (local tokenizer). Negative input = saved; output overhead is the agent calls.</small>`;
+
+    if (sessEl) {
+        const s = sessionTokens;
+        const sExtIn = (s.actualInput || 0) + (s.agentInput || 0);
+        const sExtOut = (s.mainOutput || 0) + (s.agentOutput || 0);
+        const sNetIn = sExtIn - (s.baselineInput || 0);
+        const sNetClass = sNetIn < 0 ? 'bf-mem-tok-save' : 'bf-mem-tok-bad';
+        sessEl.innerHTML = `
+            <table class="bf-mem-db-table">
+                <thead><tr><th>${s.runs} run(s)</th><th>Input</th><th>Output</th></tr></thead>
+                <tbody>
+                    <tr><td>Baseline total</td><td>${fmt(s.baselineInput)}</td><td>${fmt(s.mainOutput)}</td></tr>
+                    <tr><td>Extension total</td><td>${fmt(sExtIn)}</td><td>${fmt(sExtOut)}</td></tr>
+                    <tr><td><b>NET</b></td><td class="${sNetClass}">${(sNetIn < 0 ? '' : '+') + fmt(sNetIn)}</td><td class="bf-mem-tok-cost">+${fmt(sExtOut - (s.mainOutput || 0))}</td></tr>
+                </tbody>
+            </table>`;
+    }
 }
 
 function exportLogs() {
@@ -1304,6 +1427,13 @@ export async function initSettings() {
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
     });
 
+    // --- Tokens Tab ---
+    $('#bf_mem_tokens_reset').on('click', () => {
+        sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+        saveTokensToMeta();
+        renderTokens();
+    });
+
     // --- Debug Tab ---
     $('#bf_mem_debug').prop('checked', extensionSettings.debugMode).on('change', function () {
         extensionSettings.debugMode = $(this).prop('checked');
@@ -1371,11 +1501,13 @@ export async function initSettings() {
         // so each chat shows its own history (not a stale cross-chat snapshot).
         reloadDebugLogFromChat();
         reloadFactsFromChat();
+        reloadTokensFromChat();
     });
 
     // Initial load: pull any previously-persisted log entries + facts for the current chat
     reloadDebugLogFromChat();
     reloadFactsFromChat();
+    reloadTokensFromChat();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

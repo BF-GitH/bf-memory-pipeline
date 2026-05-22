@@ -146,6 +146,9 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     try {
         const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
         addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars):\n${resultStr}`);
+        const ctx = SillyTavern.getContext();
+        const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
+        const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
 
@@ -155,11 +158,11 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
             await applyUpdates(parsed.updates, existingDatabases);
         }
 
-        return parsed;
+        return { ...parsed, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Agent 3 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 3 (Memory) error:', error);
-        return { updates: [], summary: '', raw: '', error: error.message };
+        return { updates: [], summary: '', raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
     }
 }
 

@@ -24,6 +24,7 @@
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_generated" tabindex="-1">Last Generated</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_inserted" tabindex="-1">Last Inserted</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_tokens" tabindex="-1">Tokens</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
@@ -282,6 +283,28 @@
                         <div id="bf_mem_inserted_list" class="bf-mem-fact-list">
                             <div class="bf-mem-summary-empty">No pipeline runs yet.</div>
                         </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Tokens -->
+            <div id="bf_mem_tab_tokens" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div id="bf_mem_tokens_banner" class="bf-mem-hint" style="display:none;padding:8px 10px;border-left:3px solid #ff9800;border-radius:4px;margin-bottom:8px;"></div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-coins"></i> Last Run</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">What the whole chat would have cost vs. what the extension actually sent (trimmed chat + facts + agent calls).</small>
+                        <div id="bf_mem_tokens_lastrun"><div class="bf-mem-summary-empty">No generations yet. Send a message — token comparison appears after the first pipeline run.</div></div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-chart-column"></i> This Session
+                        <button id="bf_mem_tokens_reset" class="bf-mem-reset-btn menu_button" title="Reset session totals"><i class="fa-solid fa-rotate-left"></i></button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">Running totals across every generation since this chat was opened.</small>
+                        <div id="bf_mem_tokens_session"><div class="bf-mem-summary-empty">No generations yet this session.</div></div>
                     </div>
                 </div>
             </div>

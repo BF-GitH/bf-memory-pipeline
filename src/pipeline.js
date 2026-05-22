@@ -9,7 +9,7 @@ import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -20,6 +20,22 @@ let lastInjection = null; // cached injection text for swipes/regens
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
 let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
 let groupSkipToastShown = false; // show-once toast when skipping group chats
+
+/**
+ * Count tokens for a chat-completion message array (role wrappers included).
+ * Uses ST's local tokenizer — approximate, but same tokenizer both sides so the delta holds.
+ */
+async function countChatTokens(arr) {
+    if (!Array.isArray(arr) || arr.length === 0) return 0;
+    const ctx = SillyTavern.getContext();
+    try {
+        if (ctx.countTokensOpenAIAsync) return await ctx.countTokensOpenAIAsync(arr, true);
+        // fallback: sum per-message
+        let total = 0;
+        for (const m of arr) total += await (ctx.getTokenCountAsync?.(m.content || m.mes || '') ?? 0);
+        return total;
+    } catch { return 0; }
+}
 
 /**
  * Get recent chat messages
@@ -473,7 +489,26 @@ async function runPipelineInline(data) {
     const agent2Limit = Math.max(0, settings.agent2ContextMessages || 0);
     addDebugLog('info', `Injection ready (${injection.length} chars${agent2Limit ? `, trimming chat to last ${agent2Limit}` : ''}) in ${Date.now() - startTime}ms`);
 
+    // Token comparison: count main-model input BEFORE and AFTER trim+inject.
+    const baselineArr = data.chat || data.messages;
+    const baselineInput = await countChatTokens(baselineArr);
+
     const success = injectMemoryContext(data, injection, { trimToLast: agent2Limit });
+
+    const actualArr = data.chat || data.messages;
+    const actualInput = await countChatTokens(actualArr);
+
+    // Record token metrics for the Tokens tab (agent counts come from result objects)
+    setRunTokens({
+        baselineInput,
+        actualInput,
+        agent1Input: draftResult?.tokensIn || 0,
+        agent1Output: draftResult?.tokensOut || 0,
+        agent3Input: memoryResult?.tokensIn || 0,
+        agent3Output: memoryResult?.tokensOut || 0,
+        mainOutput: 0,
+    });
+
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
         pipelineJustInjected = true; // prevent double-injection on second event fire
@@ -532,9 +567,19 @@ export function initPipeline() {
     });
 
     // After generation complete: reset status and double-fire guard
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, () => {
+    eventSource.on(eventTypes.MESSAGE_RECEIVED, async () => {
         pipelineJustInjected = false;
         updateStatus('idle');
+
+        // Count the main model's reply tokens for the Tokens tab
+        try {
+            const ctx = SillyTavern.getContext();
+            const lastMsg = ctx.chat?.[ctx.chat.length - 1];
+            if (lastMsg && !lastMsg.is_user && lastMsg.mes) {
+                const n = await (ctx.getTokenCountAsync?.(lastMsg.mes) ?? 0);
+                setMainOutputTokens(n);
+            }
+        } catch { /* ignore */ }
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
