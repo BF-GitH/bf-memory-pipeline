@@ -68,30 +68,84 @@ export function normalizeKind(v) {
 // LAYER 1 — canonical category set (menu order; Unsorted always last as the catch-all).
 export const L1_CATEGORIES = ['People', 'Places', 'Things', 'Relationships', 'Events', 'World', 'Unsorted'];
 
-// LAYER 2 — fixed aspect vocab PER category (generic, character-agnostic). The FIRST
-// entry of each list doubles as that category's default/fallback aspect when Agent 3
-// is unsure (see defaultAspectFor / normalizeAspect).
+// LAYER 2 — fixed aspect vocab PER category (granular, generic, character-agnostic). Each
+// label is a SCENE-TRIGGER drawer: narrow enough that it's plainly irrelevant most turns, so
+// when the planner "opens" one it's a real signal (vs. the old broad always-true buckets like
+// `identity`/`appearance` the planner opened every turn). The note-taker (Agent 3) PICKS the
+// MOST SPECIFIC matching label from this fixed list; an out-of-vocab value snaps to the
+// category default (see normalizeAspect). The FIRST entry of each list is the safest coarse
+// fallback (see DEFAULT_ASPECT). Relationships stay ABSTRACT/topical (NOT character-keyed) —
+// the who↔who is carried by the `subj:`/`with:@<name>` pair-tag (Layer 3), never a label.
+// ~90 labels total. People holds ~half the granularity (RP memory is mostly about people).
 export const TAXONOMY = {
-    People:        ['identity', 'appearance', 'body', 'background', 'role', 'status', 'mood', 'goals', 'behavior', 'skills'],
-    Places:        ['residence', 'public', 'region', 'feature'],
-    Things:        ['object', 'key-item', 'substance'],
-    Relationships: ['bond', 'tension', 'history'],
-    Events:        ['milestone', 'scene', 'action'],
-    World:         ['rule', 'lore', 'faction', 'time'],
+    People: [
+        // current state / who they are
+        'status', 'identity', 'origin', 'career', 'finances', 'reputation', 'allegiance',
+        // body & look
+        'appearance', 'body_marks', 'wardrobe', 'current_clothing', 'speech_style', 'health', 'injuries',
+        // inner life
+        'mood', 'beliefs', 'values', 'morals', 'fears', 'desires', 'sexuality',
+        'current_goal', 'ambitions',
+        // how they act
+        'habits', 'vices', 'secrets',
+        // capabilities
+        'skills', 'knowledge',
+        // past & circumstance
+        'childhood', 'family_origin', 'upbringing', 'education', 'trauma',
+        // daily circumstance
+        'home', 'daily_routine', 'current_location', 'carried_items',
+    ],
+    Places:        ['feature', 'function', 'atmosphere', 'access', 'inhabitants', 'condition', 'geography', 'significance'],
+    Things:        ['object', 'key_item', 'weapon', 'substance', 'tech', 'properties', 'ownership', 'currency'],
+    Relationships: ['history', 'family_ties', 'friendship', 'romance', 'attraction', 'rivalry', 'tension', 'trust', 'debt', 'alliance', 'power_dynamic'],
+    Events:        ['scene', 'milestone', 'action', 'conflict', 'agreement', 'revelation', 'change', 'plan'],
+    World:         ['lore', 'rule', 'faction', 'culture', 'politics', 'economy', 'history', 'geography', 'time'],
     Unsorted:      ['misc'],
 };
 
-// Per-category fallback aspect (used when Agent 3 omits/invalid `aspect:`). `status` is a
-// sensible neutral default for People (current-state); every other category falls back to
-// its first vocab entry. Kept explicit so the choice is auditable.
+// Per-category fallback aspect (used when Agent 3 omits/invalid `aspect:`, OR when a pre-redesign
+// fact's legacy aspect maps to nothing — see LEGACY_ASPECT_MAP). Chosen as the safest COARSE home
+// per category (the first vocab entry by convention). `status` for People (current-state). Kept
+// explicit so the choice is auditable.
 const DEFAULT_ASPECT = {
     People: 'status',
     Places: 'feature',
     Things: 'object',
-    Relationships: 'bond',
+    Relationships: 'history',
     Events: 'scene',
     World: 'lore',
     Unsorted: 'misc',
+};
+
+// BACK-COMPAT aspect map (PRE-REDESIGN Layer-2 vocab -> nearest NEW label). Facts stored before
+// the granular-taxonomy redesign carry an old aspect (identity/appearance/body/status/role/
+// background/mood/goals/behavior/skills, plus the old Places/Things/Events/World/Relationships
+// vocab). On READ, deriveAspect routes an old aspect that is NOT in the new vocab to its nearest
+// new label here; anything still unknown falls to the category default. This keeps existing facts
+// retrievable under the new menu without a migration write. Keys are lowercased.
+const LEGACY_ASPECT_MAP = {
+    // People (old 10-aspect set)
+    identity:   'identity',
+    appearance: 'appearance',
+    body:       'appearance',   // old `body` (physiology+marks) -> appearance (marks/look)
+    background: 'childhood',    // old `background` (origin/past) -> childhood (formative past)
+    role:       'career',       // old `role` (job/function) -> career
+    // `status` (People current-state) stays `status` (still in new vocab) — no entry needed.
+    mood:       'mood',
+    goals:      'current_goal', // old `goals` -> current_goal
+    behavior:   'habits',       // old `behavior` (tells/mannerisms) -> habits
+    skills:     'skills',
+    // Places (old: residence/public/region/feature)
+    residence:  'function',     // a dwelling -> what the place is for
+    public:     'function',
+    region:     'geography',
+    // Things (old: object/key-item/substance) — `key-item` had a hyphen
+    'key-item': 'key_item',
+    // Relationships (old: bond/tension/history) — `tension`/`history` still in new vocab
+    bond:       'friendship',   // old generic `bond` -> friendship (closest abstract tie)
+    // Events (old: milestone/scene/action) — all three still in new vocab; no entry needed.
+    // World (old: rule/lore/faction/time) — all four still in new vocab; no entry needed.
+    // Unsorted -> misc (still the only label).
 };
 
 /**
@@ -157,8 +211,12 @@ export function defaultAspectFor(category) {
 /**
  * Normalize an aspect against the fixed vocab for its category (Layer 2). Lowercased,
  * trimmed; falls back to the category's default aspect when absent/invalid so a fact
- * ALWAYS resolves to a real bucket. Back-compat: facts written before this feature have
- * no `aspect` and resolve to the default here.
+ * ALWAYS resolves to a real bucket. Back-compat (two layers):
+ *   1) A value already in the NEW vocab passes through unchanged.
+ *   2) A PRE-REDESIGN aspect not in the new vocab is mapped to its nearest new label via
+ *      LEGACY_ASPECT_MAP (so old facts re-bucket instead of all collapsing to the default).
+ *   3) Anything still unknown (or absent) → the category default.
+ * Facts written before the aspect feature have no `aspect` and resolve to the default here.
  * @param {*} v - raw aspect value
  * @param {string} category
  * @returns {string}
@@ -167,6 +225,12 @@ export function normalizeAspect(v, category) {
     const a = String(v || '').trim().toLowerCase();
     const vocab = aspectVocabFor(category);
     if (a && vocab.includes(a)) return a;
+    // Back-compat: re-map a pre-redesign aspect to its nearest new label, but only if the
+    // mapped target is actually valid for THIS category's vocab (avoids cross-category leakage).
+    if (a && Object.prototype.hasOwnProperty.call(LEGACY_ASPECT_MAP, a)) {
+        const mapped = LEGACY_ASPECT_MAP[a];
+        if (vocab.includes(mapped)) return mapped;
+    }
     return defaultAspectFor(category);
 }
 
@@ -1266,21 +1330,27 @@ function findDbByCategory(databases, category) {
 }
 
 /**
- * STAGE 1 — build the compact MENU (the picker's map of the store). 3-LAYER MODEL: the
- * menu axis is now CATEGORY (Layer 1) × ASPECT (Layer 2) — the CHARACTER is a deep tag,
+ * STAGE 1 — build the compact PLANNER MENU (Agent 1's map of the store). 3-LAYER MODEL:
+ * the menu axis is CATEGORY (Layer 1) × ASPECT (Layer 2) — the CHARACTER is a deep tag,
  * NOT a branch, so a character no longer surfaces as a top-level branch (the bug this
- * model fixes). Each line lists a Layer-1 category and, under it, its FIXED Layer-2 aspect
- * vocab with active-fact counts. NO values — structure only — so it stays small.
- * Example line: `People: identity(3), appearance(2), status(1)`.
+ * model fixes). Each line lists a Layer-1 category and, under it, only its NON-EMPTY
+ * Layer-2 aspects with active-fact counts. NO values — structure only — so it stays small.
+ * Example line: `People: status(3), appearance(2), childhood(1)`.
  *
- * DEFAULT SKELETON: the FULL taxonomy is always shown — every canonical Layer-1 category
- * and every aspect in its vocab — even when a category (or the whole store) has zero facts,
- * so Agent 1 can pick any branch from turn 1. Aspects with no active facts render as `(0)`.
- * Only ACTIVE facts are counted (superseded history is never a retrieval target). Aspects
- * are shown in their fixed vocab order (then any non-vocab aspect that somehow appears, by
- * count). Deterministic category ordering: L1 order first, then any custom extras.
+ * TWO-TIER MENU (granular-taxonomy redesign): with ~90 fixed labels, rendering the FULL
+ * skeleton with `(0)` lines would drown the planner in mostly-empty noise (re-creating the
+ * over-selection problem). So the PLANNER sees ONLY labels with ≥1 active fact — an empty
+ * drawer has nothing to retrieve, so hiding it loses no recall while making every shown
+ * label a real signal ("`finances(2)` means money genuinely matters for someone"). On a
+ * fresh/empty DB this returns an EMPTY string — correct: there is nothing to open. The
+ * FULL fixed vocab (for the NOTE-TAKER and the Database UI tab) is fullTaxonomyMenu().
+ *
+ * Only ACTIVE facts are counted (superseded history is never a retrieval target). Within a
+ * category, populated aspects render in fixed vocab order, then any populated out-of-vocab
+ * aspect by count. A category with zero active facts is omitted entirely. Deterministic
+ * category ordering: L1 order first, then any custom extras.
  * @param {Object<string, DatabaseSchema>} databases
- * @returns {string} Multi-line menu (one category per line). Never empty (skeleton seeded).
+ * @returns {string} Multi-line menu (one populated category per line). '' when nothing stored.
  */
 export function summarizeMenu(databases) {
     const dbs = withSkeleton(databases || {});
@@ -1306,17 +1376,32 @@ export function summarizeMenu(databases) {
             const asp = deriveAspect(fact);
             counts.set(asp, (counts.get(asp) || 0) + 1);
         }
-        // Render the FULL fixed vocab (even at count 0) so the skeleton is always visible,
-        // then append any out-of-vocab aspect that nonetheless has facts.
+        // PLANNER tier: render ONLY non-empty aspects (count > 0). Populated vocab labels in
+        // fixed order first, then any populated out-of-vocab aspect by count. Skip the whole
+        // category line when it holds nothing active.
         const vocab = aspectVocabFor(name);
-        const parts = vocab.map(a => `${a}(${counts.get(a) || 0})`);
+        const parts = vocab.filter(a => (counts.get(a) || 0) > 0).map(a => `${a}(${counts.get(a)})`);
         const extras = [...counts.keys()]
-            .filter(a => !vocab.includes(a))
+            .filter(a => !vocab.includes(a) && counts.get(a) > 0)
             .sort((a, b) => (counts.get(b) - counts.get(a)) || String(a).localeCompare(String(b)));
         for (const a of extras) parts.push(`${a}(${counts.get(a)})`);
-        lines.push(`${name}: ${parts.join(', ')}`);
+        if (parts.length) lines.push(`${name}: ${parts.join(', ')}`);
     }
     return lines.join('\n');
+}
+
+/**
+ * FULL-vocab view of the taxonomy: every Layer-1 category and ALL its Layer-2 labels, in
+ * fixed order, regardless of what's stored. This is the COMPANION to summarizeMenu's
+ * non-empty planner tier — used where the FULL fixed list is needed:
+ *   (a) Agent 3 (note-taker) — so it files into the SAME fixed vocab consistently, and
+ *   (b) the Database UI tab skeleton (so the user sees the whole taxonomy).
+ * Pure / no DB needed (the vocab is a code constant). One category per line.
+ * Example line: `People: status, identity, origin, ...`.
+ * @returns {string} Multi-line full-vocab menu (one category per line). Never empty.
+ */
+export function fullTaxonomyMenu() {
+    return L1_CATEGORIES.map(cat => `${cat}: ${(TAXONOMY[cat] || []).join(', ')}`).join('\n');
 }
 
 /**

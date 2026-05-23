@@ -42,16 +42,17 @@ DO NOT STORE:
 
 FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 - LAYER 1 \`Category\` (the domain), one of: People, Places, Things, Relationships, Events, World, Unsorted. (World = rules/lore/factions/setting. Unsorted = catch-all when none fit.)
-- LAYER 2 \`aspect:\` (a sub-bucket WITHIN the category), picked from the FIXED menu for that category:
-    People → identity, appearance, body, background, role, status, mood, goals, behavior, skills
-    Places → residence, public, region, feature
-    Things → object, key-item, substance
-    Relationships → bond, tension, history
-    Events → milestone, scene, action
-    World → rule, lore, faction, time
+- LAYER 2 \`aspect:\` — a GRANULAR sub-bucket WITHIN the category. Pick the MOST SPECIFIC label that matches, from the FIXED menu for that category:
+    People → status, identity, origin, career, finances, reputation, allegiance, appearance, body_marks, wardrobe, current_clothing, speech_style, health, injuries, mood, beliefs, values, morals, fears, desires, sexuality, current_goal, ambitions, habits, vices, secrets, skills, knowledge, childhood, family_origin, upbringing, education, trauma, home, daily_routine, current_location, carried_items
+    Places → feature, function, atmosphere, access, inhabitants, condition, geography, significance
+    Things → object, key_item, weapon, substance, tech, properties, ownership, currency
+    Relationships → history, family_ties, friendship, romance, attraction, rivalry, tension, trust, debt, alliance, power_dynamic
+    Events → scene, milestone, action, conflict, agreement, revelation, change, plan
+    World → lore, rule, faction, culture, politics, economy, history, geography, time
     Unsorted → misc
-  If unsure of the aspect, omit it (a category default is used). NEVER invent an aspect outside the menu.
+  Pick the SINGLE most specific matching label (e.g. a phobia → \`fears\`, a current job → \`career\`, an unpaid debt → \`finances\`, a tattoo → \`body_marks\`). If NOTHING fits, file to \`Unsorted\` + \`aspect:misc\` (the always-read escape hatch) rather than guessing. If unsure WITHIN a category, omit \`aspect:\` (a category default is used). NEVER invent an aspect outside the menu.
 - The CHARACTER a fact is about is NOT a category or aspect — it is a TAG. Tag it with \`| with:@<name>\` (use \`@npc\` for an unnamed/incidental person). The same character can appear under many categories/aspects.
+- RELATIONSHIPS are character-AGNOSTIC topics (history/friendship/romance/tension/trust/...), NOT keyed by person. For a relationship fact, ALWAYS emit the pair-tag — \`| subj:@<A>\` (whose relationship) AND \`| with:@<B>\` (toward whom) — plus an abstract relationship \`aspect:\`. E.g. \`+ Relationships/a_b_trust = broken | aspect:trust | subj:@<A> | with:@<B> | !3 | kind:state\`.
 
 # OUTPUT FORMAT
 
@@ -70,7 +71,7 @@ ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-sepa
 
 IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
 
-ASPECT (recommended): append \`| aspect:<value>\` choosing the Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current mood is \`People\` + \`aspect:mood\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
+ASPECT (recommended): append \`| aspect:<value>\` choosing the MOST SPECIFIC Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current mood is \`People\` + \`aspect:mood\`; a phobia is \`People\` + \`aspect:fears\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
 
 CHARACTER TAG (recommended): name the character a People/Things/Relationships fact is ABOUT with \`| subj:<name>\` (the owner), AND list every participant with \`| with:@<name>,@<other>\`. The character is a TAG, never the Layer-1 category or Layer-2 aspect — the same person appears across many categories/aspects. For an unnamed/incidental person use \`| subj:npc\` (see NPC). For a PLACE fact set \`| subj:<PLACE>\` instead so the location files under the place.
 
@@ -116,24 +117,24 @@ ATOMIC FORMAT — always write this instead:
 Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD>, I'm allergic to <ALLERGEN>, and honestly I'm exhausted today."
 
 #MEM
-+ People/user_name      = <NAME>     | aspect:identity   | subj:{{user}} | @{{user}},{{char}} | #identity | @src:user | !5 | kind:trait
-+ People/user_employer  = <ORG>      | aspect:role       | subj:{{user}} | @{{user}},{{char}} | #identity,job | @src:user | !4 | kind:trait
-+ People/user_role      = <ROLE>     | aspect:role       | subj:{{user}} | @{{user}},{{char}} | #role | @src:user | !4 | kind:trait
-+ People/user_location  = <CITY>     | aspect:status     | subj:{{user}} | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
-+ People/user_likes_food = <FOOD>    | aspect:background | subj:{{user}} | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
-+ People/user_allergy   = <ALLERGEN> | aspect:body       | subj:{{user}} | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
-+ People/user_mood      = exhausted  | aspect:mood       | subj:{{user}} | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
++ People/user_name      = <NAME>     | aspect:identity        | subj:{{user}} | @{{user}},{{char}} | #identity | @src:user | !5 | kind:trait
++ People/user_employer  = <ORG>      | aspect:career          | subj:{{user}} | @{{user}},{{char}} | #identity,job | @src:user | !4 | kind:trait
++ People/user_role      = <ROLE>     | aspect:career          | subj:{{user}} | @{{user}},{{char}} | #role | @src:user | !4 | kind:trait
++ People/user_location  = <CITY>     | aspect:current_location| subj:{{user}} | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
++ People/user_likes_food = <FOOD>    | aspect:desires         | subj:{{user}} | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
++ People/user_allergy   = <ALLERGEN> | aspect:health          | subj:{{user}} | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
++ People/user_mood      = exhausted  | aspect:mood            | subj:{{user}} | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
 .
-#WHY All People facts about {{user}} (the character is a tag via subj/with, not a branch); Layer-2 aspect splits them (identity/role/body/mood). Name is a high-importance durable trait (!5); mood is a low-importance transient state (!1) that fades first under cap.
+#WHY All People facts about {{user}} (the character is a tag via subj/with, not a branch); the MOST SPECIFIC Layer-2 aspect splits them (identity/career/current_location/health/mood). Name is a high-importance durable trait (!5); mood is a low-importance transient state (!1) that fades first under cap.
 
 ---
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
 
 #MEM
-+ People/char_scar         = true           | aspect:appearance | subj:{{char}} | @{{char}},{{user}} | #appearance | @src:char | !3 | kind:trait | aka:the scar,old scar
-+ People/char_scar_origin  = childhood fall | aspect:background | subj:{{char}} | @{{char}},{{user}} | #backstory | @src:char | !3 | kind:trait
++ People/char_scar         = true           | aspect:body_marks | subj:{{char}} | @{{char}},{{user}} | #appearance | @src:char | !3 | kind:trait | aka:the scar,old scar
++ People/char_scar_origin  = childhood fall | aspect:childhood  | subj:{{char}} | @{{char}},{{user}} | #backstory | @src:char | !3 | kind:trait
 .
-#WHY Lasting reveal in asterisks → atomic split: existence (appearance) + origin (background). \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
+#WHY Lasting reveal in asterisks → atomic split, each filed to its MOST SPECIFIC aspect: the mark itself (body_marks) + how it happened (childhood). \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
 
 ---
 Input: [USER:{{user}}] *grins and shrugs.*
@@ -153,15 +154,15 @@ Input: [USER:{{user}}] [OOC: can we slow the pacing down?]
 Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too close.*
 
 #MEM
-+ People/char_collar_tug = defensive tell | aspect:behavior | subj:{{char}} | @{{char}},{{user}} | #tell,mannerism | !2 | kind:trait
++ People/char_collar_tug = defensive tell | aspect:habits | subj:{{char}} | @{{char}},{{user}} | #tell,mannerism | !2 | kind:trait
 .
-#WHY Recurring mannerism with explicit trigger (People/behavior) — distinct from one-off transient pose.
+#WHY Recurring mannerism with explicit trigger (People/habits) — distinct from one-off transient pose.
 
 ---
 Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place is wrong."
 
 #MEM
-+ People/user_location  = <NEW_PLACE>                 | aspect:status | subj:{{user}} | @{{user}},{{char}} | #location | !3 | kind:state | ~
++ People/user_location  = <NEW_PLACE>                 | aspect:current_location | subj:{{user}} | @{{user}},{{char}} | #location | !3 | kind:state | ~
 + Events/user_relocated = <OLD_PLACE> to <NEW_PLACE>  | aspect:milestone | subj:{{user}} | @{{user}},{{char}} | #event | !2 | kind:event
 .
 #WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add an Events fact for the move.
@@ -175,15 +176,23 @@ Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} p
 #WHY The admission is misleading without the note that it was baited — context attached because the situation changes its meaning.
 
 ---
+Input: [CHAR:{{char}}] "After what you did, I don't trust you anymore." *to {{user}}*
+
+#MEM
++ Relationships/char_user_trust = broken | aspect:trust | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #relationship | @src:char | !3 | kind:state | ~
+.
+#WHY A relationship fact → ABSTRACT aspect (\`trust\`), NOT keyed by character; the who↔who rides the pair-tag \`subj:@{{char}}\` + \`with:@{{user}}\`. Trust changed → \`~\` supersedes.
+
+---
 Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then continues on to the <PLACE_C>.*
 
 #MEM
 + Events/char_location_1 = <PLACE_A> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
 + Events/char_location_2 = <PLACE_B> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
 + Events/char_location_3 = <PLACE_C> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
-+ People/char_location   = <PLACE_C> | aspect:status | subj:{{char}} | @{{char}} | #location | !3 | kind:state
++ People/char_location   = <PLACE_C> | aspect:current_location | subj:{{char}} | @{{char}} | #location | !3 | kind:state
 .
-#WHY Ordered movement → one tracked Events step per place (history) PLUS a single overwriting current-location fact on People/status.
+#WHY Ordered movement → one tracked Events step per place (history) PLUS a single overwriting current-location fact on People/current_location.
 
 ---
 
