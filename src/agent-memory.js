@@ -254,7 +254,7 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
     // Tag the source role so the model can't collapse user disclosures into RP narrative.
     // If prior context messages are given, include them in the analyzed block so
     // user-side self-disclosures and earlier reveals get captured (otherwise Agent 3
-    // only sees the AI's N-1 message and misses things like "I'm Bernd, I work at Google").
+    // only sees the AI's N-1 message and misses things like "I'm <NAME>, I work at <ORG>").
     const roleTag = isUserMessage ? '[USER:{{user}}]' : '[CHAR:{{char}}]';
     let messageBlock = '';
     if (Array.isArray(priorMessages) && priorMessages.length > 0) {
@@ -778,7 +778,7 @@ function looksLikeUnnamedPerson(subject) {
 /**
  * Deterministic subject derivation from a key prefix (token before the first underscore),
  * mirroring database.deriveSubject's key-fallback path so the parser can stamp a subject
- * without importing storage internals. `felix_apartment_bed` -> `felix`.
+ * without importing storage internals. `<name>_apartment_bed` -> `<name>`.
  * @param {string} key
  * @returns {string}
  */

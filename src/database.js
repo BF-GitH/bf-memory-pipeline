@@ -467,7 +467,7 @@ export function upsertFact(db, fact) {
     // 3) STRONGER PARALLEL-KEY DEDUP (feature #5): if STILL no match and the incoming
     //    write is a changeable `state`, look for an existing CURRENT state fact with the
     //    SAME subject + SAME leading facet/aspect under a parallel key (the real-data bug:
-    //    four live `fiona_clothing*` facts for one evolving thing). Only the incoming
+    //    four live `<name>_clothing*` facts for one evolving thing). Only the incoming
     //    `state` kind is considered — untyped/trait/event writes never trigger this, to
     //    stay conservative. The match is then routed through the existing supersession
     //    path below (which snapshots the old value as history), so a parallel near-dup
@@ -612,7 +612,7 @@ export function deriveSubject(fact) {
  * Derive the FACET/aspect of a fact: the key with its subject prefix removed and the
  * trailing qualifier token (the last `_segment`) dropped, normalized. This groups
  * temporal-state variants of ONE evolving thing
- * (`fiona_clothing`, `fiona_clothing_change`, `fiona_clothing_current`) onto one aspect
+ * (`<name>_clothing`, `<name>_clothing_change`, `<name>_clothing_current`) onto one aspect
  * (`clothing`) so STRONGER-DEDUP can supersede instead of minting parallel keys, while
  * keeping genuinely distinct sub-properties (`x_womens_clothing_stock` vs `..._reason`)
  * apart only when they share NO leading facet token. Used together with a strict gate in
@@ -659,7 +659,7 @@ function leadingFacetToken(fact) {
 /**
  * STRONGER-DEDUP (feature #5): find an existing NON-sequence STATE fact that the incoming
  * write should supersede because it describes the SAME subject + SAME evolving aspect
- * under a parallel key (e.g. incoming `fiona_clothing_current` vs stored `fiona_clothing`).
+ * under a parallel key (e.g. incoming `<name>_clothing_current` vs stored `<name>_clothing`).
  * Conservative gate — ALL must hold:
  *   - both incoming and candidate resolve to a non-empty, EQUAL subject,
  *   - both share the same leading facet token (so `clothing*` only merges with `clothing*`),
@@ -1076,7 +1076,7 @@ function findDbByCategory(databases, category) {
  * STAGE 1 — build the compact MENU (the picker's map of the store). Lists each KIND
  * (category) and, under it, the SUBJECTS present (from deriveSubject) with active-fact
  * counts. NO values — it's the structure, not the contents — so it stays small even when
- * the DB is large. Example line: `World: felix(11), club(4)`. Subjects with an empty
+ * the DB is large. Example line: `World: <NAME>(11), <PLACE>(4)`. Subjects with an empty
  * derived subject are grouped under `(N)`. Only ACTIVE facts are counted/shown (superseded
  * history is omitted — it's never a retrieval target). Categories with zero active facts
  * are skipped. Deterministic ordering: MENU_CATEGORY_ORDER first, then any extras; subjects
@@ -1293,7 +1293,7 @@ async function deleteAttachmentFile(url) {
  *   (history breadcrumb). For in-place supersession the key is unchanged, so this equals
  *   the fact's own key. Absent while active.
  * @property {string} [subject] - OPTIONAL subject axis (feature: subject axis): the who/what
- *   the fact is about (a character or place name, e.g. `felix`). Emitted by Agent 3 via the
+ *   the fact is about (a character or place name, e.g. `<name>`). Emitted by Agent 3 via the
  *   `subj:` marker; when absent it is DERIVED deterministically from the key prefix (the
  *   token before the first underscore) by deriveSubject(). Will become a retrieval index
  *   axis. Backward-compatible: facts without it derive a subject from the key on read.

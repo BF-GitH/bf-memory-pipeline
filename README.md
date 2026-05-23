@@ -11,8 +11,8 @@ Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline/
 ## How the 3 agents work — walkthrough
 
 ### Setup
-- AI character: **Helper**
-- You (the user): **Tom**
+- AI character: **<CHAR>**
+- You (the user): **<NAME>**
 - Settings:
   - Agent 1 (Draft) ctx = **5**
   - Agent 3 (Memory) ctx = **2**
@@ -21,30 +21,30 @@ Drop into `SillyTavern/public/scripts/extensions/third-party/bf-memory-pipeline/
 ### The chat so far (10 messages)
 
 ```
-1.  Tom:    "Hi"
-2.  Helper: "Hello! How can I help?"
-3.  Tom:    "I'm Tom"
-4.  Helper: "Nice to meet you Tom!"
-5.  Tom:    "I work at a coffee shop"
-6.  Helper: "That sounds fun!"
-7.  Tom:    "I'm allergic to peanuts"
-8.  Helper: "Good to know, I'll remember that."
-9.  Tom:    "My dog is named Bear"
-10. Helper: "Bear is a great name!"
+1.  <NAME>:    "Hi"
+2.  <CHAR>: "Hello! How can I help?"
+3.  <NAME>:    "I'm <NAME>"
+4.  <CHAR>: "Nice to meet you <NAME>!"
+5.  <NAME>:    "I work at a coffee shop"
+6.  <CHAR>: "That sounds fun!"
+7.  <NAME>:    "I'm allergic to peanuts"
+8.  <CHAR>: "Good to know, I'll remember that."
+9.  <NAME>:    "My dog is named <PET>"
+10. <CHAR>: "<PET> is a great name!"
 ```
 
 **Database after these 10 messages (built up over previous turns by Agent 3):**
 ```
-user_name      = Tom
+user_name      = <NAME>
 user_job       = coffee shop
 user_allergy   = peanuts
-user_pet_dog   = Bear
+user_pet_dog   = <PET>
 ```
 
-### Tom types message 11 and hits Send
+### <NAME> types message 11 and hits Send
 
 ```
-11. Tom: "What should I have for lunch?"
+11. <NAME>: "What should I have for lunch?"
 ```
 
 **Behind the scenes, three things fire in parallel:**
@@ -52,9 +52,9 @@ user_pet_dog   = Bear
 #### 🥖 Agent 1 (Draft) — "the planner"
 - **Sees:** the last **5** messages (msgs 7–11) + character card
 - **Goes to LLM** (e.g. Deepseek profile you set)
-- **Thinks:** "Tom asks about lunch. He's allergic to peanuts. Helper should suggest something safe."
+- **Thinks:** "<NAME> asks about lunch. He's allergic to peanuts. <CHAR> should suggest something safe."
 - **Outputs:**
-  - Draft: *"Helper suggests a safe lunch option, mentions allergy, asks if quick"*
+  - Draft: *"<CHAR> suggests a safe lunch option, mentions allergy, asks if quick"*
   - Needed facts: *user_allergy, user_food_preferences, user_lunch_options*
 
 #### 🗂️ Agent 3 (Memory) — "the librarian"
@@ -80,23 +80,23 @@ Then we **inject** a system message before msg 11 containing the facts + draft.
 
 **What the main model actually receives:**
 ```
-[System prompt + Helper's character card]
+[System prompt + <CHAR>'s character card]
 
-msg 7:  Tom:    "I'm allergic to peanuts"
-msg 8:  Helper: "Good to know, I'll remember that."
-msg 9:  Tom:    "My dog is named Bear"
-msg 10: Helper: "Bear is a great name!"
+msg 7:  <NAME>:    "I'm allergic to peanuts"
+msg 8:  <CHAR>: "Good to know, I'll remember that."
+msg 9:  <NAME>:    "My dog is named <PET>"
+msg 10: <CHAR>: "<PET> is a great name!"
 
 [OUR INJECTED SYSTEM MESSAGE:
  Facts: user_allergy=peanuts, user_job=coffee shop
- Draft: Helper suggests safe lunch, mentions allergy, asks if quick]
+ Draft: <CHAR> suggests safe lunch, mentions allergy, asks if quick]
 
-msg 11: Tom: "What should I have for lunch?"
+msg 11: <NAME>: "What should I have for lunch?"
 ```
 
 **Main model writes:**
 
-> *"Hey Tom! Since you're allergic to peanuts, maybe avoid anything Thai or with pesto. A turkey wrap or salad would work. Want something quick from your coffee shop, or are you out and about?"*
+> *"Hey <NAME>! Since you're allergic to peanuts, maybe avoid anything Thai or with pesto. A turkey wrap or salad would work. Want something quick from your coffee shop, or are you out and about?"*
 
 ---
 

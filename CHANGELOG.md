@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.17.0] - 2026-05-23
+
+### Added — entity scope + link-following retrieval + character registry (Phase 4)
+The full arc since 0.16.0, landed across four sub-phases. All backward-compatible (absent fields/state/settings behave as before).
+
+**Phase 4a — scope + participants + place filing.** Facts gain an explicit `scope` axis (`character | place | event`) so the store knows whether a row describes a person, a location, or something that happened; derived deterministically from category/track when the model omits it. Event facts carry an `involved` participant list (the who) and a `location` link (the where), so a single event can tie people⇄place together. Unnamed/one-off people file under a shared `npc` drawer (`subj:npc | with:<the descriptor>`) instead of cluttering the store, and a place-filing fix routes World/location facts to the correct `place` scope so they stop being mis-derived as characters. ([src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js))
+
+**Phase 4b — link-following retrieval.** A new graph-walk pass expands the candidate set along the scope links AFTER the lexical/fuzzy layers: place→events, person→events, event→place, and event→people. Any retrieved event pulls in the place it happened at and the key facts of each `involved` participant, so recalling one node surfaces the connected ones without extra API calls. Bounded by the existing tier caps; deterministic. ([src/fact-retrieval.js](src/fact-retrieval.js))
+
+**Phase 4c — character registry + recurring-cast detection.** A per-chat character registry tracks every named entity seen (name, status, first/last-seen, mention count). An every-N-message detector flags recurring people, freshly-named NPCs, and walk-ons worth promoting, batched into a single Recurring/NPC/Later review popup instead of interrupting per message. Promoting an NPC auto-migrates its `npc_*` facts onto the real name (re-keyed, subject restamped). New registry UI surfaces the tracked cast and pending promotions. ([src/agent-entities.js](src/agent-entities.js), [src/review-popup.js](src/review-popup.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+**Phase 4d — anonymization + secrets pass (release prep).** Final sweep before going public: every illustrative person/place/org/object name in code comments, prompt examples, and CHANGELOG/README prose was replaced with generic placeholders (`<NAME>`, `<CHAR>`, `<PLACE>`, `<CITY>`, `<ORG>`, `<PET>`, `<OBJECT>`), and the README walkthrough rewritten to use placeholders throughout. No functional code, element IDs, function names, settings keys, or grammar markers were changed — illustrative content only. A credential scan (API keys, tokens, bearer strings, hex/base64 blobs) found nothing to redact. ([README.md](README.md), [src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js))
+
 ## [0.16.0] - 2026-05-23
 
 ### Added — extraction-quality + two-stage retrieval + latency arc (Phases 1–3b)
@@ -34,7 +47,7 @@ Two upgrades closing out the memory-research blueprint. Backward-compatible (abs
 
 **Middle-ground retrieval — a 3-layer cascade, no embeddings, no extra API calls.** Replaces the rejected vector approach (browser-only / mobile cost / storage bloat / loss of bounded predictability; and Agent 1 already provides the semantic step). Solves the synonym/paraphrase brittleness of pure keyword matching (e.g. a fact `World/club_target = corner table man` not matching "the mark" / "the guy by the window"):
 - **Layer A — aliases-at-write.** New optional `aliases: string[]` on the fact schema. Agent 3 optionally emits nicknames/descriptors via an `aka:` segment; `searchFacts` folds them into the match text (MATCH-ONLY — never shown to the writer, mirroring `context`); `upsertFact` unions+dedupes aliases across re-mentions. ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js))
-- **Layer B — local fuzzy fallback.** New `trigramSimilarity()` (char-trigram Jaccard, zero deps); when a needed-info entry yields no primary hit, token-level fuzzy match against each active fact's `key value tags aliases` admits matches ≥ `FUZZY_THRESHOLD` (0.4) as secondary (bounded by the existing cap). Catches typos/morphology (apartments→apartment, felixs→felix). Deterministic. ([src/fact-retrieval.js](src/fact-retrieval.js))
+- **Layer B — local fuzzy fallback.** New `trigramSimilarity()` (char-trigram Jaccard, zero deps); when a needed-info entry yields no primary hit, token-level fuzzy match against each active fact's `key value tags aliases` admits matches ≥ `FUZZY_THRESHOLD` (0.4) as secondary (bounded by the existing cap). Catches typos/morphology (apartments→apartment, <NAME>s→<NAME>). Deterministic. ([src/fact-retrieval.js](src/fact-retrieval.js))
 - **Layer C — caged Agent-1 rerank.** `DEFAULT_DRAFT_PROMPT` tightened to "pick from the menu first" — Agent 1 prefers exact `Category/key` from the inventory for current-moment subjects INCLUDING paraphrases the lexical layers can't bridge; `resolveExactKeys` hardened (whitespace/punctuation-tolerant, validated against the inventory so hallucinated keys are silently dropped). ([src/agent-draft.js](src/agent-draft.js), [src/fact-retrieval.js](src/fact-retrieval.js))
 
 Integration order in `retrieveFacts`: exact-key picks → primary; keyword+alias → primary/secondary; fuzzy fallback → secondary (uncovered needed-info only). Existing tier caps, salience ranking, sequence/track expansion, supersession + knownBy filtering all run unchanged afterward.
@@ -182,7 +195,7 @@ Every element id was preserved, so all existing handlers/persistence keep workin
 ## [0.7.3] - 2026-05-17
 
 ### Docs
-- **Added [README.md](README.md)** with a full walkthrough of how the 3 agents work — uses a fake 10-message chat (Tom + Helper) and shows exactly what each agent sees, what it outputs, and where the Agent 2 trim kicks in. Includes:
+- **Added [README.md](README.md)** with a full walkthrough of how the 3 agents work — uses a fake 10-message chat (<NAME> + <CHAR>) and shows exactly what each agent sees, what it outputs, and where the Agent 2 trim kicks in. Includes:
   - Step-by-step trace of one generation cycle
   - Agent reference table (LLM call? what it sees? output?)
   - Full settings reference
@@ -370,7 +383,7 @@ Bumped from v3.1 (58 checks) after deep research by 3 agents (Detailed code anal
 
 ### Fixed (HIGH — behavior bugs surfaced by test suite v2)
 - **Cross-profile data leak on character switch**: `autoSaveDbProfile()` previously snapshotted in-memory databases into the active profile slot on `CHAT_CHANGED`. By flush time, ST had already advanced state, so e.g. Seraphina's facts could end up in Assistant's profile. Fix: removed the unsafe save-on-switch entirely; persistence now happens via capture-at-write in `saveCurrentToActiveProfile(profileKey)`, with the profile key captured at pipeline start (`src/pipeline.js`). Also added an integrity guard that refuses writes to deleted profiles and surfaces a toast. Removed a second residual `MESSAGE_RECEIVED → saveCurrentToActiveProfile()` handler that had the same leak class.
-- **Agent 3 ignored USER facts**: messages like "I am Bernd, I work at Google in Berlin" produced 0 stored facts because Agent 3 ran only on the N-1 AI message. Fix: Agent 3 now also sees the latest user message in the same call (combined `[USER:...] ... [CHAR:...]` block). The prompt has been rewritten to anchor on `{{user}}` / `{{char}}` macros (resolved via ST's `substituteParams`), with a CRITICAL clause for first-person disclosures and a new few-shot example for user-fact extraction. User persona description is also injected.
+- **Agent 3 ignored USER facts**: messages like "I am <NAME>, I work at <ORG> in <CITY>" produced 0 stored facts because Agent 3 ran only on the N-1 AI message. Fix: Agent 3 now also sees the latest user message in the same call (combined `[USER:...] ... [CHAR:...]` block). The prompt has been rewritten to anchor on `{{user}}` / `{{char}}` macros (resolved via ST's `substituteParams`), with a CRITICAL clause for first-person disclosures and a new few-shot example for user-fact extraction. User persona description is also injected.
 
 ### Added (MED)
 - **Relationships schema is no longer dead**: extended the Agent 3 output format with an optional `| rel:key1,key2` segment. The parser writes these into `fact.relationships.primary`, which the existing retrieval logic uses to expand fallback keywords. `upsertFact()` now MERGES (unions) relationships instead of replacing them, so prior tier links survive subsequent updates.

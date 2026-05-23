@@ -120,7 +120,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // trigram similarity match against every ACTIVE fact's `key value tags aliases` text and
     // admit anything at/above FUZZY_THRESHOLD as SECONDARY (so the existing MAX_SECONDARY cap
     // bounds it). This catches typos/morphology the lexical layers miss
-    // ("apartments"->"apartment", "felixs"->"felix"). Deterministic — no Math.random. Skips
+    // ("apartments"->"apartment", "<name>s"->"<name>"). Deterministic — no Math.random. Skips
     // `Category/key` requests (Layer C already resolved those exactly). Never duplicates a
     // fact already found by exact/keyword.
     fuzzyFallback(databases, neededInfo, directResults, exactIds);
@@ -228,7 +228,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 /**
  * LAYER B threshold: minimum character-trigram Jaccard similarity for a fuzzy fallback
  * match to be admitted. ~0.4 catches typos/morphology ("apartments"->"apartment",
- * "felixs"->"felix") without flooding in unrelated facts. Named const so it's tunable.
+ * "<name>s"->"<name>") without flooding in unrelated facts. Named const so it's tunable.
  */
 const FUZZY_THRESHOLD = 0.4;
 
