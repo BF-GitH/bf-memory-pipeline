@@ -103,6 +103,28 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
+                    <div class="bf-mem-section-body">
+                        <small class="bf-mem-hint">For tracked sequences (e.g. a character's location over time) the current step is always included. These set the chance of reaching further back in history. The furthest successful roll sets how far back to include — and every step in between is always included (no gaps).</small>
+                        <div class="bf-mem-field">
+                            <label>1 Step Back <span class="bf-mem-val" id="bf_mem_depth1_val">70%</span></label>
+                            <input type="range" id="bf_mem_depth1" min="0" max="100" step="5" value="70" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>2 Steps Back <span class="bf-mem-val" id="bf_mem_depth2_val">50%</span></label>
+                            <input type="range" id="bf_mem_depth2" min="0" max="100" step="5" value="50" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>3 Steps Back <span class="bf-mem-val" id="bf_mem_depth3_val">25%</span></label>
+                            <input type="range" id="bf_mem_depth3" min="0" max="100" step="5" value="25" />
+                        </div>
+                        <div class="bf-mem-field">
+                            <label>4 Steps Back <span class="bf-mem-val" id="bf_mem_depth4_val">10%</span></label>
+                            <input type="range" id="bf_mem_depth4" min="0" max="100" step="5" value="10" />
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-pen"></i> Writer Injection Format
                         <button id="bf_mem_reset_writer_format" class="bf-mem-reset-btn menu_button" title="Reset to default">

@@ -73,21 +73,65 @@ export async function saveDatabase(db) {
     // Enforce max facts limit.
     if (db.facts.length > MAX_FACTS_PER_DB) {
         const evictCount = db.facts.length - MAX_FACTS_PER_DB;
-        // Sort by lastUpdated DESC (most-recently-updated first), keep top MAX_FACTS_PER_DB.
-        // upsertFact bumps lastUpdated on every touch, so foundational facts (re-mentioned
-        // by the user / model) survive while one-off tertiary facts get evicted.
-        const kept = db.facts
-            .slice() // copy to avoid mutating in-place during sort
-            .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
-        const evicted = kept.slice(MAX_FACTS_PER_DB);
-        db.facts = kept.slice(0, MAX_FACTS_PER_DB);
+        // Feature #4 — continuity-aware eviction. A sequence track is a contiguous
+        // chain (step ords 1..N); eviction must NOT punch holes mid-chain or wipe a
+        // whole track. Policy:
+        //   1) Evict NON-sequence facts first, oldest-lastUpdated first (existing rule).
+        //   2) If still over cap, trim each track from its OLDEST steps inward (lowest
+        //      ord first), keeping the latest steps so the recent chain (and the
+        //      "current" tail used by retrieval) stays intact and contiguous.
+        const seqFacts = db.facts.filter(isSequenceFact);
+        const nonSeqFacts = db.facts.filter(f => !isSequenceFact(f));
+
+        // Step 1: drop oldest non-sequence facts.
+        nonSeqFacts.sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+        const evicted = [];
+        let overflow = (nonSeqFacts.length + seqFacts.length) - MAX_FACTS_PER_DB;
+        while (overflow > 0 && nonSeqFacts.length > 0) {
+            evicted.push(nonSeqFacts.pop());
+            overflow--;
+        }
+
+        // Step 2: if non-sequence facts weren't enough, trim oldest steps PER track
+        // (lowest ord first) so each chain loses its tail-end history, never a hole.
+        if (overflow > 0 && seqFacts.length > 0) {
+            const byTrack = new Map();
+            for (const f of seqFacts) {
+                if (!byTrack.has(f.track)) byTrack.set(f.track, []);
+                byTrack.get(f.track).push(f);
+            }
+            // Round-robin across tracks, evicting the lowest-ord (oldest) step each pass,
+            // so no single track is wiped while another keeps deep history.
+            const trackQueues = [...byTrack.values()].map(arr =>
+                arr.slice().sort((a, b) => (Number(a.ord) || 0) - (Number(b.ord) || 0)));
+            let progress = true;
+            while (overflow > 0 && progress) {
+                progress = false;
+                for (const q of trackQueues) {
+                    if (overflow <= 0) break;
+                    if (q.length > 1) { // never let a track drop below its newest step
+                        evicted.push(q.shift());
+                        overflow--;
+                        progress = true;
+                    }
+                }
+            }
+            // Last resort (every track down to 1 step and still over): drop oldest singletons.
+            if (overflow > 0) {
+                const singles = trackQueues.flat().sort((a, b) => (a.lastUpdated || 0) - (b.lastUpdated || 0));
+                while (overflow > 0 && singles.length > 0) { evicted.push(singles.shift()); overflow--; }
+            }
+        }
+
+        const evictedSet = new Set(evicted);
+        db.facts = db.facts.filter(f => !evictedSet.has(f));
         // NON-SILENT eviction (FIX #4): the old code dropped facts with only a
         // console.warn, so late-session facts vanished from exports with no trace
         // in the user-visible debug log. Surface it. (Cap value unchanged — see
         // MAX_FACTS_PER_DB note; raising it is the owner's cost decision.)
         console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length + evictCount} facts, evicting ${evictCount} least-recently-updated`);
         const evictedKeys = evicted.map(f => f.key).filter(Boolean).join(', ');
-        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, oldest-first): ${evictedKeys}`);
+        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, non-sequence oldest-first then oldest track steps): ${evictedKeys}`);
     }
 
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
@@ -182,6 +226,38 @@ export function createEmptyDatabase(category) {
  * @returns {DatabaseSchema} Updated database
  */
 export function upsertFact(db, fact) {
+    // SEQUENCE FACTS (Feature #4): a fact carrying a `track` is one ordered step in a
+    // timeline (e.g. `<char>_location_3`). Each step is its OWN fact — they must NEVER
+    // be collapsed by the reconcile-on-write normalize-merge below (which would make
+    // `_2` and `_3` overwrite each other and destroy the chain — the known bug). We
+    // therefore (a) skip the normalized variant match entirely for track facts and (b)
+    // auto-assign a monotonic `ord` from the existing steps in that track at write time,
+    // so the LLM never has to track step numbers reliably.
+    if (isSequenceFact(fact)) {
+        // Auto-assign ord if missing/invalid: max existing ord in this track + 1.
+        let ord = Number(fact.ord);
+        if (!Number.isInteger(ord) || ord <= 0) {
+            ord = nextOrdForTrack(db, fact.track);
+        }
+        const seqFact = { ...fact, ord };
+        // Match an existing step ONLY by exact (track + ord) identity — re-running the
+        // same extraction shouldn't duplicate a step, but distinct ords stay distinct.
+        const exactStepIdx = db.facts.findIndex(f =>
+            isSequenceFact(f) && f.track === seqFact.track && Number(f.ord) === ord);
+        // Also honor an exact KEY match (idempotent re-write of the same step key).
+        const exactKeyIdx = exactStepIdx >= 0 ? exactStepIdx : db.facts.findIndex(f => f.key === seqFact.key);
+        if (exactKeyIdx >= 0) {
+            const existing = db.facts[exactKeyIdx];
+            const mergedRels = mergeRelationships(existing.relationships, seqFact.relationships);
+            const mergedContext = mergeContext(existing.context, seqFact.context);
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, lastUpdated: Date.now() };
+        } else {
+            db.facts.push({ ...seqFact, lastUpdated: Date.now() });
+        }
+        db.updatedAt = Date.now();
+        return db;
+    }
+
     // 1) Exact key match — always update in place.
     let existingIdx = db.facts.findIndex(f => f.key === fact.key);
     // 2) Reconcile-on-write (FIX #2c): if no exact match, look for a fact whose key
@@ -190,24 +266,68 @@ export function upsertFact(db, fact) {
     //    mints parallel keys and contradictory facts coexist (a "gentle" trait
     //    lingering alongside a later "rough" one). We only merge clear normalized
     //    matches — distinct properties (different normalized keys) stay separate.
+    //    Sequence steps are handled above and never reach this path.
     if (existingIdx < 0) {
         const normIncoming = normalizeFactKey(fact.key);
         if (normIncoming) {
-            existingIdx = db.facts.findIndex(f => normalizeFactKey(f.key) === normIncoming);
+            // Never collapse a non-sequence write onto a sequence step (or vice versa).
+            existingIdx = db.facts.findIndex(f => !isSequenceFact(f) && normalizeFactKey(f.key) === normIncoming);
         }
     }
     if (existingIdx >= 0) {
         const existing = db.facts[existingIdx];
         // Merge relationships (union) rather than replace, so prior tier links survive.
         const mergedRels = mergeRelationships(existing.relationships, fact.relationships);
+        // Preserve context across merges: a new write keeps the old context note unless
+        // it provides its own (Feature #3) — so re-mentioning a fact without context
+        // doesn't wipe a previously-attached note.
+        const mergedContext = mergeContext(existing.context, fact.context);
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, lastUpdated: Date.now() };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, lastUpdated: Date.now() };
     } else {
         db.facts.push({ ...fact, lastUpdated: Date.now() });
     }
     db.updatedAt = Date.now();
     return db;
+}
+
+/**
+ * True if a fact is a sequence/event step — i.e. it carries a non-empty `track`
+ * (Feature #4). Such facts form an ordered chain and are EXEMPT from reconcile-on-write
+ * collapse and from key-normalized merging.
+ * @param {FactSchema} fact
+ * @returns {boolean}
+ */
+export function isSequenceFact(fact) {
+    return !!(fact && typeof fact.track === 'string' && fact.track.trim());
+}
+
+/**
+ * Compute the next monotonic ord for a track: (max existing ord in that track) + 1,
+ * starting at 1 for a brand-new track. Called at write time so the LLM doesn't have
+ * to number steps itself.
+ * @param {DatabaseSchema} db
+ * @param {string} track
+ * @returns {number}
+ */
+function nextOrdForTrack(db, track) {
+    let max = 0;
+    for (const f of (db.facts || [])) {
+        if (isSequenceFact(f) && f.track === track) {
+            const o = Number(f.ord);
+            if (Number.isInteger(o) && o > max) max = o;
+        }
+    }
+    return max + 1;
+}
+
+/** Prefer an incoming context note; fall back to the existing one. Empty → undefined. */
+function mergeContext(existing, incoming) {
+    const inc = (typeof incoming === 'string') ? incoming.trim() : '';
+    if (inc) return inc;
+    const ex = (typeof existing === 'string') ? existing.trim() : '';
+    return ex || undefined;
 }
 
 /**
@@ -465,4 +585,32 @@ async function deleteAttachmentFile(url) {
  * @property {string[]} relationships.tertiary
  * @property {number} lastUpdated
  * @property {string} [source] - Message reference where fact was established
+ * @property {string} [context] - OPTIONAL prose note giving the situation around a fact
+ *   (Feature #3). Injection-only and EXCLUDED from searchFacts() match text. Absent on
+ *   facts written by older versions (backward-compatible).
+ * @property {string} [track] - OPTIONAL timeline name (Feature #4). Presence marks this
+ *   fact as one ordered step in a sequence (e.g. a location track). Sequence facts are
+ *   exempt from reconcile-on-write collapse.
+ * @property {number} [ord] - OPTIONAL monotonic step number within `track` (1-based),
+ *   auto-assigned at write time.
  */
+
+/**
+ * Return all steps of a sequence track, sorted ascending by ord. Used by retrieval's
+ * depth-dice continuity logic (Feature #4).
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string} track
+ * @returns {Array<{fact: FactSchema, category: string}>}
+ */
+export function getTrackSteps(databases, track) {
+    const steps = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (isSequenceFact(fact) && fact.track === track) {
+                steps.push({ fact, category });
+            }
+        }
+    }
+    steps.sort((a, b) => (Number(a.fact.ord) || 0) - (Number(b.fact.ord) || 0));
+    return steps;
+}

@@ -68,6 +68,14 @@ const DEFAULT_SETTINGS = {
     // UI later; the values are inert.
     secondaryChance: 50,
     tertiaryChance: 15,
+    // Feature #4 — depth-dice sequence retrieval. For a relevant track we always include
+    // the current step, then roll each depth tier (steps back) at these probabilities;
+    // the furthest successful roll sets how far back we reach (contiguously). Stored as
+    // 0..1 floats. Absent on older settings → defaults below apply (back-compatible).
+    depthDice1: 0.70,
+    depthDice2: 0.50,
+    depthDice3: 0.25,
+    depthDice4: 0.10,
     showToast: true,
     debugMode: false,
     draftPrompt: '',
@@ -117,6 +125,11 @@ function validateSettings(s) {
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
+    // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
+    s.depthDice1 = clamp(s.depthDice1, 0, 1, 0.70);
+    s.depthDice2 = clamp(s.depthDice2, 0, 1, 0.50);
+    s.depthDice3 = clamp(s.depthDice3, 0, 1, 0.25);
+    s.depthDice4 = clamp(s.depthDice4, 0, 1, 0.10);
     if (typeof s.enabled !== 'boolean') {
         // FIX #10: log when a coercion silently flips a previously-true enable off.
         if (s.enabled === true || (s.enabled && s.enabled !== false)) {
@@ -1405,6 +1418,22 @@ export async function initSettings() {
         extensionSettings.tertiaryChance = val;
         $('#bf_mem_tertiary_val').text(`${val}%`);
         saveSettings();
+    });
+
+    // Depth-dice sliders (Feature #4). Stored as 0..1 floats; UI shows percent.
+    [1, 2, 3, 4].forEach(n => {
+        const slider = `#bf_mem_depth${n}`;
+        const label = `#bf_mem_depth${n}_val`;
+        const key = `depthDice${n}`;
+        const pct = Math.round((Number(extensionSettings[key]) || 0) * 100);
+        $(slider).val(pct);
+        $(label).text(`${pct}%`);
+        $(slider).on('input', function () {
+            const v = parseInt($(this).val());
+            extensionSettings[key] = v / 100;
+            $(label).text(`${v}%`);
+            saveSettings();
+        });
     });
 
     // Toast

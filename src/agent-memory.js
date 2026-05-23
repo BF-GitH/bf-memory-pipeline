@@ -45,13 +45,17 @@ CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | >context note
 .
 #WHY <one sentence>
 
 If nothing: just \`.\` immediately.
 
 SOURCE TAG (optional but preferred): append \`| @src:user\` if the fact was disclosed in the [USER] message, or \`| @src:char\` if it came from the [CHAR] message. This attributes each fact to the correct message. If you cannot tell, omit it.
+
+CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY when the fact's meaning depends on the surrounding situation and would be misread without it — e.g. a strategic admission that only makes sense once you know another party baited it. Do NOT add a context note to ordinary facts; most facts have none. The note is stored separately and never affects keyword search.
+
+SEQUENCE STEPS (optional): for things that form a genuine ORDERED SERIES over time — a character's location changing place to place, plot milestones in order — emit each step as its OWN fact with \`| track:<track_name>\`. Use a stable track name tied to the subject (e.g. \`<char>_location\`). Give each step a numbered key (\`<char>_location_1\`, \`_2\`, ...); do NOT worry about getting the number right — the system assigns the real order. ALSO keep one plain overwriting current-state fact (e.g. \`<char>_location = <current_place>\`, with NO track) so "where are they now" stays a single cheap fact. Only use tracks for real ordered series, never for unrelated facts.
 
 # WRONG → RIGHT (atomic splitting)
 
@@ -129,6 +133,25 @@ Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place i
 + History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event
 .
 #WHY Same existing key user_location → value OVERWRITES (don't invent a second key). Add History fact for the move event.
+
+---
+Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} pretended to already have proof.*
+
+#MEM
++ History/char_admission = took the <ITEM> | @{{char}},{{user}} | #event | @src:char | >only admitted because <NAME> bluffed having proof; not a free confession
+.
+#WHY The admission is misleading without the note that it was baited — context attached because the situation changes its meaning.
+
+---
+Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then continues on to the <PLACE_C>.*
+
+#MEM
++ World/char_location_1 = <PLACE_A> | @{{char}} | #location | track:char_location
++ World/char_location_2 = <PLACE_B> | @{{char}} | #location | track:char_location
++ World/char_location_3 = <PLACE_C> | @{{char}} | #location | track:char_location
++ Status/char_location  = <PLACE_C> | @{{char}} | #location
+.
+#WHY Ordered movement → one tracked step per place (history) PLUS a single overwriting current-location fact.
 
 ---
 
@@ -335,16 +358,42 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
         if (!key) continue;
 
-        // Split rest on | to get value, @knownBy, #tags, rel:, @src:
+        // Split rest on | to get value, @knownBy, #tags, rel:, @src:, track:, >context
         const segments = rest.split('|').map(s => s.trim());
         const value = segments[0] || '';
         let knownBy = [];
         let tags = [];
         let relationships = [];
         let srcRole = null; // 'user' | 'char' | null (unknown → default attribution)
+        let context = '';   // Feature #3: optional prose note (delimiter: a `>` segment)
+        let track = '';     // Feature #4: optional sequence track name (`track:<name>`)
+        let ord = null;     // Feature #4: optional explicit step number (auto-assigned if absent)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
+
+            // >context — OPTIONAL prose note (Feature #3). `>` was chosen because it
+            // does NOT collide with the existing |/@/#/rel:/@src: grammar. Only attach
+            // when the surrounding situation genuinely matters (see prompt).
+            if (seg.startsWith('>')) {
+                context = seg.slice(1).trim();
+                continue;
+            }
+
+            // track:<name>[#ord] — OPTIONAL sequence step (Feature #4). The ord is
+            // normally OMITTED (auto-assigned in database.js); an explicit `#N` is
+            // honored if present.
+            const trackMatch = seg.match(/^track\s*:\s*(.+)$/i);
+            if (trackMatch) {
+                let t = trackMatch[1].trim();
+                const ordMatch = t.match(/#\s*(\d+)\s*$/);
+                if (ordMatch) {
+                    ord = parseInt(ordMatch[1], 10);
+                    t = t.slice(0, ordMatch.index).trim();
+                }
+                track = t.replace(/\s+/g, '_').toLowerCase();
+                continue;
+            }
 
             // @src:user / @src:char — per-fact source attribution (FIX #3).
             // Checked BEFORE the generic @KnownBy branch since both start with '@'.
@@ -392,7 +441,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             ? userMsgIndex
             : messageIndex;
 
-        result.updates.push({
+        const update = {
             action: 'add',
             category,
             key,
@@ -401,7 +450,15 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             knownBy,
             relationships,
             source: `msg_${sourceIndex}`,
-        });
+        };
+        // Feature #3: only attach context when present (keep object lean / back-compat).
+        if (context) update.context = context;
+        // Feature #4: only attach sequence info when a track was given.
+        if (track) {
+            update.track = track;
+            if (Number.isInteger(ord) && ord > 0) update.ord = ord;
+        }
+        result.updates.push(update);
     }
 
     console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
@@ -440,7 +497,12 @@ async function applyUpdates(updates, existingDatabases) {
         const db = existingDatabases[category];
 
         // Classify BEFORE writing, using the same match rule upsertFact uses.
-        const matched = findFactMatch(db, update.key);
+        // Sequence facts (Feature #4) are exempt from normalized collapse, so they
+        // match ONLY by exact key — a fresh step is correctly classified NEW instead
+        // of UPDATED against a sibling step that shares the normalized key.
+        const matched = update.track
+            ? (db.facts.find(f => f.key === update.key) || null)
+            : findFactMatch(db, update.key);
         const newValue = update.value || '';
         const newTags = update.tags || [];
         let status;
@@ -457,7 +519,7 @@ async function applyUpdates(updates, existingDatabases) {
         update.changed = status !== 'SKIPPED';
         update.wasNew = status === 'NEW'; // kept for backward compatibility
 
-        upsertFact(db, {
+        const factToWrite = {
             key: update.key,
             value: newValue,
             tags: newTags,
@@ -468,7 +530,15 @@ async function applyUpdates(updates, existingDatabases) {
                 tertiary: [],
             },
             source: update.source,
-        });
+        };
+        // Feature #3 / #4: forward optional context + sequence info so upsertFact can
+        // store the note and treat track facts as exempt-from-collapse ordered steps.
+        if (update.context) factToWrite.context = update.context;
+        if (update.track) {
+            factToWrite.track = update.track;
+            if (Number.isInteger(update.ord) && update.ord > 0) factToWrite.ord = update.ord;
+        }
+        upsertFact(db, factToWrite);
         const relCount = update.relationships?.length || 0;
         addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
 

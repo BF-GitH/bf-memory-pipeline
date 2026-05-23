@@ -2,8 +2,8 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts } from './database.js';
-import { addDebugLog } from './settings.js';
+import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact } from './database.js';
+import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
@@ -112,6 +112,14 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         }
     }
 
+    // DEPTH-DICE SEQUENCE EXPANSION WITH CONTINUITY (Feature #4).
+    // Any track touched by the matched facts so far is "relevant". For each such track
+    // we ALWAYS include the current (highest-ord) step, then probabilistically reach
+    // further back: roll each depth tier (1..4 steps back) at its configured chance;
+    // the REACH is the FURTHEST depth whose roll succeeds; then include EVERY step from
+    // current back to that reach CONTIGUOUSLY (continuity is mandatory — no gaps).
+    expandSequenceTracks(databases, directResults, alreadyFound);
+
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
     // facts — the real cause of "the writer skips facts." We now include facts by tier
@@ -203,6 +211,71 @@ function resolveExactKeys(databases, requests) {
 }
 
 /**
+ * Default depth-dice probabilities (Feature #4). Each is the chance of reaching that
+ * many steps back from the current step. Overridden by settings.depthDice* when present.
+ */
+const DEFAULT_DEPTH_PROBS = [0.70, 0.50, 0.25, 0.10]; // depth 1,2,3,4
+
+/** Read configured depth probabilities (clamped 0..1), falling back to defaults. */
+function getDepthProbs() {
+    const s = (() => { try { return getSettings(); } catch { return null; } })() || {};
+    const pick = (v, d) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : d;
+    };
+    return [
+        pick(s.depthDice1, DEFAULT_DEPTH_PROBS[0]),
+        pick(s.depthDice2, DEFAULT_DEPTH_PROBS[1]),
+        pick(s.depthDice3, DEFAULT_DEPTH_PROBS[2]),
+        pick(s.depthDice4, DEFAULT_DEPTH_PROBS[3]),
+    ];
+}
+
+/**
+ * Depth-dice sequence expansion with mandatory continuity (Feature #4).
+ * Identifies every track already touched by the retrieved facts, then for each track
+ * includes the current (highest-ord) step plus a CONTIGUOUS run of older steps back to
+ * a probabilistically-chosen reach. Newly included steps are pushed as primary so the
+ * writer reliably sees the relevant slice of history. Mutates `results` in place.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier: string}>} results
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results
+ */
+function expandSequenceTracks(databases, results, alreadyFound) {
+    // Collect relevant tracks from already-matched facts.
+    const tracks = new Set();
+    for (const r of results) {
+        if (isSequenceFact(r.fact)) tracks.add(r.fact.track);
+    }
+    if (tracks.size === 0) return;
+
+    const probs = getDepthProbs();
+
+    for (const track of tracks) {
+        const steps = getTrackSteps(databases, track); // ascending by ord
+        if (steps.length === 0) continue;
+
+        // Roll each depth tier; REACH = furthest depth whose roll succeeds (0 = current only).
+        let reach = 0;
+        for (let depth = 1; depth <= probs.length; depth++) {
+            if (Math.random() < probs[depth - 1]) reach = depth;
+        }
+        // Number of steps to include from the tail: current + `reach` older = reach+1,
+        // bounded by how many steps actually exist.
+        const includeCount = Math.min(reach + 1, steps.length);
+        const slice = steps.slice(steps.length - includeCount); // contiguous tail — no gaps
+
+        for (const { fact, category } of slice) {
+            const id = `${category}:${fact.key}`;
+            if (alreadyFound.has(id)) continue;
+            results.push({ fact, category, tier: 'primary' });
+            alreadyFound.add(id);
+        }
+        addDebugLog('info', `Depth-dice track "${track}": reach ${reach} → included ${includeCount}/${steps.length} step(s)`);
+    }
+}
+
+/**
  * Format retrieved facts into a string for Agent 2 (Writer)
  * Format: [who_knows] fact_content
  * @param {Array} results - Filtered retrieval results
@@ -213,12 +286,18 @@ function formatFactsForWriter(results) {
 
     const lines = [];
 
-    for (const { fact, category } of results) {
+    for (const { fact, category, tier } of results) {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
         // Keep the KEY (Feature #2b) so the writer sees `Category/key = value` and can
         // tell similar facts apart and use them precisely.
-        lines.push(`${prefix} ${category}/${fact.key} = ${fact.value}`);
+        let line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
+        // Feature #3: surface the optional context note for TOP-TIER (primary) facts
+        // only, to bound tokens. Secondary/tertiary lines never carry context.
+        if (tier === 'primary' && typeof fact.context === 'string' && fact.context.trim()) {
+            line += ` — ${fact.context.trim()}`;
+        }
+        lines.push(line);
     }
 
     return lines.join('\n');
