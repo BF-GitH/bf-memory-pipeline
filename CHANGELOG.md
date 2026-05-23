@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.20.0] - 2026-05-23
+
+### Changed — token-cost savings (after a 3-agent overspend audit)
+An audit found ~3 LLM calls every turn re-sending overlapping context, with Agent 3 (the note-taker: a ~4.2k-token prompt + the full fact DB) the dominant cost, re-running on every generated swipe. This release lands the safe code-side savings; the biggest win (caching Agent 3's static prompt) is a server-side SillyTavern setting (see note).
+
+- **Per-swipe extraction gated.** Agent 3 extraction was firing on every generated swipe (4 swipes ≈ 4× the ~7k-token call). Both `MESSAGE_RECEIVED` and `MESSAGE_SWIPED` now feed a single ~1.8s settle-debounce (`scheduleSettleExtraction`), so a heavily-swiped turn extracts **once** — on the kept/settled reply. A normal single-reply turn still extracts exactly once, promptly. All guards intact (`bf_mem_processed`, Stop/`pipelineCancelled`, capture-at-write, character-changed, `memoryExtractionInFlight`). Reflection + entity-check now also tick once per settled turn rather than per swipe. ([src/pipeline.js](src/pipeline.js))
+- **Dead payloads dropped.** (a) The fact-key inventory (`summarizeKeys`) is no longer built or sent to Agent 1 when the finder is on (default) — it was only used by the deterministic fallback; the menu still goes to Agent 1 as before. (b) Reflection's rolling `#STORY` summary (no longer injected since 0.18) is no longer generated or fed back each pass — only the `#OBS` observation-writeback remains; the settings panel still renders observation chips. ([src/pipeline.js](src/pipeline.js), [src/agent-reflect.js](src/agent-reflect.js))
+
+### Note — prompt caching is a server-side setting, not an extension feature
+The biggest potential saving (caching Agent 3's large static system prompt) **cannot be set from an extension** — SillyTavern's connection layer strips client `cache_control`, and caching is driven by server config. The extension's prompts are already structured cache-optimally (static system prompt first, all variable data after). To enable it, set in SillyTavern's `config.yaml`: `claude.enableSystemPromptCache: true` (and optionally `claude.extendedTTL: true`). A doc-comment recording this invariant was added to [src/llm-call.js](src/llm-call.js). ([src/llm-call.js](src/llm-call.js))
+
 ## [0.19.0] - 2026-05-23
 
 ### Changed — granular ~82-label Layer-2 taxonomy + two-tier menu
