@@ -38,6 +38,10 @@ let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
 let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
 let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+// Scene card — the always-injected "what is true right now" core working-memory block.
+// Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
+// null = no scene yet (back-compatible: absent scene behaves as no scene card).
+let sceneCard = null; // { location, present[], goals[], beats[], updatedAt, runId }
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -78,6 +82,13 @@ const DEFAULT_SETTINGS = {
     depthDice4: 0.10,
     showToast: true,
     debugMode: false,
+    // Scene card (always-on core working-memory block). When enabled, Agent 1 emits an
+    // optional #SCENE block each turn (location / present / goals / last beat); we inject
+    // a compact one-line [Scene] block ABOVE the fact list every turn a scene exists.
+    // Absent (older settings) → default true; back-compatible (no scene = no injection).
+    sceneCardEnabled: true,
+    // Hard cap on the injected scene block, in approx tokens. Truncated defensively.
+    sceneCardMaxTokens: 150,
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
@@ -137,9 +148,11 @@ function validateSettings(s) {
         }
         s.enabled = false;
     }
+    s.sceneCardMaxTokens = Math.floor(clamp(s.sceneCardMaxTokens, 30, 400, 150));
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
+    if (typeof s.sceneCardEnabled !== 'boolean') s.sceneCardEnabled = true;
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
     if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
@@ -476,6 +489,115 @@ export function reloadTokensFromChat() {
     sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
     loadTokensFromMeta();
     renderTokens();
+}
+
+// --- Scene Card (persistent — stored in chat_metadata.bf_mem_scene) ---
+// Always-on "what is true right now" core block. Updated by Agent 1 each turn,
+// injected above the fact list every turn (when enabled and a scene exists).
+
+const SCENE_META_KEY = 'bf_mem_scene';
+const SCENE_BEATS_MAX = 3; // rolling window: keep the last N one-line beats
+
+/** Coerce a stored value into the scene shape, or return null if unusable. */
+function normalizeScene(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const arr = (v) => Array.isArray(v) ? v.map(x => String(x ?? '').trim()).filter(Boolean) : [];
+    const loc = typeof raw.location === 'string' ? raw.location.trim() : '';
+    const present = arr(raw.present);
+    const goals = arr(raw.goals);
+    const beats = arr(raw.beats).slice(-SCENE_BEATS_MAX);
+    // A scene is meaningful only if it carries at least one field.
+    if (!loc && present.length === 0 && goals.length === 0 && beats.length === 0) return null;
+    return {
+        location: loc,
+        present,
+        goals,
+        beats,
+        updatedAt: Number(raw.updatedAt) || Date.now(),
+        runId: typeof raw.runId === 'string' ? raw.runId : '',
+    };
+}
+
+function loadSceneFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizeScene(md[SCENE_META_KEY]);
+    } catch { return null; }
+}
+
+function saveSceneToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[SCENE_META_KEY] = sceneCard;
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+/** Current scene card (or null). Read by pipeline.js to build the injection. */
+export function getScene() {
+    return sceneCard;
+}
+
+/**
+ * Update the scene card from an Agent 1 #SCENE parse. Merges defensively:
+ *   - location / present / goals: replaced when the new value is non-empty,
+ *     otherwise the prior value is kept (Agent 1 may omit a field on a given turn).
+ *   - beats: rolling window — append the newest beat(s), drop the oldest, cap at 3.
+ * @param {{location?:string, present?:string[], goals?:string[], newBeats?:string[]}} patch
+ * @param {string} runId
+ */
+export function setScene(patch, runId = '') {
+    if (!patch || typeof patch !== 'object') return;
+    const prev = sceneCard || { location: '', present: [], goals: [], beats: [] };
+    const cleanArr = (v) => Array.isArray(v) ? v.map(x => String(x ?? '').trim()).filter(Boolean) : [];
+
+    const location = (typeof patch.location === 'string' && patch.location.trim())
+        ? patch.location.trim() : prev.location;
+    const present = (Array.isArray(patch.present) && patch.present.length)
+        ? cleanArr(patch.present) : prev.present;
+    const goals = (Array.isArray(patch.goals) && patch.goals.length)
+        ? cleanArr(patch.goals) : prev.goals;
+
+    // Rolling beats window: append new beats, keep last SCENE_BEATS_MAX, de-dupe
+    // a newest beat that exactly repeats the prior tail (Agent 1 echoing itself).
+    let beats = [...(prev.beats || [])];
+    for (const b of cleanArr(patch.newBeats)) {
+        if (beats.length && beats[beats.length - 1] === b) continue;
+        beats.push(b);
+    }
+    beats = beats.slice(-SCENE_BEATS_MAX);
+
+    const next = normalizeScene({ location, present, goals, beats, updatedAt: Date.now(), runId });
+    if (!next) return; // nothing meaningful to store
+    sceneCard = next;
+    saveSceneToMeta();
+    renderScene();
+}
+
+/** Re-load the scene card from the current chat's metadata. Called on CHAT_CHANGED. */
+export function reloadSceneFromChat() {
+    sceneCard = loadSceneFromMeta();
+    renderScene();
+}
+
+/** Render the read-only live scene card in the Agent 1 tab (if present). */
+function renderScene() {
+    const el = document.getElementById('bf_mem_scene_view');
+    if (!el) return;
+    if (!sceneCard) {
+        el.innerHTML = '<div class="bf-mem-summary-empty">No scene yet. It updates each turn once the pipeline runs.</div>';
+        return;
+    }
+    const s = sceneCard;
+    const row = (label, val) => val ? `<div class="bf-mem-fact-line"><span class="bf-mem-fact-cat">${escapeHtml(label)}</span> ${escapeHtml(val)}</div>` : '';
+    el.innerHTML =
+        row('Location', s.location) +
+        row('Present', (s.present || []).join(', ')) +
+        row('Goals', (s.goals || []).join('; ')) +
+        row('Recently', (s.beats || []).join('; '));
 }
 
 function fmt(n) { return (typeof n === 'number' && Number.isFinite(n)) ? n.toLocaleString() : '—'; }
@@ -1442,6 +1564,14 @@ export async function initSettings() {
         saveSettings();
     });
 
+    // Scene card enable toggle (Agent 1 tab)
+    $('#bf_mem_scene_enabled').prop('checked', extensionSettings.sceneCardEnabled).on('change', function () {
+        extensionSettings.sceneCardEnabled = $(this).prop('checked');
+        saveSettings();
+    });
+    // Render the current live scene card (read-only)
+    renderScene();
+
     // --- Prompts Tab ---
     $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).off('input').on('input', function () {
         const val = $(this).val();
@@ -1676,12 +1806,14 @@ export async function initSettings() {
         reloadDebugLogFromChat();
         reloadFactsFromChat();
         reloadTokensFromChat();
+        reloadSceneFromChat();
     });
 
     // Initial load: pull any previously-persisted log entries + facts for the current chat
     reloadDebugLogFromChat();
     reloadFactsFromChat();
     reloadTokensFromChat();
+    reloadSceneFromChat();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {
