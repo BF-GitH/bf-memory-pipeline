@@ -229,7 +229,13 @@ export function normalizeAspect(v, category) {
     // mapped target is actually valid for THIS category's vocab (avoids cross-category leakage).
     if (a && Object.prototype.hasOwnProperty.call(LEGACY_ASPECT_MAP, a)) {
         const mapped = LEGACY_ASPECT_MAP[a];
-        if (vocab.includes(mapped)) return mapped;
+        if (vocab.includes(mapped)) {
+            addDebugLog('debug', `Legacy aspect remap: "${a}" → "${mapped}" (${category})`, {
+                subsystem: 'db', event: 'fact.remapped', reason: 'LEGACY_ASPECT_REMAP',
+                data: { category }, before: a, after: mapped,
+            });
+            return mapped;
+        }
     }
     return defaultAspectFor(category);
 }
@@ -446,6 +452,12 @@ export async function getAllDatabases() {
                     // Stamp the per-fact category so deriveScope/aspect and the menu read the
                     // resolved Layer-1 home (the fact may diverge from the file's category when
                     // a scope-sensitive remap split a legacy bucket).
+                    if (target !== db.category) {
+                        addDebugLog('debug', `Legacy category remap: ${db.category} → ${target} (${fact.key})`, {
+                            subsystem: 'db', event: 'fact.remapped', reason: 'LEGACY_CATEGORY_REMAP',
+                            data: { key: fact.key }, before: db.category, after: target,
+                        });
+                    }
                     fact.category = target;
                     if (!databases[target]) databases[target] = createEmptyDatabase(target);
                     // MIGRATION SAFETY: when BOTH a legacy file (e.g. bf_memory_db_identity.json)
@@ -567,8 +579,19 @@ export async function saveDatabase(db) {
             }
             return `${f.key || '?'} (track step)`;
         }).filter(Boolean).join(', ');
+        // Structured eviction detail: which keys lost and their losing salience score
+        // (track-step evictions have no salience score → null).
+        const evictedDetail = evicted.map(f => ({
+            key: f.key || '?',
+            salienceScore: typeof f.__evictScore === 'number' ? Number(f.__evictScore.toFixed(2)) : null,
+            importance: clampImportance(f.importance),
+            kind: normalizeKind(f.kind),
+        }));
         for (const f of evicted) delete f.__evictScore; // strip transient annotation (don't persist)
-        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, lowest-salience non-sequence first then oldest track steps): ${evictedDesc}`);
+        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, lowest-salience non-sequence first then oldest track steps): ${evictedDesc}`, {
+            subsystem: 'db', event: 'fact.evicted', reason: 'CAP_EXCEEDED_LOW_SALIENCE',
+            data: { category: db.category, cap: MAX_FACTS_PER_DB, evictCount, evictedKeys: evictedDetail.map(e => e.key), evicted: evictedDetail },
+        });
     }
 
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
@@ -696,9 +719,21 @@ export function upsertFact(db, fact) {
             const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
             const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
             const sal = mergeSalience(existing, seqFact);
+            const oldSeqVal = existing.value;
             db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
+            if (!factValuesEqual(oldSeqVal, seqFact.value)) {
+                addDebugLog('debug', `Sequence step updated: [${db.category}] ${existing.key} (track ${seqFact.track}, ord ${ord})`, {
+                    subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
+                    data: { category: db.category, key: existing.key, track: seqFact.track, ord, isSequence: true },
+                    before: oldSeqVal, after: seqFact.value,
+                });
+            }
         } else {
             db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
+            addDebugLog('debug', `Sequence step added: [${db.category}] ${seqFact.key} (track ${seqFact.track}, ord ${ord})`, {
+                subsystem: 'db', event: 'fact.created',
+                data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: factAspect(seqFact), track: seqFact.track, ord, isSequence: true },
+            });
         }
         db.updatedAt = Date.now();
         return db;
@@ -713,11 +748,13 @@ export function upsertFact(db, fact) {
     //    lingering alongside a later "rough" one). We only merge clear normalized
     //    matches — distinct properties (different normalized keys) stay separate.
     //    Sequence steps are handled above and never reach this path.
+    let matchVia = existingIdx >= 0 ? 'EXACT_KEY' : null;
     if (existingIdx < 0) {
         const normIncoming = normalizeFactKey(fact.key);
         if (normIncoming) {
             // Never collapse a non-sequence write onto a sequence step (or vice versa).
             existingIdx = db.facts.findIndex(f => !isSequenceFact(f) && normalizeFactKey(f.key) === normIncoming);
+            if (existingIdx >= 0) matchVia = 'NORMALIZED_KEY';
         }
     }
     // 3) STRONGER PARALLEL-KEY DEDUP (feature #5): if STILL no match and the incoming
@@ -734,9 +771,18 @@ export function upsertFact(db, fact) {
         const parallelIdx = findParallelStateKey(db, fact, -1);
         if (parallelIdx >= 0) {
             existingIdx = parallelIdx;
+            matchVia = 'PARALLEL_KEY';
             // Adopt the existing canonical key so the merge updates-in-place / supersedes
             // rather than renaming (mirrors the in-place-correction policy below).
-            fact = { ...fact, key: db.facts[parallelIdx].key };
+            const fromKey = fact.key;
+            const intoKey = db.facts[parallelIdx].key;
+            fact = { ...fact, key: intoKey };
+            if (fromKey !== intoKey) {
+                addDebugLog('debug', `Merged parallel state key: [${db.category}] ${fromKey} → ${intoKey}`, {
+                    subsystem: 'db', event: 'fact.merged', reason: 'PARALLEL_KEY_DEDUP',
+                    data: { category: db.category, fromKey, intoKey, subject: deriveSubject(fact), aspect: factAspect(fact) },
+                });
+            }
         }
     }
     if (existingIdx >= 0) {
@@ -767,6 +813,7 @@ export function upsertFact(db, fact) {
         // the job of the track/diary feature, not this lightweight breadcrumb.
         if (existing.active !== false && shouldSupersede(existing, fact, supersedesSignal)) {
             const now = Date.now();
+            const oldSupersededValue = existing.value;
             const snapshotKey = makeSupersededKey(db, existing.key);
             // Build the inactive history snapshot from the OLD fact's state.
             const snapshot = {
@@ -791,14 +838,37 @@ export function upsertFact(db, fact) {
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
             };
             db.updatedAt = now;
+            addDebugLog('info', `Fact superseded: [${db.category}] ${existing.key} (old kept as ${snapshotKey})`, {
+                subsystem: 'db', event: 'fact.superseded',
+                reason: supersedesSignal ? 'EXPLICIT_SUPERSEDE_MARKER' : 'STATE_CHANGED_HEURISTIC',
+                data: { category: db.category, key: existing.key, snapshotKey, subject: deriveSubject(existing), aspect: factAspect(existing) },
+                before: oldSupersededValue, after: fact.value,
+            });
             return db;
         }
 
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
+        const oldValue = existing.value;
         db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
+        if (factValuesEqual(oldValue, fact.value)) {
+            addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
+                subsystem: 'db', event: 'fact.unchanged',
+                data: { category: db.category, key: existing.key, via: matchVia },
+            });
+        } else {
+            addDebugLog('info', `Fact updated: [${db.category}] ${existing.key}`, {
+                subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
+                data: { category: db.category, key: existing.key, subject: deriveSubject(existing), aspect: factAspect(existing), via: matchVia },
+                before: oldValue, after: fact.value,
+            });
+        }
     } else {
         db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
+        addDebugLog('info', `Fact created: [${db.category}] ${fact.key}`, {
+            subsystem: 'db', event: 'fact.created',
+            data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: factAspect(fact) },
+        });
     }
     db.updatedAt = Date.now();
     return db;

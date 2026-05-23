@@ -221,7 +221,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'agent3');
         addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars):\n${resultStr}`);
         const ctx = SillyTavern.getContext();
         const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
@@ -678,6 +678,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             about = resolvedSubject;          // keep the descriptor for later promotion
             if (!involved.includes(about)) involved = [about, ...involved];
             resolvedSubject = NPC_SUBJECT;
+            addDebugLog('debug', `NPC-routed unnamed descriptor "${about}" → subject:npc`, {
+                subsystem: 'db', event: 'fact.npc_routed', reason: 'UNNAMED_DESCRIPTOR',
+                data: { descriptor: about, key, category },
+            });
         }
         update.subject = resolvedSubject;
 

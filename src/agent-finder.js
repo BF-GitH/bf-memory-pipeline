@@ -72,7 +72,7 @@ export async function runFinderAgent({
 
     let resultStr = '';
     try {
-        resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
+        resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'finder');
     } catch (error) {
         addDebugLog('fail', `Agent 4 (finder) LLM error: ${error.message || error}`);
         return { facts: [], formatted: '', raw: '', error: error.message || String(error), tokensIn: 0, tokensOut: 0 };

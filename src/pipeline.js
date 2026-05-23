@@ -368,14 +368,17 @@ function hideWorkingIndicator() {
 
 function shouldRunPipeline(data) {
     const settings = getSettings();
-    if (!settings || !settings.enabled) return false;
+    if (!settings || !settings.enabled) {
+        addDebugLog('debug', 'Skipping pipeline (disabled)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'DISABLED' });
+        return false;
+    }
 
     // Skip group chats: characterId in a group = active speaker, not addressee.
     // Writing facts to the speaker's attachments would cross-contaminate characters.
     // Group support is planned for a future release.
     const ctx = SillyTavern.getContext();
     if (ctx.groupId || ctx.selected_group) {
-        addDebugLog('info', 'Skipping pipeline (group chat — not supported in this version)');
+        addDebugLog('info', 'Skipping pipeline (group chat — not supported in this version)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'GROUP' });
         if (!groupSkipToastShown && typeof toastr !== 'undefined') {
             toastr.info('BF Memory: group chats not supported — memory pipeline disabled for this chat.', 'BF Memory', { timeOut: 6000 });
             groupSkipToastShown = true;
@@ -385,7 +388,7 @@ function shouldRunPipeline(data) {
 
     // Skip our own internal LLM calls (Agent 1, Agent 3)
     if (isInternalCall) {
-        addDebugLog('info', 'Skipping pipeline (internal agent call)');
+        addDebugLog('debug', 'Skipping pipeline (internal agent call)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'INTERNAL' });
         return false;
     }
 
@@ -393,11 +396,17 @@ function shouldRunPipeline(data) {
     // impersonations (when the user clicks the Impersonate button), and any
     // other non-genuine generation types. Without this, Quick Reply scripts
     // that call /gen would burn billable Agent 1 + Agent 3 LLM calls per fire.
-    if (data?.dryRun) return false;
-    if (data?.quiet) return false;
+    if (data?.dryRun) {
+        addDebugLog('debug', 'Skipping pipeline (dry run)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'DRY' });
+        return false;
+    }
+    if (data?.quiet) {
+        addDebugLog('debug', 'Skipping pipeline (quiet generation)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'QUIET' });
+        return false;
+    }
     const generationType = data?.type || data?.generationType;
     if (generationType === 'quiet' || generationType === 'impersonate' || generationType === 'continue') {
-        addDebugLog('info', `Skipping pipeline (generation type: ${generationType})`);
+        addDebugLog('info', `Skipping pipeline (generation type: ${generationType})`, { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'GEN_TYPE', data: { generationType } });
         return false;
     }
 
@@ -437,9 +446,9 @@ function shouldRunPipeline(data) {
 
     if (!isNewUserMsg && !hasUnprocessedWork) {
         if (Date.now() - chatChangedAt < 5000) {
-            addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown, no new user msg)');
+            addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown, no new user msg)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'COOLDOWN', data: { msSinceChatChanged: Date.now() - chatChangedAt } });
         } else {
-            addDebugLog('info', `Skipping pipeline (already processed for user msg index ${lastUserMsgIndex})`);
+            addDebugLog('info', `Skipping pipeline (already processed for user msg index ${lastUserMsgIndex})`, { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'ALREADY_PROCESSED', data: { lastUserMsgIndex } });
         }
         return false;
     }
@@ -448,10 +457,11 @@ function shouldRunPipeline(data) {
     // unprocessed work but it's NOT a new user message (e.g. after a swipe reset
     // the index), still respect the load cooldown to avoid firing on chat open.
     if (!isNewUserMsg && hasUnprocessedWork && Date.now() - chatChangedAt < 5000) {
-        addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown — deferring unprocessed work)');
+        addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown — deferring unprocessed work)', { subsystem: 'pipeline', event: 'pipeline.gate.skip', reason: 'COOLDOWN', data: { msSinceChatChanged: Date.now() - chatChangedAt } });
         return false;
     }
 
+    addDebugLog('debug', 'Pipeline gate passed', { subsystem: 'pipeline', event: 'pipeline.gate.pass', reason: 'OK', data: { isNewUserMsg, lastUserMsgIndex, memoryTargetIndex, hasUnprocessedWork } });
     return true;
 }
 
@@ -585,6 +595,7 @@ async function runPipelineInline(data) {
     const factMenu = summarizeMenu(databases);
     addDebugLog('info', `Fact inventory for Agent 1: ${wantFinder ? 'skipped (finder on)' : (factInventory ? factInventory.split('\n').length + ' keys' : 'empty')}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
+    const agent1Start = Date.now();
     try {
         isInternalCall = true;
         const promises = [];
@@ -623,8 +634,21 @@ async function runPipelineInline(data) {
     // even after retry), don't abort the whole pipeline — the writer can still inject
     // the retrieved facts with no draft. Memory > nothing.
     if (!draftResult || draftResult.error) {
-        addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
+        addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`, {
+            subsystem: 'agent1', event: 'agent1.run', reason: 'ERROR',
+            data: { agent: 'agent1', profileId: agent1ProfileId || null, success: false, error: draftResult?.error || 'no result', durationMs: Date.now() - agent1Start },
+        });
         draftResult = { draft: '', branches: [], focus: [], neededFacts: [], scene: null, raw: '' };
+    } else {
+        addDebugLog('debug', `Agent 1 run ok (${Date.now() - agent1Start}ms)`, {
+            subsystem: 'agent1', event: 'agent1.run',
+            data: {
+                agent: 'agent1', profileId: agent1ProfileId || null, success: true,
+                durationMs: Date.now() - agent1Start,
+                tokensIn: draftResult.tokensIn ?? null, tokensOut: draftResult.tokensOut ?? null,
+                branchCount: Array.isArray(draftResult.branches) ? draftResult.branches.length : 0,
+            },
+        });
     }
     // Older Agent 1 result shapes (or partial parses) may lack branches/focus/neededFacts/nextHint.
     if (!Array.isArray(draftResult.branches)) draftResult.branches = [];
@@ -736,6 +760,8 @@ async function runPipelineInline(data) {
         expandLinks(databases, candidatesAll, branchSeen);
         const candidates = candidatesAll.filter(({ fact }) => isFactVisible(fact));
         addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion)`);
+        const finderProfileId = getAgent4ProfileId(settings);
+        const finderStart = Date.now();
         try {
             const finder = await runFinderAgent({
                 candidates,
@@ -743,7 +769,7 @@ async function runPipelineInline(data) {
                 recentChat: formattedChat,
                 characterInfo,
                 userPersona,
-                profileId: getAgent4ProfileId(settings),
+                profileId: finderProfileId,
             });
             // Use finder results when it succeeded AND chose something. Empty/error => fall back.
             if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
@@ -753,15 +779,27 @@ async function runPipelineInline(data) {
                     formatted: finder.formatted || formatChosenFacts(finder.facts),
                     stats: { primary: facts.length, secondary: 0, tertiary: 0 },
                 };
-                addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`);
+                addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
+                    subsystem: 'finder', event: 'finder.run',
+                    data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length },
+                });
             } else {
-                addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`);
+                addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
+                    subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
+                    data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
+                });
             }
         } catch (finderErr) {
-            addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`);
+            addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`, {
+                subsystem: 'finder', event: 'finder.run', reason: 'FINDER_THREW',
+                data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finderErr.message || String(finderErr), fallback: 'deterministic' },
+            });
         }
     } else {
-        addDebugLog('info', 'Finder agent disabled (useFinderAgent=false) — using deterministic retrieval');
+        addDebugLog('info', 'Finder agent disabled (useFinderAgent=false) — using deterministic retrieval', {
+            subsystem: 'finder', event: 'finder.run', reason: 'FINDER_DISABLED',
+            data: { agent: 'finder', fired: false, fallback: 'deterministic' },
+        });
     }
 
     // FALLBACK: finder disabled, errored, or empty → deterministic retrieval (over Agent 1's
@@ -974,7 +1012,10 @@ async function runMemoryExtraction() {
         addAgent3Tokens({ agent3Input: memoryResult?.tokensIn || 0, agent3Output: memoryResult?.tokensOut || 0 });
 
         if (!memoryResult || memoryResult.error) {
-            if (memoryResult?.error) addDebugLog('fail', `[${runId}] Agent 3 error: ${memoryResult.error}`);
+            if (memoryResult?.error) addDebugLog('fail', `[${runId}] Agent 3 error: ${memoryResult.error}`, {
+                subsystem: 'agent3', event: 'agent3.run', reason: 'ERROR',
+                data: { agent: 'agent3', profileId: getAgent3ProfileId(settings) || null, success: false, error: memoryResult.error, durationMs: Date.now() - startTime },
+            });
             return;
         }
 
@@ -1007,7 +1048,20 @@ async function runMemoryExtraction() {
                 ...u,
                 status: u.status || (u.wasNew ? 'NEW' : 'UPDATED'),
             }));
-        addDebugLog('info', `[${runId}] Agent 3: ${memoryResult.updates.length} proposed, ${committed.length} committed. ${memoryResult.summary}`);
+        const a3Counts = (memoryResult.updates || []).reduce((acc, u) => {
+            const s = String(u.status || (u.changed === false ? 'SKIPPED' : (u.wasNew ? 'NEW' : 'UPDATED'))).toUpperCase();
+            acc[s] = (acc[s] || 0) + 1; return acc;
+        }, {});
+        addDebugLog('info', `[${runId}] Agent 3: ${memoryResult.updates.length} proposed, ${committed.length} committed. ${memoryResult.summary}`, {
+            subsystem: 'agent3', event: 'agent3.run',
+            data: {
+                agent: 'agent3', profileId: getAgent3ProfileId(settings) || null, success: true,
+                durationMs: Date.now() - startTime, targetMsgIndex: memoryTargetIndex,
+                tokensIn: memoryResult.tokensIn ?? null, tokensOut: memoryResult.tokensOut ?? null,
+                proposed: memoryResult.updates.length, committed: committed.length,
+                NEW: a3Counts.NEW || 0, UPDATED: a3Counts.UPDATED || 0, SKIPPED: a3Counts.SKIPPED || 0,
+            },
+        });
         setLastInserted(committed);
         for (const update of memoryResult.updates) trackUpdate(update);
         lastProcessedMessageIndex = memoryTargetIndex;
@@ -1088,6 +1142,7 @@ async function maybeRunReflection() {
     reflectionInFlight = true;
     successfulRunsSinceReflection = 0; // reset the cadence regardless of outcome
     isInternalCall = true; // ensure the reflection LLM call can't re-trigger the pipeline
+    const reflectStart = Date.now();
     try {
         updateStatus('running', 'Reflecting (consolidating memory)...');
         // FIX #12: no longer pass prevReflection — the rolling #STORY summary was dropped, so
@@ -1101,8 +1156,15 @@ async function maybeRunReflection() {
         });
         // Persist any observation facts the pass wrote to the active DB profile.
         try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch { /* best-effort */ }
+        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${Date.now() - reflectStart}ms)`, {
+            subsystem: 'reflection', event: 'reflection.run',
+            data: { agent: 'reflection', profileId: pending.profileId || null, success: true, durationMs: Date.now() - reflectStart },
+        });
     } catch (err) {
-        addDebugLog('fail', `Reflection pass failed (non-fatal): ${err.message || err}`);
+        addDebugLog('fail', `Reflection pass failed (non-fatal): ${err.message || err}`, {
+            subsystem: 'reflection', event: 'reflection.run', reason: 'ERROR',
+            data: { agent: 'reflection', profileId: pending.profileId || null, success: false, error: err.message || String(err), durationMs: Date.now() - reflectStart },
+        });
     } finally {
         reflectionInFlight = false;
         isInternalCall = false;

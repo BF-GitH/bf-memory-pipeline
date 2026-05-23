@@ -66,7 +66,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     addDebugLog('info', `Agent 1 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'agent1');
         addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars):\n${resultStr}`);
         const ctx = SillyTavern.getContext();
         const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);

@@ -110,6 +110,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     for (const r of searchFacts(databases, allKeywords)) {
         const id = `${r.category}:${r.fact.key}`;
         if (!exactIds.has(id)) {
+            if (r.via == null) r.via = 'keyword';
             directResults.push(r);
             exactIds.add(id);
         }
@@ -156,6 +157,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         if (!alreadyFound.has(id)) {
             // Demote: direct fallback hits become secondary, relationship hits become tertiary
             result.tier = result.tier === 'primary' ? 'secondary' : 'tertiary';
+            if (result.via == null) result.via = 'link';
             directResults.push(result);
             alreadyFound.add(id);
         }
@@ -203,9 +205,37 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         ...tertiary.slice(0, MAX_TERTIARY),
     ];
 
+    // EXCLUSION LEDGER — record candidates that fell off the cap cliff so "why it forgot X"
+    // is answerable. Only candidates that ACTUALLY entered a tier are logged (never the whole
+    // DB). Each carries rank + salience score so the user sees it was e.g. rank-14-of-18.
+    const excludedByReason = {};
+    const recordExclude = (r, reason, extra = {}) => {
+        excludedByReason[reason] = (excludedByReason[reason] || 0) + 1;
+        addDebugLog('debug', `Retrieval excluded ${r.category}/${r.fact.key} (${reason})`, {
+            subsystem: 'retrieval', event: 'retrieval.exclude', reason,
+            data: { key: r.fact.key, category: r.category, tier: r.tier, ...extra },
+        });
+    };
+    secondary.slice(MAX_SECONDARY).forEach((r, i) =>
+        recordExclude(r, 'CAP_SECONDARY', { rank: MAX_SECONDARY + i + 1, of: secondary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
+    tertiary.slice(MAX_TERTIARY).forEach((r, i) =>
+        recordExclude(r, 'CAP_TERTIARY', { rank: MAX_TERTIARY + i + 1, of: tertiary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
+
     // Filter by knownBy: only include facts the current character knows.
     // Empty knownBy means "everyone knows" (no filter).
-    const visibleResults = filteredResults.filter(({ fact }) => isFactVisible(fact));
+    const visibleResults = filteredResults.filter((r) => {
+        if (isFactVisible(r.fact)) return true;
+        recordExclude(r, 'KNOWNBY_INVISIBLE', { knownBy: r.fact.knownBy || [] });
+        return false;
+    });
+
+    // Per-fact ADMIT ledger (debug firehose): one line per fact that made it in.
+    for (const r of visibleResults) {
+        addDebugLog('debug', `Retrieval admit ${r.category}/${r.fact.key} (${r.tier[0].toUpperCase()}, via ${r.via || 'keyword'})`, {
+            subsystem: 'retrieval', event: 'retrieval.admit',
+            data: { key: r.fact.key, category: r.category, tier: r.tier, via: r.via || 'keyword' },
+        });
+    }
 
     // Format for Agent 2
     const formatted = formatFactsForWriter(visibleResults);
@@ -221,6 +251,16 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         const factSummary = visibleResults.slice(0, 5).map(r => `[${r.tier[0].toUpperCase()}] ${r.category}:${r.fact.key}`).join(', ');
         addDebugLog('info', `Top facts: ${factSummary}${visibleResults.length > 5 ? ` (+${visibleResults.length - 5} more)` : ''}`);
     }
+
+    // One-line retrieval summary: admitted by via, excluded by reason.
+    const admittedByVia = visibleResults.reduce((acc, r) => {
+        const v = r.via || 'keyword'; acc[v] = (acc[v] || 0) + 1; return acc;
+    }, {});
+    const totalExcluded = Object.values(excludedByReason).reduce((a, b) => a + b, 0);
+    addDebugLog('info', `Retrieval summary: in=${visibleResults.length} excluded=${totalExcluded}`, {
+        subsystem: 'retrieval', event: 'retrieval.summary',
+        data: { admitted: visibleResults.length, admittedByVia, excluded: totalExcluded, excludedByReason },
+    });
 
     return { facts: visibleResults, formatted, stats };
 }
@@ -312,7 +352,7 @@ function fuzzyFallback(databases, neededInfo, results, seenIds) {
                     if (best >= FUZZY_THRESHOLD) break;
                 }
                 if (best >= FUZZY_THRESHOLD) {
-                    results.push({ fact, category, tier: 'secondary' });
+                    results.push({ fact, category, tier: 'secondary', via: 'fuzzy', fuzzyScore: Number(best.toFixed(2)) });
                     seenIds.add(id);
                     admitted++;
                 }
@@ -366,7 +406,7 @@ function resolveExactKeys(databases, requests) {
                 const id = `${category}:${fact.key}`;
                 if (seen.has(id)) continue;
                 seen.add(id);
-                results.push({ fact, category, tier: 'primary' });
+                results.push({ fact, category, tier: 'primary', via: 'exact' });
             }
         }
     }
@@ -457,7 +497,7 @@ function expandSequenceTracks(databases, results, alreadyFound) {
         for (const { fact, category } of slice) {
             const id = `${category}:${fact.key}`;
             if (alreadyFound.has(id)) continue;
-            results.push({ fact, category, tier: 'primary' });
+            results.push({ fact, category, tier: 'primary', via: 'link' });
             alreadyFound.add(id);
         }
         addDebugLog('info', `Depth-dice track "${track}": reach ${reach} → included ${includeCount}/${steps.length} step(s)`);
@@ -536,7 +576,7 @@ export function expandLinks(databases, results, alreadyFound) {
         if (!isFactVisible(fact)) return false;          // respect knownBy
         const id = `${category}:${fact.key}`;
         if (alreadyFound.has(id)) return false;
-        results.push({ fact, category, tier: 'secondary' });
+        results.push({ fact, category, tier: 'secondary', via: 'link' });
         alreadyFound.add(id);
         return true;
     };
@@ -736,6 +776,54 @@ export function extractContextKeywords(messages) {
     }
 
     return [...keywords];
+}
+
+/**
+ * ON-DEMAND "WHY NOT key X?" PROBE. Given a fact key (optionally `Category/key`), re-run the
+ * relevant match/visibility logic for that single fact and return + log its fate this turn —
+ * turning "it forgot X" into a one-click answer without flooding the per-turn log.
+ *
+ * @param {string} key - bare key or `Category/key`
+ * @param {string[]} [keywords=[]] - current-turn keywords to test keyword/fuzzy matching against
+ * @returns {Promise<{found:boolean, reason:string, detail:object}>}
+ */
+export async function explainFactRetrieval(key, keywords = []) {
+    const databases = await getAllDatabases();
+    const slashIdx = String(key || '').indexOf('/');
+    const wantCat = slashIdx >= 0 ? String(key).slice(0, slashIdx).trim().toLowerCase() : null;
+    const wantKey = (slashIdx >= 0 ? String(key).slice(slashIdx + 1) : String(key || '')).trim().toLowerCase();
+
+    let match = null;
+    for (const [category, db] of Object.entries(databases)) {
+        if (wantCat && category.toLowerCase() !== wantCat) continue;
+        for (const fact of (db.facts || [])) {
+            if (String(fact.key).toLowerCase() === wantKey) { match = { category, fact }; break; }
+        }
+        if (match) break;
+    }
+
+    let reason, detail;
+    if (!match) {
+        reason = 'NEVER_MATCHED';
+        detail = { searched: wantCat ? `${wantCat}/${wantKey}` : wantKey, note: 'no stored fact with that key' };
+    } else if (!isActiveFact(match.fact)) {
+        reason = 'SUPERSEDED_INACTIVE';
+        detail = { key: match.fact.key, category: match.category, note: 'fact is a superseded/inactive history snapshot' };
+    } else if (!isFactVisible(match.fact)) {
+        reason = 'KNOWNBY_INVISIBLE';
+        detail = { key: match.fact.key, category: match.category, knownBy: match.fact.knownBy || [] };
+    } else {
+        // Active + visible: would it have matched the given keywords?
+        const kw = (keywords || []).filter(Boolean);
+        const hit = kw.length ? searchFacts({ [match.category]: { category: match.category, facts: [match.fact] } }, kw).length > 0 : false;
+        reason = hit ? 'WOULD_ADMIT' : (kw.length ? 'NO_KEYWORD_MATCH' : 'ACTIVE_VISIBLE');
+        detail = { key: match.fact.key, category: match.category, tier: 'unknown', testedKeywords: kw, keywordHit: hit };
+    }
+
+    addDebugLog('info', `Why-not probe "${key}": ${reason}`, {
+        subsystem: 'retrieval', event: 'retrieval.explain', reason, data: detail,
+    });
+    return { found: !!match, reason, detail };
 }
 
 /**

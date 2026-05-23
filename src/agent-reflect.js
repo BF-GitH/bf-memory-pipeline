@@ -218,7 +218,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
-        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId);
+        const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'reflection');
         const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
         const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
         addDebugLog('info', `[${runId}] Reflection LLM reply (${resultStr.length} chars):\n${resultStr}`);

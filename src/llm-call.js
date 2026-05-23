@@ -7,6 +7,25 @@ import { addDebugLog } from './settings.js';
 
 const LLM_TIMEOUT_MS = 60000; // 60s — bumped from 30s for mobile network tolerance
 
+// CACHE-ELIGIBILITY tracking (HONEST — server-side cache HITS are NOT observable from an
+// extension; see the long note in callAgentLLMOnce). We can only observe what makes the
+// cacheable PREFIX stable: the agent's system-prompt bytes (hash vs the last call for that
+// agent) and the active persona. These per-agent last-seen values let us emit a truthful
+// `systemPromptStable` flag without ever claiming a cache hit.
+const lastSystemHashByAgent = new Map();   // agent -> last system-prompt hash (this session)
+let lastPersonaName = undefined;            // active persona name at the last agent call
+
+/** Cheap, dependency-free 32-bit string hash (FNV-1a-ish) for prefix-stability comparison. */
+function cheapHash(str) {
+    let h = 0x811c9dc5;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+}
+
 /** Wrap a promise with a timeout */
 function withTimeout(promise, ms) {
     let timer;
@@ -105,14 +124,32 @@ async function callViaCMRS(profileId, messages) {
  *   This is safe to call during mid-generation because it doesn't touch the active profile.
  * @returns {Promise<string>} The LLM response text
  */
-export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
+export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown') {
     // Up to 2 attempts. Retry on:
     // - Empty response (providers like Deepseek intermittently return empty)
     // - Network errors (mobile users hit ERR_NETWORK_CHANGED on WiFi↔cellular switch)
+    // CACHE-ELIGIBILITY (honest): observe prefix stability, NEVER a cache hit. Computed once
+    // per call (before the retry loop) so a retry doesn't double-log or falsely flip the flag.
+    try {
+        const sysHash = cheapHash(systemPrompt);
+        const sysTokens = Math.round((String(systemPrompt || '').length) / 4); // ~4 chars/token estimate
+        const prevHash = lastSystemHashByAgent.get(agent);
+        const systemPromptStable = prevHash !== undefined && prevHash === sysHash;
+        lastSystemHashByAgent.set(agent, sysHash);
+        let personaName = '';
+        try { personaName = SillyTavern.getContext()?.name1 || ''; } catch { /* best-effort */ }
+        const personaChanged = lastPersonaName !== undefined && lastPersonaName !== personaName;
+        lastPersonaName = personaName;
+        addDebugLog('debug', `Cache eligibility [${agent}]: systemPromptStable=${systemPromptStable}, ~${sysTokens} sys tokens${personaChanged ? ', persona CHANGED' : ''}`, {
+            subsystem: 'cache', event: 'cache.eligibility',
+            data: { agent, systemPromptStable, systemPromptTokens: sysTokens, personaChanged, note: 'server-side cache HITS are not observable from the extension; this is prefix-stability only' },
+        });
+    } catch { /* logging must never break the call */ }
+
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-            const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId);
+            const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent);
             if (result && result.trim()) return result;
             if (attempt === 1) {
                 addDebugLog('info', 'LLM returned empty response, retrying once...');
@@ -134,7 +171,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
     return '';
 }
 
-async function callAgentLLMOnce(systemPrompt, userPrompt, profileId) {
+async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'unknown') {
     // ── Prompt-caching note (Claude / OpenRouter / Electron Hub etc.) ─────────────
     // We CANNOT attach `cache_control: {type:'ephemeral'}` markers from an extension.
     // SillyTavern's chat-completions backend rebuilds every message into a fresh

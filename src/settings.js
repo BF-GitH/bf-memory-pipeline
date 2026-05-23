@@ -1097,7 +1097,11 @@ function renderTokens() {
 function exportLogs() {
     const header = `=== BF Memory Pipeline Debug Logs ===\nExported: ${new Date().toISOString()}\nEntries: ${debugLog.length}\n${'='.repeat(40)}\n\n`;
     const logText = debugLog.map(entry => `[${entry.timestamp}] [${entry.type.toUpperCase().padEnd(5)}] ${entry.message}`).join('\n');
-    return header + logText;
+    const out = header + logText;
+    addDebugLog('info', `Logs exported (${debugLog.length} entries)`, {
+        subsystem: 'settings', event: 'log.exported', actor: 'USER', data: { entryCount: debugLog.length },
+    });
+    return out;
 }
 
 /**
@@ -1388,7 +1392,9 @@ async function loadDbProfile(profileName) {
     refreshDbProfileDropdown();
     refreshDatabaseView();
     toastr.success(`Loaded profile "${profileName}"`, 'BF Memory');
-    addDebugLog('info', `DB profile loaded: "${profileName}"`);
+    addDebugLog('info', `DB profile loaded: "${profileName}"`, {
+        subsystem: 'import', event: 'profile.switched', actor: 'USER', data: { profileName },
+    });
 }
 
 async function saveDbProfile(profileName) {
@@ -1591,6 +1597,11 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
 
     let processed = 0, skipped = 0, factsAdded = 0;
     const total = chat.length;
+    const backfillStart = Date.now();
+    addDebugLog('info', `Full-chat backfill start (${total} messages)`, {
+        subsystem: 'import', event: 'backfill.start', actor: 'USER',
+        data: { total, profileId: profileId || null, skipAlreadyProcessed },
+    });
     // FIX #7: accumulate proposed + committed facts so the Last Generated /
     // Last Inserted tabs reflect what THIS backfill produced (mirrors pipeline.js).
     const allUpdates = [];
@@ -1598,20 +1609,26 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
 
     for (let i = 0; i < chat.length; i++) {
         if (shouldCancel?.()) {
-            addDebugLog('info', `Full-chat extraction cancelled at message ${i}/${total}`);
+            addDebugLog('info', `Full-chat extraction cancelled at message ${i}/${total}`, {
+                subsystem: 'import', event: 'backfill.cancelled', data: { msgIndex: i, total },
+            });
             break;
         }
         const msg = chat[i];
-        if (!msg || !msg.mes) { skipped++; continue; }
-        if (msg.is_system) { skipped++; continue; }
-        if (msg.extra?.type) { skipped++; continue; }
+        const skip = (reason) => addDebugLog('debug', `Full-chat: msg ${i + 1} skipped (${reason})`, {
+            subsystem: 'import', event: 'backfill.skipped', reason, data: { msgIndex: i },
+        });
+        if (!msg || !msg.mes) { skipped++; skip('EMPTY'); continue; }
+        if (msg.is_system) { skipped++; skip('SYSTEM'); continue; }
+        if (msg.extra?.type) { skipped++; skip('EXTRA_TYPE'); continue; }
         // FIX #9: skip already-processed BEFORE spending an LLM call (short-circuit,
         // not just tally). On by default via skipAlreadyProcessed.
-        if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; continue; }
+        if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; skip('ALREADY_PROCESSED'); continue; }
         // FIX #9: client-side pre-filter of trivially-empty messages so we don't burn
         // a ~1200-token call on content the prompt would return zero facts for anyway.
         if (isTriviallyEmptyForExtraction(msg.mes)) {
             skipped++;
+            skip('TRIVIALLY_EMPTY');
             // Still mark processed so a re-run doesn't re-evaluate the same dead message.
             msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
             continue;
@@ -1637,9 +1654,13 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
             msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
             processed++;
             onProgress?.({ current: i + 1, total, factsAdded });
-            addDebugLog('info', `Full-chat: msg ${i + 1}/${total} → +${n} facts`);
+            addDebugLog('info', `Full-chat: msg ${i + 1}/${total} → +${n} facts`, {
+                subsystem: 'import', event: 'backfill.perMsg', data: { msgIndex: i, total, factsAdded: n },
+            });
         } catch (err) {
-            addDebugLog('fail', `Full-chat: msg ${i + 1} failed: ${err.message || err}`);
+            addDebugLog('fail', `Full-chat: msg ${i + 1} failed: ${err.message || err}`, {
+                subsystem: 'import', event: 'backfill.msgFailed', reason: 'ERROR', data: { msgIndex: i, error: err.message || String(err) },
+            });
         }
     }
 
@@ -1652,6 +1673,10 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
     ctx.saveChatDebounced?.();
     await saveCurrentToActiveProfile();
 
+    addDebugLog('pass', `Full-chat backfill complete: ${processed} processed, ${skipped} skipped, +${factsAdded} facts`, {
+        subsystem: 'import', event: 'backfill.complete', actor: 'USER',
+        data: { processed, skipped, factsAdded, durationMs: Date.now() - backfillStart },
+    });
     return { processed, skipped, factsAdded };
 }
 
@@ -1685,12 +1710,16 @@ async function autoSaveDbProfile() {
                 // when a real fact lands (write-on-first-fact via Agent 3 / saveDatabase), so
                 // we never spam the backend with empty uploads.
                 const { buildSkeletonDatabases } = await import('./database.js');
+                const seeded = buildSkeletonDatabases();
                 extensionSettings.dbProfiles[chatLabel] = {
-                    databases: buildSkeletonDatabases(),
+                    databases: seeded,
                     savedAt: Date.now(),
                     linkedChats: [chatId],
                 };
-                addDebugLog('info', `Auto-created DB profile "${chatLabel}" (seeded Layer-1 skeleton) for chat ${chatId}`);
+                addDebugLog('info', `Auto-created DB profile "${chatLabel}" (seeded Layer-1 skeleton) for chat ${chatId}`, {
+                    subsystem: 'import', event: 'db.seeded', actor: 'SYSTEM',
+                    data: { profileName: chatLabel, chatId, categoriesSeeded: Object.keys(seeded) },
+                });
             } else {
                 // Profile with that name exists, link this chat to it
                 linkChatToProfile(chatLabel, chatId);
@@ -1721,7 +1750,9 @@ async function autoSaveDbProfile() {
             saveSettings();
             refreshDbProfileDropdown();
             refreshLinkedChatsField();
-            addDebugLog('info', `Auto-loaded DB profile "${profileToLoad}" (linked to chat ${chatId})`);
+            addDebugLog('info', `Auto-loaded DB profile "${profileToLoad}" (linked to chat ${chatId})`, {
+                subsystem: 'import', event: 'profile.switched', actor: 'SYSTEM', reason: 'AUTO_LOADED', data: { profileName: profileToLoad, chatId },
+            });
         }
 
         lastAutoLoadedChat = chatId;
@@ -1925,7 +1956,7 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         // FIX #10: log enable/disable state changes.
         if (next !== extensionSettings.enabled) {
-            addDebugLog('info', `Pipeline ${next ? 'ENABLED' : 'DISABLED'} by user`);
+            addDebugLog('info', `Pipeline ${next ? 'ENABLED' : 'DISABLED'} by user`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enabled' }, before: !!extensionSettings.enabled, after: !!next });
         }
         extensionSettings.enabled = next;
         updateStatus('idle');
@@ -1943,10 +1974,12 @@ export async function initSettings() {
     reloadProfiles();
     $('#bf_mem_agent1_profile').val(extensionSettings.agent1Profile || '').on('change', function () {
         extensionSettings.agent1Profile = $(this).val() || '';
+        addDebugLog('info', `Agent 1 profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent1Profile', value: extensionSettings.agent1Profile } });
         saveSettings();
     });
     $('#bf_mem_agent3_profile').val(extensionSettings.agent3Profile || '').on('change', function () {
         extensionSettings.agent3Profile = $(this).val() || '';
+        addDebugLog('info', `Agent 3 profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent3Profile', value: extensionSettings.agent3Profile } });
         saveSettings();
     });
 
@@ -1958,11 +1991,14 @@ export async function initSettings() {
     // Agent 4 (Fact Finder) — toggle + profile selector (Agent 2 tab / Fact Finder section).
     // reloadProfiles() above already populated the dropdown; just bind value + change.
     $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false).on('change', function () {
+        const before = extensionSettings.useFinderAgent !== false;
         extensionSettings.useFinderAgent = $(this).prop('checked');
+        addDebugLog('info', `Finder agent ${extensionSettings.useFinderAgent ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'useFinderAgent' }, before, after: !!extensionSettings.useFinderAgent });
         saveSettings();
     });
     $('#bf_mem_agent4_profile').val(extensionSettings.agent4Profile || '').on('change', function () {
         extensionSettings.agent4Profile = $(this).val() || '';
+        addDebugLog('info', `Finder profile changed`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent4Profile', value: extensionSettings.agent4Profile } });
         saveSettings();
     });
 
@@ -1971,8 +2007,10 @@ export async function initSettings() {
     $('#bf_mem_agent1_context_val').text(extensionSettings.agent1ContextMessages);
     $('#bf_mem_agent1_context').on('input', function () {
         const val = parseInt($(this).val());
+        const before = extensionSettings.agent1ContextMessages;
         extensionSettings.agent1ContextMessages = val;
         $('#bf_mem_agent1_context_val').text(val);
+        if (before !== val) addDebugLog('debug', `Agent 1 context messages: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent1ContextMessages' }, before, after: val });
         saveSettings();
     });
 
@@ -1991,8 +2029,10 @@ export async function initSettings() {
     $('#bf_mem_agent3_context_val').text(extensionSettings.agent3ContextMessages);
     $('#bf_mem_agent3_context').on('input', function () {
         const val = parseInt($(this).val());
+        const before = extensionSettings.agent3ContextMessages;
         extensionSettings.agent3ContextMessages = val;
         $('#bf_mem_agent3_context_val').text(val);
+        if (before !== val) addDebugLog('debug', `Agent 3 context messages: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent3ContextMessages' }, before, after: val });
         saveSettings();
     });
 
@@ -2011,8 +2051,10 @@ export async function initSettings() {
     $('#bf_mem_review_val').text(extensionSettings.reviewInterval);
     $('#bf_mem_review_interval').on('input', function () {
         const val = parseInt($(this).val());
+        const before = extensionSettings.reviewInterval;
         extensionSettings.reviewInterval = val;
         $('#bf_mem_review_val').text(val);
+        if (before !== val) addDebugLog('debug', `Review interval: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reviewInterval' }, before, after: val });
         saveSettings();
     });
 
@@ -2079,8 +2121,10 @@ export async function initSettings() {
     $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval').on('input', function () {
         const val = parseInt($(this).val());
+        const before = extensionSettings.reflectionInterval;
         extensionSettings.reflectionInterval = val;
         $('#bf_mem_reflection_interval_val').text(val);
+        if (before !== val) addDebugLog('debug', `Reflection interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionInterval' }, before, after: val });
         saveSettings();
     });
     $('#bf_mem_reflection_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
@@ -2091,6 +2135,7 @@ export async function initSettings() {
     $('#bf_mem_reset_reflection_prompt').on('click', () => {
         extensionSettings.reflectionPrompt = '';
         $('#bf_mem_reflection_prompt').val(DEFAULT_REFLECT_PROMPT);
+        addDebugLog('info', 'Reflection prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionPrompt', isDefault: true } });
         saveSettings();
         toastr.info('Reflection prompt reset', 'BF Memory');
     });
@@ -2106,8 +2151,10 @@ export async function initSettings() {
     $('#bf_mem_charcheck_interval_val').text(extensionSettings.characterCheckInterval);
     $('#bf_mem_charcheck_interval').on('input', function () {
         const val = parseInt($(this).val());
+        const before = extensionSettings.characterCheckInterval;
         extensionSettings.characterCheckInterval = val;
         $('#bf_mem_charcheck_interval_val').text(val);
+        if (before !== val) addDebugLog('debug', `Character-check interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'characterCheckInterval' }, before, after: val });
         saveSettings();
     });
     // Manual "scan now": run the deterministic scan and, if there are unclassified named
@@ -2153,6 +2200,7 @@ export async function initSettings() {
     $('#bf_mem_reset_draft_prompt').on('click', () => {
         extensionSettings.draftPrompt = '';
         $('#bf_mem_draft_prompt').val(DEFAULT_DRAFT_PROMPT);
+        addDebugLog('info', 'Agent 1 (draft) prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'draftPrompt', isDefault: true } });
         saveSettings();
         toastr.info('Draft prompt reset', 'BF Memory');
     });
@@ -2160,6 +2208,7 @@ export async function initSettings() {
     $('#bf_mem_reset_memory_prompt').on('click', () => {
         extensionSettings.memoryPrompt = '';
         $('#bf_mem_memory_prompt').val(DEFAULT_MEMORY_PROMPT);
+        addDebugLog('info', 'Agent 3 (memory) prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'memoryPrompt', isDefault: true } });
         saveSettings();
         toastr.info('Memory prompt reset', 'BF Memory');
     });
@@ -2180,6 +2229,7 @@ export async function initSettings() {
     $('#bf_mem_reset_finder_prompt').on('click', () => {
         extensionSettings.finderPrompt = '';
         $('#bf_mem_finder_prompt').val(DEFAULT_FINDER_PROMPT);
+        addDebugLog('info', 'Finder prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'finderPrompt', isDefault: true } });
         saveSettings();
         toastr.info('Fact finder prompt reset', 'BF Memory');
     });
@@ -2243,6 +2293,11 @@ export async function initSettings() {
         a.download = `bf-memory-export-${Date.now()}.json`;
         a.click();
         URL.revokeObjectURL(url);
+        const dbCount = Object.keys(databases).length;
+        const totalFacts = Object.values(databases).reduce((s, db) => s + (db.facts?.length || 0), 0);
+        addDebugLog('info', `Databases exported (${dbCount} dbs, ${totalFacts} facts)`, {
+            subsystem: 'import', event: 'db.exported', actor: 'USER', data: { dbCount, totalFacts },
+        });
         toastr.success('Databases exported', 'BF Memory');
     });
 
@@ -2250,10 +2305,14 @@ export async function initSettings() {
         if (!confirm('Clear ALL memory databases for this character? This cannot be undone.')) return;
         const { getAllDatabases, deleteDatabase } = await import('./database.js');
         const dbs = await getAllDatabases();
-        for (const category of Object.keys(dbs)) {
+        const clearedCats = Object.keys(dbs);
+        const clearedFacts = Object.values(dbs).reduce((s, db) => s + (db.facts?.length || 0), 0);
+        for (const category of clearedCats) {
             await deleteDatabase(category);
         }
-        addDebugLog('info', 'All databases cleared');
+        addDebugLog('pass', 'All databases cleared', {
+            subsystem: 'import', event: 'db.cleared', actor: 'USER', data: { dbCount: clearedCats.length, totalFacts: clearedFacts, categories: clearedCats },
+        });
         toastr.success('All databases cleared', 'BF Memory');
         refreshDatabaseView();
     });

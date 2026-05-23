@@ -256,6 +256,12 @@ export function detectAndRecord(databases) {
         toAsk.push({ name: reg[key].name, count: c.count, seenAs: c.seenAs });
     }
     saveEntitiesToMeta();
+    if (toAsk.length > 0) {
+        addDebugLog('info', `Entity detection: ${toAsk.length} candidate(s) need a decision`, {
+            subsystem: 'entity', event: 'entity.detected', actor: 'SYSTEM',
+            data: { count: toAsk.length, candidates: toAsk.map(c => ({ name: c.name, count: c.count, seenAs: c.seenAs })) },
+        });
+    }
     return toAsk;
 }
 
@@ -334,6 +340,10 @@ export async function showEntityPopup(candidates) {
         </div>`;
 
     popupOpen = true;
+    addDebugLog('info', `Entity popup shown for ${list.length} candidate(s)`, {
+        subsystem: 'entity', event: 'entity.popup', actor: 'SYSTEM',
+        data: { count: list.length, names: list.map(c => c.name) },
+    });
     let decisions = {};
     try {
         const popup = new Popup(html, POPUP_TYPE.TEXT, '', {
@@ -366,6 +376,12 @@ export async function showEntityPopup(candidates) {
     let promoted = 0, markedNpc = 0, deferred = 0;
     for (const [name, choice] of Object.entries(decisions)) {
         try {
+            const reason = choice === 'named' ? 'USER_MARKED_RECURRING'
+                : choice === 'npc' ? 'USER_MARKED_NPC' : 'USER_MARKED_LATER';
+            addDebugLog('info', `Entity decision: "${name}" → ${choice}`, {
+                subsystem: 'entity', event: 'entity.decided', reason, actor: 'USER',
+                data: { name, choice },
+            });
             if (choice === 'named') {
                 setEntityStatus(name, 'named');
                 await promoteEntity(name);
@@ -445,6 +461,7 @@ export async function promoteEntity(name) {
     const databases = await getAllDatabases();
     let moved = 0;
     const touched = new Set();
+    const movedKeys = []; // {category, from, to} for the migration trace
 
     for (const [category, db] of Object.entries(databases)) {
         if (!db || !Array.isArray(db.facts)) continue;
@@ -486,6 +503,7 @@ export async function promoteEntity(name) {
             // mistaken for it (and a same-value collision merges cleanly).
             db.facts = db.facts.filter(f => f !== oldFact);
             upsertFact(db, migrated);
+            movedKeys.push({ category, from: oldFact.key, to: newKey });
             moved++;
         }
         touched.add(category);
@@ -500,6 +518,9 @@ export async function promoteEntity(name) {
         }
     }
 
-    addDebugLog('info', `Character registry: promoted "${display}" → subject "${subjectToken}" (${moved} fact(s) across ${touched.size} db(s))`);
+    addDebugLog('pass', `Character registry: promoted "${display}" → subject "${subjectToken}" (${moved} fact(s) across ${touched.size} db(s))`, {
+        subsystem: 'entity', event: 'entity.promoted', reason: 'USER_MARKED_RECURRING', actor: 'USER',
+        data: { name: display, subject: subjectToken, factsMigrated: moved, dbsTouched: touched.size, movedKeys },
+    });
     return { moved, dbs: touched.size };
 }
