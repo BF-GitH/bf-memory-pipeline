@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, clampImportance, normalizeKind } from './database.js';
+import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, clampImportance, normalizeKind } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -207,6 +207,7 @@ function resolveExactKeys(databases, requests) {
             if (category.toLowerCase() !== reqCat) continue;
             for (const fact of (db.facts || [])) {
                 if (String(fact.key).toLowerCase() !== reqKey) continue;
+                if (!isActiveFact(fact)) continue; // never surface superseded history via exact-key
                 const id = `${category}:${fact.key}`;
                 if (seen.has(id)) continue;
                 seen.add(id);

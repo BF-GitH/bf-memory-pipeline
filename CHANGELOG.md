@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.0] - 2026-05-23
+
+### Added — temporal validity / supersession (memory-research Phase 3)
+When a CHANGEABLE-STATE fact's value genuinely changes, the OLD value is now marked SUPERSEDED (retained as history) rather than silently overwritten — so retrieval surfaces only what's currently true while the timeline stays truthful. Backward-compatible: facts without the new fields behave exactly as before (treated as currently valid).
+
+**Validity representation.** Facts gain optional `active` (absent/`true` => currently valid), plus `supersededAt` (ms, doubles as validTo) and `supersededBy` (history breadcrumb) on the inactive snapshot. `isActiveFact()` is the single filter ([src/database.js](src/database.js)). Chosen for simplicity: retrieval just checks `active !== false`.
+
+**Write path — lightweight, capped.** `upsertFact` now snapshots the OLD value as a retained-but-inactive copy (under a distinct `__was` key so reconcile-on-write never collapses onto it) and advances the canonical fact in place to the new ACTIVE value. Gated by `shouldSupersede`: triggers only for a CHANGEABLE-STATE existing fact (`kind:state`) whose value MATERIALLY changed, or on an explicit Agent-3 signal — durable traits (name/age) keep today's silent in-place correction (a typo fix is not a supersession). Only the SINGLE most-recent snapshot per logical key is retained (older ones pruned) so it never blows the 50-fact cap; track/sequence facts remain append-only and are untouched. ([src/database.js](src/database.js))
+
+**Extraction — optional `~` marker.** Agent 3 may append `| ~` to mark a write as replacing the prior value of a changeable-state fact. Optional: if omitted, supersession is inferred from changed `kind:state`. New grammar marker doesn't collide with `|/@/#/rel:/@src:/>/track:/!N/kind:`. Prompt + the relocation example updated minimally. ([src/agent-memory.js](src/agent-memory.js))
+
+**Retrieval — current-only by default.** `searchFacts`, the relationship-expansion pass, `resolveExactKeys`, the Agent 1 key inventory (`summarizeKeys`), and Agent 3's existing-DB summary all skip superseded facts, so only currently-valid facts are injected/listed. History is retained on disk (and dovetails with the track/diary feature). ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-memory.js](src/agent-memory.js))
+
+**Eviction — history compresses first.** Superseded facts get the lowest salience score (≈ -1, with a tiny recency tiebreak) in `saveDatabase`, so they are the FIRST evicted under the cap — track-step protection unchanged. ([src/database.js](src/database.js))
+
 ## [0.13.0] - 2026-05-23
 
 ### Added — always-on scene card (live core working memory)

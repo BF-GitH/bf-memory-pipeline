@@ -57,6 +57,8 @@ CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY wh
 
 IMPORTANCE + KIND (optional but preferred): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 3 = ordinary, 1 = trivial/passing) and \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Omit if unsure (defaults: !3, kind:trait).
 
+SUPERSEDES (optional): when a write REPLACES the prior value of an existing CHANGEABLE-STATE fact (a status, a current location, a goal now resolved — not a durable trait like a name), append \`| ~\` to mark the old value as ended history while the key becomes the new current truth. Only for \`kind:state\` facts whose value genuinely changed; omit for trait corrections and unchanged re-mentions (the system also infers this for changed kind:state facts, so \`~\` is optional).
+
 SEQUENCE STEPS (optional): for things that form a genuine ORDERED SERIES over time — a character's location changing place to place, plot milestones in order — emit each step as its OWN fact with \`| track:<track_name>\`. Use a stable track name tied to the subject (e.g. \`<char>_location\`). Give each step a numbered key (\`<char>_location_1\`, \`_2\`, ...); do NOT worry about getting the number right — the system assigns the real order. ALSO keep one plain overwriting current-state fact (e.g. \`<char>_location = <current_place>\`, with NO track) so "where are they now" stays a single cheap fact. Only use tracks for real ordered series, never for unrelated facts.
 
 # WRONG → RIGHT (atomic splitting)
@@ -132,10 +134,10 @@ Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too cl
 Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place is wrong."
 
 #MEM
-+ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location
-+ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event
++ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location | kind:state | ~
++ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event | kind:event
 .
-#WHY Same existing key user_location → value OVERWRITES (don't invent a second key). Add History fact for the move event.
+#WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add a History event for the move.
 
 ---
 Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} pretended to already have proof.*
@@ -266,6 +268,9 @@ function summarizeDatabases(databases) {
     const lines = [];
     for (const [category, db] of Object.entries(databases)) {
         for (const fact of db.facts) {
+            // Supersession: don't show Agent 3 the inactive history snapshots — it should
+            // reason against the CURRENT state only (and not try to re-extract stale values).
+            if (fact.active === false) continue;
             const known = fact.knownBy?.length ? ` | @${fact.knownBy.join(',')}` : '';
             const tags = fact.tags?.length ? ` | #${fact.tags.join(',')}` : '';
             lines.push(`${category}/${fact.key} = ${fact.value}${known}${tags}`);
@@ -373,9 +378,20 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let ord = null;     // Feature #4: optional explicit step number (auto-assigned if absent)
         let importance = null; // Salience feature: optional 1-5 (`!N` marker)
         let kind = '';         // Salience feature: optional trait|state|event (`kind:` marker)
+        let supersedes = false; // Supersession feature: optional `~` marker (replaces prior value)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
+
+            // ~ / ~supersedes — OPTIONAL explicit supersession signal (temporal-validity
+            // feature). Means "this write REPLACES the prior value of the same key; mark the
+            // old value as superseded history." `~` was chosen because it does NOT collide
+            // with the existing |/@/#/rel:/@src:/>/track:/!N/kind: grammar. Optional: if
+            // omitted, supersession is still inferred for changed `kind:state` facts.
+            if (/^~\s*(supersedes?)?$/i.test(seg)) {
+                supersedes = true;
+                continue;
+            }
 
             // !N — OPTIONAL importance 1-5 (salience feature). `!` was chosen because it
             // does NOT collide with the existing |/@/#/rel:/@src:/>/track: grammar.
@@ -483,6 +499,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         // facts without them stay lean and fall back to defaults at storage/read time.
         if (Number.isInteger(importance)) update.importance = importance;
         if (kind) update.kind = kind;
+        // Supersession feature: only attach the explicit signal when present (lean / back-compat).
+        if (supersedes) update.supersedes = true;
         result.updates.push(update);
     }
 
@@ -567,6 +585,9 @@ async function applyUpdates(updates, existingDatabases) {
         // importance) and persist them for eviction + retrieval scoring.
         if (Number.isInteger(update.importance)) factToWrite.importance = update.importance;
         if (update.kind) factToWrite.kind = update.kind;
+        // Supersession feature: forward the explicit signal so upsertFact marks the prior
+        // value of a changeable-state fact as superseded history (transient flag, not persisted).
+        if (update.supersedes) factToWrite.supersedes = true;
         upsertFact(db, factToWrite);
         const relCount = update.relationships?.length || 0;
         addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);

@@ -50,6 +50,57 @@ export function normalizeKind(v) {
 }
 
 /**
+ * True when a fact is CURRENTLY valid (supersession feature). A fact is active unless it
+ * has been explicitly superseded (`active === false`). Absent `active` => active, so
+ * every fact written before this feature is treated as currently valid (back-compat).
+ * @param {FactSchema} fact
+ * @returns {boolean}
+ */
+export function isActiveFact(fact) {
+    return !(fact && fact.active === false);
+}
+
+/**
+ * Decide whether an INCOMING write should SUPERSEDE the existing fact it reconciles to
+ * (i.e. mark the old value as ended and record the new current value) rather than just
+ * correct it in place. Supersession is reserved for CHANGEABLE STATE — a status, a
+ * current location/goal that genuinely moved on — so the timeline stays truthful while
+ * durable traits (name/age/species) keep today's silent in-place correction (a typo fix
+ * is NOT a state change). It triggers only when ALL hold:
+ *   - the EXISTING fact is itself a `state` (durable traits are corrected, not superseded),
+ *   - the incoming write does not itself declare a non-state kind (so a write explicitly
+ *     re-typing the fact as a trait is treated as a correction), and
+ *   - the value MATERIALLY changed (a no-op re-mention never supersedes).
+ * An explicit Agent-3 signal (`supersedes:true` on the incoming fact) forces supersession
+ * on a materially-changed value regardless of kind heuristics. Track/sequence facts are
+ * handled separately (append-only) and never reach this path.
+ * @param {FactSchema} existing - the fact being reconciled to
+ * @param {FactSchema} incoming - the new write
+ * @param {boolean} explicitSignal - true when Agent 3 emitted the `~` supersession marker
+ * @returns {boolean}
+ */
+function shouldSupersede(existing, incoming, explicitSignal) {
+    if (!existing || !incoming) return false;
+    // Never supersede when the value is unchanged — that's a pure re-mention/no-op.
+    if (factValuesEqual(existing.value, incoming.value)) return false;
+    // Explicit writer signal wins (still requires a materially-changed value, checked above).
+    if (explicitSignal === true) return true;
+    // Heuristic: only changeable STATE supersedes. Existing must be a state; and if the
+    // incoming write explicitly re-types the fact as a NON-state kind, treat it as a
+    // correction (in-place) rather than a supersession.
+    const existingKind = normalizeKind(existing.kind);
+    if (existingKind !== 'state') return false;
+    const incHasKind = incoming.kind !== undefined && incoming.kind !== null && String(incoming.kind).trim();
+    if (incHasKind && normalizeKind(incoming.kind) !== 'state') return false;
+    return true;
+}
+
+/** Loose value equality (trim + case-insensitive) — mirrors agent-memory's sameValue. */
+function factValuesEqual(a, b) {
+    return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
+}
+
+/**
  * Compute a salience keep-score for a non-sequence fact. Higher = more worth keeping.
  * Blends importance (foundational-ness) with kind-modulated recency decay so durable
  * traits survive even when old, while transient states/events fade fast.
@@ -58,6 +109,15 @@ export function normalizeKind(v) {
  * @returns {number}
  */
 function salienceScore(fact, now) {
+    // Superseded facts (temporal-validity feature) carry the LOWEST salience so they are
+    // evicted FIRST under the cap — history compresses gracefully without crowding out
+    // currently-valid facts. A tiny recency tiebreak keeps the most-recently-superseded
+    // snapshot last to go among the inactive set.
+    if (fact && fact.active === false) {
+        const at = Number(fact.supersededAt) || Number(fact.lastUpdated) || 0;
+        const ageDays = at > 0 ? Math.max(0, (now - at) / 86400000) : 36500;
+        return -1 + Math.pow(0.5, ageDays / 7) * 0.001; // ~ -1, newer-superseded slightly higher
+    }
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
     const last = Number(fact?.lastUpdated) || 0;
@@ -298,6 +358,12 @@ export function createEmptyDatabase(category) {
  * @returns {DatabaseSchema} Updated database
  */
 export function upsertFact(db, fact) {
+    // `supersedes` is a TRANSIENT write-time signal (temporal-validity feature), consumed
+    // by shouldSupersede() below — it must NEVER be persisted onto a stored fact. Read it
+    // off a local copy so the spreads (`...fact`) below can't leak it onto db.facts.
+    const supersedesSignal = fact && fact.supersedes === true;
+    if (fact && 'supersedes' in fact) { fact = { ...fact }; delete fact.supersedes; }
+
     // SEQUENCE FACTS (Feature #4): a fact carrying a `track` is one ordered step in a
     // timeline (e.g. `<char>_location_3`). Each step is its OWN fact — they must NEVER
     // be collapsed by the reconcile-on-write normalize-merge below (which would make
@@ -359,6 +425,44 @@ export function upsertFact(db, fact) {
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
         const sal = mergeSalience(existing, fact);
+
+        // TEMPORAL SUPERSESSION (Phase 3): when a CHANGEABLE-STATE fact's value genuinely
+        // changes (or Agent 3 explicitly signals it), keep history truthful by snapshotting
+        // the OLD value as a retained-but-inactive copy, then advancing the canonical fact
+        // in place to the new ACTIVE value. Durable traits (and no-op re-mentions) keep the
+        // existing silent in-place correction below. We retain only the SINGLE most-recent
+        // superseded snapshot per logical key (older inactive snapshots for the same
+        // normalized key are dropped) so this never blows the fact cap — deeper history is
+        // the job of the track/diary feature, not this lightweight breadcrumb.
+        if (existing.active !== false && shouldSupersede(existing, fact, supersedesSignal)) {
+            const now = Date.now();
+            const snapshotKey = makeSupersededKey(db, existing.key);
+            // Build the inactive history snapshot from the OLD fact's state.
+            const snapshot = {
+                ...existing,
+                key: snapshotKey,
+                active: false,
+                supersededAt: now,
+                supersededBy: existing.key, // in-place: canonical key is unchanged
+            };
+            // Drop any prior superseded snapshot of this same logical key (keep just one).
+            const normCanon = normalizeFactKey(existing.key);
+            db.facts = db.facts.filter(f =>
+                !(f.active === false && f !== existing && normalizeFactKey(stripSupersededSuffix(f.key)) === normCanon));
+            // Re-find the canonical fact (filter may have shifted indices).
+            const canonIdx = db.facts.findIndex(f => f.key === existing.key);
+            db.facts.push(snapshot);
+            // Advance the canonical fact to the new active value, clearing any stale
+            // supersession markers (it's the current truth again).
+            db.facts[canonIdx] = {
+                ...existing, ...fact, key: existing.key, relationships: mergedRels,
+                context: mergedContext, ...sal, active: true,
+                supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
+            };
+            db.updatedAt = now;
+            return db;
+        }
+
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
         db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, ...sal, lastUpdated: Date.now() };
@@ -367,6 +471,32 @@ export function upsertFact(db, fact) {
     }
     db.updatedAt = Date.now();
     return db;
+}
+
+// Suffix appended to a superseded snapshot's key so it (a) stays a distinct fact and
+// (b) normalizes differently from the live canonical key (so reconcile-on-write never
+// collapses a new write onto a history snapshot).
+const SUPERSEDED_SUFFIX = '__was';
+
+/**
+ * Mint a unique key for an inactive history snapshot of `canonicalKey`. Numeric tail keeps
+ * snapshots distinct if more than one ever coexists transiently.
+ * @param {DatabaseSchema} db
+ * @param {string} canonicalKey
+ * @returns {string}
+ */
+function makeSupersededKey(db, canonicalKey) {
+    const base = `${canonicalKey}${SUPERSEDED_SUFFIX}`;
+    let n = 1;
+    let key = `${base}${n}`;
+    const taken = new Set((db.facts || []).map(f => f.key));
+    while (taken.has(key)) { n++; key = `${base}${n}`; }
+    return key;
+}
+
+/** Strip the superseded-snapshot suffix (and its numeric tail) back to the canonical key. */
+function stripSupersededSuffix(key) {
+    return String(key || '').replace(new RegExp(`${SUPERSEDED_SUFFIX}\\d*$`), '');
 }
 
 /**
@@ -547,6 +677,10 @@ export function searchFacts(databases, keywords) {
         const categoryLower = category.toLowerCase();
 
         for (const fact of db.facts) {
+            // Supersession: skip facts whose value has been superseded so retrieval/
+            // injection surfaces only what is CURRENTLY true. History snapshots are
+            // retained on disk (and visible via the track/diary) but never injected here.
+            if (!isActiveFact(fact)) continue;
             const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')}`.toLowerCase();
 
             // Direct keyword match: require phrase-level relevance
@@ -619,6 +753,7 @@ export function searchFacts(databases, keywords) {
         // Search remaining facts for relationship matches
         for (const [category, db] of Object.entries(databases)) {
             for (const fact of db.facts) {
+                if (!isActiveFact(fact)) continue; // never expand into superseded history
                 const id = `${category}:${fact.key}`;
                 if (alreadyFound.has(id)) continue;
 
@@ -657,6 +792,9 @@ export function summarizeKeys(databases) {
     const lines = [];
     for (const [category, db] of Object.entries(databases)) {
         for (const fact of (db.facts || [])) {
+            // Supersession: omit inactive history snapshots from the requestable inventory
+            // so Agent 1 only sees currently-valid keys (and we don't pay tokens for stale ones).
+            if (!isActiveFact(fact)) continue;
             if (fact.key) lines.push(`${category}/${fact.key}`);
         }
     }
@@ -720,6 +858,17 @@ async function deleteAttachmentFile(url) {
  *   (age, name, personality); `state` = current/transient (mood, current goal/location);
  *   `event` = something that happened (often a track step). Default 'trait' when absent
  *   (see DEFAULT_KIND). Modulates how fast a fact decays during eviction.
+ * @property {boolean} [active] - OPTIONAL temporal-validity flag (supersession feature).
+ *   ABSENT or `true` => currently valid (the default for every fact ever written). Set to
+ *   `false` when a later write supersedes this fact's value (a `state` that changed). A
+ *   superseded fact is RETAINED for history but excluded from the normal writer-injection
+ *   path and is the first to be shed under the eviction cap. Backward-compatible: older
+ *   facts have no `active` field and are treated as active.
+ * @property {number} [supersededAt] - OPTIONAL ms timestamp when this fact was superseded
+ *   (i.e. when `active` was set false). Doubles as `validTo`. Absent while active.
+ * @property {string} [supersededBy] - OPTIONAL key of the fact that replaced this value
+ *   (history breadcrumb). For in-place supersession the key is unchanged, so this equals
+ *   the fact's own key. Absent while active.
  */
 
 /**
