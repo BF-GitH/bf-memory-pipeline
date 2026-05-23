@@ -62,6 +62,47 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
 }
 
 /**
+ * FIX #10: Emit a single consolidated per-run SUMMARY debug entry, grouping the
+ * run's outcome under a runId: durations, Agent 1 ok/failed, Agent 3 fact
+ * NEW/UPDATED/SKIPPED counts, and token numbers. mainOutput is usually not known
+ * yet at this point (it lands on MESSAGE_RECEIVED), so it is reported when present.
+ */
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled }) {
+    try {
+        const duration = Date.now() - startTime;
+        const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
+        const updates = Array.isArray(memoryResult?.updates) ? memoryResult.updates : [];
+        const applied = Array.isArray(memoryResult?.applied)
+            ? memoryResult.applied
+            : updates.filter(u => u.changed ?? u.wasNew);
+        let nNew = 0, nUpd = 0, nSkip = 0;
+        for (const u of applied) {
+            const st = (u.status || (u.wasNew ? 'NEW' : 'UPDATED')).toUpperCase();
+            if (st === 'NEW') nNew++;
+            else if (st === 'UPDATED') nUpd++;
+            else if (st === 'SKIPPED') nSkip++;
+        }
+        const a1In = Number(draftResult?.tokensIn) || 0;
+        const a1Out = Number(draftResult?.tokensOut) || 0;
+        const a3In = Number(memoryResult?.tokensIn) || 0;
+        const a3Out = Number(memoryResult?.tokensOut) || 0;
+        const bIn = Number(baselineInput) || 0;
+        const aIn = Number(actualInput) || 0;
+        const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 here
+        const netIn = (aIn + a1In + a3In) - bIn;
+        addDebugLog('info',
+            `[${runId}] SUMMARY ${cancelled ? '(cancelled) ' : ''}` +
+            `dur=${duration}ms | Agent1=${agent1Ok ? 'ok' : 'failed'} | ` +
+            `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} | ` +
+            `tokens: baselineIn=${bIn} actualIn=${aIn} a1(in/out)=${a1In}/${a1Out} ` +
+            `a3(in/out)=${a3In}/${a3Out}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
+        );
+    } catch (err) {
+        addDebugLog('info', `Run summary failed (non-fatal): ${err.message || err}`);
+    }
+}
+
+/**
  * Get recent chat messages
  */
 function getRecentMessages(count) {
@@ -282,6 +323,8 @@ async function runPipelineInline(data) {
     lastTriggeredUserMsgIndex = lastUserMsgIndex;
 
     const startTime = Date.now();
+    // FIX #10: short per-run id to group this run's log entries + the SUMMARY line.
+    const runId = `R${startTime.toString(36).slice(-5)}`;
     const recentMessages = getRecentMessages(settings.agent1ContextMessages || 5);
     if (recentMessages.length === 0) {
         addDebugLog('info', 'No messages in chat, skipping pipeline');
@@ -554,6 +597,7 @@ async function runPipelineInline(data) {
         // Still record the agent token cost (input == baseline since we didn't inject)
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
         recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult, cancelled: true });
         hideWorkingIndicator();
         updateStatus('idle');
         return;
@@ -576,6 +620,8 @@ async function runPipelineInline(data) {
 
     // Record token metrics for the Tokens tab (agent counts come from result objects)
     recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult });
+    // FIX #10: consolidated per-run summary (after token recording — values in scope).
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled: false });
 
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');

@@ -33,7 +33,7 @@ const EXTENSION_NAME = (() => {
 
 let extensionSettings = null;
 let debugLog = [];
-const MAX_DEBUG_ENTRIES = 200;
+const MAX_DEBUG_ENTRIES = 500; // FIX #10: raised from 200 so a long session isn't truncated (still bounded)
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
 let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
@@ -113,7 +113,13 @@ function validateSettings(s) {
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
-    if (typeof s.enabled !== 'boolean')          s.enabled = false;
+    if (typeof s.enabled !== 'boolean') {
+        // FIX #10: log when a coercion silently flips a previously-true enable off.
+        if (s.enabled === true || (s.enabled && s.enabled !== false)) {
+            addDebugLog('fail', `enabled coerced to false (was non-boolean: ${JSON.stringify(s.enabled)})`);
+        }
+        s.enabled = false;
+    }
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
@@ -196,6 +202,29 @@ export function updateStatus(status, message = '') {
 
 const LOG_META_KEY = 'bf_mem_log';
 
+// FIX #8: ctx.saveMetadata() is DEBOUNCED — rapid addDebugLog bursts each schedule
+// a save the next call supersedes, so only entries that happen to coincide with
+// ST's own chat-save reach disk. We add a throttled IMMEDIATE chat save (at most
+// once per LOG_FLUSH_THROTTLE_MS) plus a guaranteed synchronous flush on
+// beforeunload (the primary fix, since reload is exactly when data is lost).
+const LOG_FLUSH_THROTTLE_MS = 5000;
+let lastLogFlushAt = 0;
+
+/** Best-effort immediate (non-debounced) persist of the debug log to chat .jsonl. */
+function flushDebugLogNow() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[LOG_META_KEY] = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+        ctx.saveMetadata?.();
+        // Immediate, non-debounced chat write so the metadata reaches disk.
+        if (typeof ctx.saveChat === 'function') ctx.saveChat();
+        else if (typeof ctx.saveChatConditional === 'function') ctx.saveChatConditional();
+        lastLogFlushAt = Date.now();
+    } catch { /* best-effort */ }
+}
+
 function loadDebugLogFromMeta() {
     try {
         const md = getContext().chatMetadata || getContext().chat_metadata;
@@ -214,6 +243,14 @@ function saveDebugLogToMeta() {
         if (!md) return; // no chat loaded — log lives in-memory only until a chat opens
         md[LOG_META_KEY] = debugLog.slice(0, MAX_DEBUG_ENTRIES);
         ctx.saveMetadata?.();
+        // FIX #8: throttled immediate flush so a burst of entries doesn't all get
+        // lost to the debounce on reload. Bounded to once per LOG_FLUSH_THROTTLE_MS
+        // to avoid thrashing disk; the beforeunload handler guarantees the tail.
+        if (Date.now() - lastLogFlushAt >= LOG_FLUSH_THROTTLE_MS) {
+            if (typeof ctx.saveChat === 'function') ctx.saveChat();
+            else if (typeof ctx.saveChatConditional === 'function') ctx.saveChatConditional();
+            lastLogFlushAt = Date.now();
+        }
     } catch { /* best-effort */ }
 }
 
@@ -869,6 +906,52 @@ export async function saveCurrentToActiveProfile(profileKey = null) {
 }
 
 /**
+ * FIX #9: Cheap client-side filter — returns true for messages that almost
+ * certainly carry zero extractable facts, so the backfill can skip them WITHOUT
+ * spending an LLM call. Conservative on purpose (only obvious no-ops):
+ *   - empty / whitespace-only
+ *   - very short (< 15 visible chars after stripping markup) — greetings,
+ *     "ok", "*nods*", emoji, etc.
+ *   - pure OOC lines: every non-empty line wrapped in (( )) or prefixed OOC:
+ */
+function isTriviallyEmptyForExtraction(mes) {
+    const raw = String(mes ?? '');
+    // Strip simple action-asterisks and collapse whitespace for the length test.
+    const visible = raw.replace(/\*/g, '').replace(/\s+/g, ' ').trim();
+    if (visible.length === 0) return true;
+    if (visible.length < 15) return true;
+
+    // Pure OOC: all non-blank lines are out-of-character chatter.
+    const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length > 0) {
+        const allOoc = lines.every(l =>
+            /^\(\(.*\)\)$/.test(l) || /^ooc\b/i.test(l) || /^\[ooc/i.test(l));
+        if (allOoc) return true;
+    }
+    return false;
+}
+
+/**
+ * FIX #9: Estimate how many LLM calls a backfill will make, so the confirm
+ * dialog can warn the user about cost up front. Mirrors the skip logic in
+ * runAgent3OnFullChat WITHOUT making any calls.
+ */
+export function estimateFullChatCalls({ skipAlreadyProcessed = true } = {}) {
+    const ctx = getContext();
+    const chat = ctx.chat || [];
+    let calls = 0;
+    for (const msg of chat) {
+        if (!msg || !msg.mes) continue;
+        if (msg.is_system) continue;
+        if (msg.extra?.type) continue;
+        if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) continue;
+        if (isTriviallyEmptyForExtraction(msg.mes)) continue;
+        calls++;
+    }
+    return { calls, total: chat.length };
+}
+
+/**
  * Process every message in the current chat through Agent 3 sequentially.
  * Used by the "Run on current chat" button — for users who installed the
  * extension after their chat was already going.
@@ -906,6 +989,10 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
 
     let processed = 0, skipped = 0, factsAdded = 0;
     const total = chat.length;
+    // FIX #7: accumulate proposed + committed facts so the Last Generated /
+    // Last Inserted tabs reflect what THIS backfill produced (mirrors pipeline.js).
+    const allUpdates = [];
+    const allApplied = [];
 
     for (let i = 0; i < chat.length; i++) {
         if (shouldCancel?.()) {
@@ -916,7 +1003,17 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
         if (!msg || !msg.mes) { skipped++; continue; }
         if (msg.is_system) { skipped++; continue; }
         if (msg.extra?.type) { skipped++; continue; }
+        // FIX #9: skip already-processed BEFORE spending an LLM call (short-circuit,
+        // not just tally). On by default via skipAlreadyProcessed.
         if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; continue; }
+        // FIX #9: client-side pre-filter of trivially-empty messages so we don't burn
+        // a ~1200-token call on content the prompt would return zero facts for anyway.
+        if (isTriviallyEmptyForExtraction(msg.mes)) {
+            skipped++;
+            // Still mark processed so a re-run doesn't re-evaluate the same dead message.
+            msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
+            continue;
+        }
 
         try {
             const databases = await getAllDatabases();
@@ -932,6 +1029,9 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
             );
             const n = result?.updates?.length || 0;
             factsAdded += n;
+            if (Array.isArray(result?.updates)) allUpdates.push(...result.updates);
+            // .applied = committed/changed subset (NEW/UPDATED/SKIPPED), like pipeline.js
+            if (Array.isArray(result?.applied)) allApplied.push(...result.applied);
             msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
             processed++;
             onProgress?.({ current: i + 1, total, factsAdded });
@@ -940,6 +1040,11 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
             addDebugLog('fail', `Full-chat: msg ${i + 1} failed: ${err.message || err}`);
         }
     }
+
+    // FIX #7: surface this backfill's results in the Generated / Inserted panels.
+    // Replace (not append) so the tabs show what this backfill produced.
+    setLastGenerated(allUpdates);
+    setLastInserted(allApplied);
 
     // Persist chat (the extra.bf_mem_processed flags) + active DB profile
     ctx.saveChatDebounced?.();
@@ -1136,13 +1241,16 @@ export async function initSettings() {
 
     // Load saved settings (guard against null, arrays, primitives, or corrupted blobs)
     if (!context.extensionSettings) context.extensionSettings = {};
+    let resetClobberedEnabled = false; // FIX #10: track if a reset flipped enabled true->false
     try {
         const current = context.extensionSettings[EXTENSION_NAME];
         if (!current || typeof current !== 'object' || Array.isArray(current)) {
+            if (current && typeof current === 'object' && current.enabled === true) resetClobberedEnabled = true;
             context.extensionSettings[EXTENSION_NAME] = structuredClone(DEFAULT_SETTINGS);
         }
     } catch (err) {
         console.error('[BFMemory] corrupt settings, resetting:', err);
+        try { if (context.extensionSettings?.[EXTENSION_NAME]?.enabled === true) resetClobberedEnabled = true; } catch { /* ignore */ }
         context.extensionSettings[EXTENSION_NAME] = structuredClone(DEFAULT_SETTINGS);
         if (typeof toastr !== 'undefined') {
             toastr.warning('BF Memory settings were corrupt and have been reset.');
@@ -1162,6 +1270,11 @@ export async function initSettings() {
 
     // Type-coerce and clamp values (defends against persisted garbage)
     validateSettings(extensionSettings);
+
+    // FIX #10: log if a corrupt-settings reset silently turned the pipeline off.
+    if (resetClobberedEnabled && !extensionSettings.enabled) {
+        addDebugLog('fail', 'Pipeline DISABLED by corrupt-settings reset (was enabled before reset)');
+    }
 
     // Load HTML template
     let path = `scripts/extensions/third-party/${EXTENSION_NAME}`;
@@ -1197,7 +1310,12 @@ export async function initSettings() {
 
     // --- Pipeline Tab ---
     $('#bf_mem_enabled').prop('checked', extensionSettings.enabled).on('change', function () {
-        extensionSettings.enabled = $(this).prop('checked');
+        const next = $(this).prop('checked');
+        // FIX #10: log enable/disable state changes.
+        if (next !== extensionSettings.enabled) {
+            addDebugLog('info', `Pipeline ${next ? 'ENABLED' : 'DISABLED'} by user`);
+        }
+        extensionSettings.enabled = next;
         updateStatus('idle');
         saveSettings();
     });
@@ -1408,11 +1526,17 @@ export async function initSettings() {
     // --- Run Agent 3 on full chat (retroactive extraction) ---
     let fullChatCancel = false;
     $('#bf_mem_run_full_chat').on('click', async () => {
-        if (!confirm('Run Agent 3 on every message in this chat? This can be slow and costs LLM tokens per message.')) return;
+        const skipDone = $('#bf_mem_skip_processed').is(':checked');
+        // FIX #9: estimate LLM calls (post-skip, post-prefilter) so the user sees cost.
+        const { calls, total } = estimateFullChatCalls({ skipAlreadyProcessed: skipDone });
+        if (calls === 0) {
+            toastr.info(`Nothing to process: all ${total} message(s) are already done or trivially empty.`, 'BF Memory');
+            return;
+        }
+        if (!confirm(`Run Agent 3 on this chat?\n\nThis will make ~${calls} LLM call(s) (one per eligible message, out of ${total} total). Each call costs tokens. Already-processed and trivially-empty messages are skipped.\n\nProceed?`)) return;
         const btn = $('#bf_mem_run_full_chat');
         const progress = $('#bf_mem_full_chat_progress');
         const cancelBtn = $('#bf_mem_run_full_chat_cancel');
-        const skipDone = $('#bf_mem_skip_processed').is(':checked');
 
         fullChatCancel = false;
         btn.prop('disabled', true).text('Running...');
@@ -1534,6 +1658,10 @@ export async function initSettings() {
             // Can't do async here, but saveSettings is synchronous (debounced flush)
             saveSettings();
         }
+        // FIX #8: guarantee the debug log reaches disk before reload. saveMetadata()
+        // is debounced, so a synchronous immediate chat save here is the primary fix —
+        // reload is exactly when the buffered entries would otherwise be lost.
+        flushDebugLogNow();
     });
 
     // Note: removed MESSAGE_RECEIVED → saveCurrentToActiveProfile() handler.
