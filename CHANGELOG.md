@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.21.0] - 2026-05-24
+
+### Added — comprehensive debug logging + queryable Debug tab (Phase 8)
+The flat, lossy text log became a structured, run-grouped, before→after audit trail that answers "what ran when, what changed, why" — without bloating `chat_metadata` or breaking the existing readers. Entirely additive: every entry still carries the legacy `{type, message, timestamp}` keys, so the old Copy export and persisted-log shape-check keep working.
+
+**Structured entry schema (Phase 8a — logging core).** Each log entry gains `level` (5-value superset of the 3-value `type`), `subsystem`, `runId`, `event` (dotted machine key), `data` blob, `reason` code, `before`/`after`, plus `seq`/`ts`/`iso` for stable, machine-parseable ordering. `addDebugLog` stays backward-compatible (2-arg legacy form still valid; new `opts` object is optional), with a RAM ring buffer (`MAX_DEBUG_ENTRIES_MEM = 2000`, drop-oldest) and a separate verbose-stripped, byte-budgeted persisted slice (`MAX_DEBUG_ENTRIES_PERSIST`). Old persisted logs back-fill `level`/`subsystem`/`ts` and parse a leading `[Rxxxx]` prefix so they still group. ([src/settings.js](src/settings.js))
+
+**Instrumented ~135 events across subsystems (Phase 8b).** Pipeline, agents 1/3, finder, retrieval, db, entity, and reflection now emit structured events. Previously **silent fact mutations** (new/updated/superseded/skipped/evicted/deleted) are logged with compact `before → after` diffs and `reason` codes. Retrieval emits an **admission + exclusion ledger** answering why each fact was or wasn't used, with an on-demand `explainFactRetrieval(key)` "why not?" probe. Each turn shares ONE `runId` across the pre-reply and post-reply boundary, ending in a single `run.summary` event (duration, per-agent status, fact counts, token accounting). Cache-eligibility is logged honestly (client `cache_control` is stripped server-side). ([src/pipeline.js](src/pipeline.js), [src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-memory.js](src/agent-memory.js), [src/agent-reflect.js](src/agent-reflect.js), [src/agent-entities.js](src/agent-entities.js))
+
+**Debug tab UI (Phase 8c).** ([templates/settings.html](templates/settings.html), [src/settings.js](src/settings.js), [style.css](style.css))
+- **Per-run grouping.** Entries collapse into one `<details>` block per `runId` (newest first, collapsed by default), with the `run.summary` rendered as a compact header (e.g. `Run R3f2 · 320ms · A1✓ A3✓ · facts 3N/1U/0S · +4.1k tok`). Run-less entries collect under an "Ungrouped / manual" section.
+- **Filter toolbar.** Level checkboxes (fail/pass/info default-on, debug/verbose opt-in), a subsystem dropdown, and a runId/text search — all pure client-side passes over the in-memory buffer, re-rendering on change, with a live `showing N / total` count. Entries are color-coded by level.
+- **Verbose toggle.** A clearly-labeled checkbox bound to the `debugVerbose` setting — when off, verbose entries are dropped at ingestion (RAM-only firehose, never persisted) and the verbose display checkbox greys out.
+- **JSON export.** A new "Export JSON" button downloads + copies the full ring buffer via `exportLogsJSON()`; the existing text Copy/Clear buttons are unchanged.
+- **"Why not?" probe.** A small input + button calls `explainFactRetrieval(key)` and shows the fact's fate inline.
+
 ## [0.20.0] - 2026-05-23
 
 ### Changed — token-cost savings (after a 3-agent overspend audit)

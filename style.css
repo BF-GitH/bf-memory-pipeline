@@ -317,7 +317,90 @@
 .bf-mem-debug-entry.info { color: #aaa; }
 .bf-mem-debug-entry.pass { color: #4caf50; }
 .bf-mem-debug-entry.fail { color: #f44336; }
+.bf-mem-debug-entry.debug { color: #6a8caf; }
+.bf-mem-debug-entry.verbose { color: #777; }
 .bf-mem-log-time { color: #555; }
+.bf-mem-log-sub { color: #7bb3ff; opacity: 0.8; }
+
+/* Debug filter toolbar */
+.bf-mem-debug-filters {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 8px 0;
+}
+.bf-mem-debug-levels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 10px;
+    align-items: center;
+}
+.bf-mem-debug-levels .checkbox_label {
+    font-family: monospace;
+    font-size: 11px;
+}
+.bf-mem-debug-filter-row {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.bf-mem-debug-filter-row #bf_mem_log_subsystem { flex: 0 0 auto; }
+.bf-mem-debug-filter-row #bf_mem_log_search { flex: 1 1 140px; min-width: 120px; }
+.bf-mem-disabled { opacity: 0.4; }
+.bf-mem-lv-fail { color: #f44336; }
+.bf-mem-lv-pass { color: #4caf50; }
+.bf-mem-lv-info { color: #aaa; }
+.bf-mem-lv-debug { color: #6a8caf; }
+.bf-mem-lv-verbose { color: #777; }
+.bf-mem-log-count {
+    margin-left: auto;
+    align-self: center;
+    font-size: 11px;
+    color: #888;
+}
+
+/* "Why not?" probe */
+.bf-mem-debug-probe {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 6px 0;
+}
+.bf-mem-debug-probe #bf_mem_probe_key { flex: 1 1 160px; min-width: 120px; }
+.bf-mem-probe-result {
+    flex: 1 1 100%;
+    font-family: monospace;
+    font-size: 11px;
+    color: #aaa;
+    word-break: break-word;
+}
+.bf-mem-probe-reason { font-weight: bold; }
+.bf-mem-probe-reason.found { color: #4caf50; }
+.bf-mem-probe-reason.missing { color: #f0a020; }
+.bf-mem-probe-detail { color: #888; }
+
+/* Run grouping */
+.bf-mem-run-group {
+    border-left: 3px solid #444;
+    margin: 4px 0;
+    background: rgba(255, 255, 255, 0.02);
+}
+.bf-mem-run-group.pass { border-left-color: #4caf50; }
+.bf-mem-run-group.fail { border-left-color: #f44336; }
+.bf-mem-run-group.ungrouped { border-left-color: #6a6a6a; }
+.bf-mem-run-group > summary {
+    cursor: pointer;
+    padding: 4px 6px;
+    font-weight: bold;
+    color: #cfd8e0;
+    user-select: none;
+}
+.bf-mem-run-group > summary:hover { background: rgba(255, 255, 255, 0.04); }
+.bf-mem-run-count { font-weight: normal; color: #888; }
+.bf-mem-run-body { padding: 0 6px 4px 12px; }
+.bf-mem-fact-diff .bf-mem-diff-before { color: #f44336; }
+.bf-mem-fact-diff .bf-mem-diff-after { color: #4caf50; }
 
 /* Review Popup */
 #bf_mem_review_overlay {

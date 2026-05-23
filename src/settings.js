@@ -11,6 +11,7 @@ import {
     getEntities, setEntityStatus, reloadEntitiesFromChat,
     scanForNamedCandidates, showEntityPopup, promoteEntity,
 } from './agent-entities.js';
+import { explainFactRetrieval } from './fact-retrieval.js';
 
 let Popup, POPUP_TYPE;
 async function ensurePopup() {
@@ -556,18 +557,154 @@ export function addDebugLog(type, message, opts = {}) {
     }
 }
 
+// --- Debug-log filter state (client-side over the in-memory ring buffer) ---
+// Level checkboxes default to fail+pass+info; debug/verbose opt-in. The verbose level is
+// further gated by the debugVerbose SETTING (capture-side) — when off, verbose entries
+// never enter the buffer regardless of this display filter.
+const DEFAULT_LOG_LEVEL_FILTER = new Set(['fail', 'pass', 'info']);
+let logLevelFilter = new Set(DEFAULT_LOG_LEVEL_FILTER);
+let logSubsystemFilter = '';
+let logSearchFilter = '';
+
+/** Read the current filter UI into module state (no-op when the controls aren't mounted). */
+function syncLogFilterFromUI() {
+    const boxes = document.querySelectorAll('.bf-mem-log-level');
+    if (boxes.length) {
+        logLevelFilter = new Set();
+        boxes.forEach(b => { if (b.checked) logLevelFilter.add(b.value); });
+    }
+    const sub = document.getElementById('bf_mem_log_subsystem');
+    if (sub) logSubsystemFilter = sub.value || '';
+    const search = document.getElementById('bf_mem_log_search');
+    if (search) logSearchFilter = (search.value || '').trim().toLowerCase();
+}
+
+/** True if an entry passes the active level/subsystem/text filters. */
+function entryMatchesFilter(entry) {
+    const level = entry.level || entry.type || 'info';
+    if (logLevelFilter.size && !logLevelFilter.has(level)) return false;
+    if (logSubsystemFilter && (entry.subsystem || 'settings') !== logSubsystemFilter) return false;
+    if (logSearchFilter) {
+        const hay = (
+            (entry.message || '') + ' ' +
+            (entry.runId || '') + ' ' +
+            (entry.event || '') + ' ' +
+            (entry.subsystem || '') + ' ' +
+            (entry.data != null ? safeStringify(entry.data) : '')
+        ).toLowerCase();
+        if (!hay.includes(logSearchFilter)) return false;
+    }
+    return true;
+}
+
+function safeStringify(v) {
+    try { return JSON.stringify(v); } catch { return String(v); }
+}
+
+/** Compact human header for a run, derived from its run.summary entry's `data` blob. */
+function formatRunSummary(runId, summaryEntry) {
+    const shortId = runId || '(run)';
+    if (!summaryEntry || !summaryEntry.data) {
+        return `Run ${shortId}`;
+    }
+    const d = summaryEntry.data;
+    const parts = [`Run ${shortId}`];
+    if (Number.isFinite(d.durationMs)) parts.push(`${d.durationMs}ms`);
+    if (d.agents) {
+        const mark = (s) => s === 'ok' ? '✓' : s === 'failed' ? '✗' : s === 'skipped' ? '–' : '?';
+        const ag = [];
+        if (d.agents.agent1) ag.push(`A1${mark(d.agents.agent1)}`);
+        if (d.agents.agent3) ag.push(`A3${mark(d.agents.agent3)}`);
+        if (ag.length) parts.push(ag.join(' '));
+    }
+    if (d.facts) {
+        const f = d.facts;
+        const fstr = `facts ${f.NEW ?? 0}N/${f.UPDATED ?? 0}U/${f.SKIPPED ?? 0}S` +
+            (f.EVICTED ? `/${f.EVICTED}E` : '');
+        parts.push(fstr);
+    }
+    if (d.tokens && Number.isFinite(d.tokens.netIn)) {
+        const n = d.tokens.netIn;
+        const tok = Math.abs(n) >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+        parts.push(`${n >= 0 ? '+' : ''}${tok} tok`);
+    }
+    if (d.cancelled) parts.push('CANCELLED');
+    return parts.join(' · ');
+}
+
+/** Render one entry as an HTML string (shared by flat + grouped paths). */
+function renderEntryHtml(entry) {
+    const level = entry.level || entry.type || 'info';
+    const meta = [];
+    if (entry.subsystem && entry.subsystem !== 'settings') meta.push(escapeHtml(entry.subsystem));
+    const metaHtml = meta.length ? `<span class="bf-mem-log-sub">${meta.join(' ')}</span> ` : '';
+    return `
+        <div class="bf-mem-debug-entry ${escapeHtml(level)}" data-event="${escapeHtml(entry.event || '')}" data-run="${escapeHtml(entry.runId || '')}">
+            <span class="bf-mem-log-time">[${escapeHtml(entry.timestamp)}]</span> ${metaHtml}${escapeHtml(entry.message).replace(/\n/g, '<br>')}
+        </div>`;
+}
+
 function renderDebugLog() {
     const container = document.getElementById('bf_mem_debug_log');
     if (!container) return;
 
-    // Use the 5-value `level` for the CSS class when present (debug/verbose tinting), falling
-    // back to the legacy 3-value `type` for old persisted entries. The flat render is preserved
-    // (group/filter UI is a later phase); both classes keep the existing .info/.pass/.fail CSS.
-    container.innerHTML = debugLog.map(entry => `
-        <div class="bf-mem-debug-entry ${entry.level || entry.type}">
-            <span class="bf-mem-log-time">[${entry.timestamp}]</span> ${escapeHtml(entry.message).replace(/\n/g, '<br>')}
-        </div>
-    `).join('');
+    syncLogFilterFromUI();
+
+    const total = debugLog.length;
+    const visible = debugLog.filter(entryMatchesFilter);
+
+    // Group visible entries by runId, newest run first. The ring buffer is already
+    // newest-first, so the first time we see a runId fixes its display order. Entries with
+    // no runId collect under a synthetic "Ungrouped / manual" block at the end.
+    const order = [];
+    const groups = new Map(); // runId -> entries[]
+    const ungrouped = [];
+    for (const e of visible) {
+        const rid = e.runId;
+        if (!rid) { ungrouped.push(e); continue; }
+        if (!groups.has(rid)) { groups.set(rid, []); order.push(rid); }
+        groups.get(rid).push(e);
+    }
+
+    // Map each runId to its summary entry (search the FULL buffer, not just the visible
+    // slice, so a filtered-out summary still drives the header). Within a run, summary is
+    // typically present once; fall back to a generic header when absent.
+    const summaryByRun = new Map();
+    for (const e of debugLog) {
+        if (e.runId && e.event === 'run.summary' && !summaryByRun.has(e.runId)) {
+            summaryByRun.set(e.runId, e);
+        }
+    }
+
+    const blocks = [];
+    for (const rid of order) {
+        const entries = groups.get(rid);
+        const summary = summaryByRun.get(rid);
+        const headerLevel = (summary && (summary.level || summary.type)) || 'info';
+        const header = escapeHtml(formatRunSummary(rid, summary));
+        const body = entries.map(renderEntryHtml).join('');
+        blocks.push(
+            `<details class="bf-mem-run-group ${escapeHtml(headerLevel)}">` +
+            `<summary>${header} <span class="bf-mem-run-count">(${entries.length})</span></summary>` +
+            `<div class="bf-mem-run-body">${body}</div>` +
+            `</details>`,
+        );
+    }
+    if (ungrouped.length) {
+        const body = ungrouped.map(renderEntryHtml).join('');
+        blocks.push(
+            `<details class="bf-mem-run-group ungrouped" open>` +
+            `<summary>Ungrouped / manual <span class="bf-mem-run-count">(${ungrouped.length})</span></summary>` +
+            `<div class="bf-mem-run-body">${body}</div>` +
+            `</details>`,
+        );
+    }
+
+    container.innerHTML = blocks.join('') ||
+        '<div class="bf-mem-summary-empty">No log entries match the current filter.</div>';
+
+    const countEl = document.getElementById('bf_mem_log_count');
+    if (countEl) countEl.textContent = `showing ${visible.length} / ${total}`;
 }
 
 // --- Last Generated / Last Inserted Facts (replaces old Summary tab) ---
@@ -2375,19 +2512,80 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Verbose tier toggle (opt-in firehose). The control markup lands in a later UI phase;
-    // wiring it now is a no-op when the element is absent. When OFF, addDebugLog drops
-    // level:'verbose' at ingestion (see addDebugLog) — this is the volume control.
+    // Verbose tier toggle (opt-in firehose). When OFF, addDebugLog drops level:'verbose'
+    // at INGESTION (see addDebugLog) — this is the capture-side volume control, not just a
+    // display filter. Greys out the verbose display checkbox to match (nothing to show).
+    const syncVerboseLevelControl = () => {
+        const on = !!extensionSettings.debugVerbose;
+        const vbox = document.querySelector('.bf-mem-log-level[value="verbose"]');
+        const wrap = document.getElementById('bf_mem_log_level_verbose_wrap');
+        if (vbox) { vbox.disabled = !on; if (!on) vbox.checked = false; }
+        if (wrap) wrap.classList.toggle('bf-mem-disabled', !on);
+    };
     $('#bf_mem_debug_verbose').prop('checked', extensionSettings.debugVerbose).on('change', function () {
         extensionSettings.debugVerbose = $(this).prop('checked');
         saveSettings();
+        syncVerboseLevelControl();
+        renderDebugLog();
     });
+    syncVerboseLevelControl();
+
+    // Filter toolbar: pure client-side re-render over the in-memory buffer on any change.
+    $(document).on('change', '.bf-mem-log-level', () => renderDebugLog());
+    $('#bf_mem_log_subsystem').on('change', () => renderDebugLog());
+    $('#bf_mem_log_search').on('input', () => renderDebugLog());
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];
         saveDebugLogToMeta(); // also clear the persistent copy
         renderDebugLog();
     });
+
+    // Export the full RAM ring buffer as machine-readable JSON. Mirrors the Copy button's
+    // clipboard-with-mobile-fallback pattern, plus a file download.
+    $('#bf_mem_export_json').on('click', async () => {
+        const json = exportLogsJSON();
+        let chatId = 'log';
+        try { chatId = String(getContext().chatId ?? 'log'); } catch { /* no chat */ }
+        const fname = `bf-mem-log-${chatId}-${Date.now()}.json`;
+        // Download as a file.
+        try {
+            const blob = new Blob([json], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url; a.download = fname;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+        } catch { /* download best-effort */ }
+        // Also copy to clipboard for convenience.
+        try {
+            await navigator.clipboard.writeText(json);
+            toastr.success(`Log JSON downloaded + copied (${debugLog.length} entries)`, 'BF Memory');
+        } catch {
+            toastr.success(`Log JSON downloaded (${debugLog.length} entries)`, 'BF Memory');
+        }
+    });
+
+    // "Why not fact X?" retrieval probe — explains a single fact's fate this turn.
+    const runProbe = async () => {
+        const input = document.getElementById('bf_mem_probe_key');
+        const out = document.getElementById('bf_mem_probe_result');
+        if (!out) return;
+        const key = (input?.value || '').trim();
+        if (!key) { out.textContent = 'Enter a fact key (e.g. Status/location) to probe.'; return; }
+        out.textContent = 'Checking…';
+        try {
+            const res = await explainFactRetrieval(key);
+            const detail = res.detail ? safeStringify(res.detail) : '';
+            out.innerHTML =
+                `<span class="bf-mem-probe-reason ${res.found ? 'found' : 'missing'}">${escapeHtml(res.reason || 'unknown')}</span> ` +
+                `<span class="bf-mem-probe-detail">${escapeHtml(detail)}</span>`;
+        } catch (err) {
+            out.textContent = `Probe failed: ${err?.message || err}`;
+        }
+    };
+    $('#bf_mem_probe_btn').on('click', runProbe);
+    $('#bf_mem_probe_key').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); runProbe(); } });
 
     $('#bf_mem_copy_log').on('click', async () => {
         const logText = exportLogs();

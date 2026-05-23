@@ -475,6 +475,39 @@
                             <input type="checkbox" id="bf_mem_debug" />
                             <span>Enable debug logging</span>
                         </label>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_debug_verbose" />
+                            <span>Verbose logging (RAM only, heavy) &mdash; captures raw prompts/replies</span>
+                        </label>
+
+                        <!-- Filter toolbar: client-side over the in-memory ring buffer -->
+                        <div class="bf-mem-debug-filters">
+                            <div class="bf-mem-debug-levels">
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="fail" checked /><span class="bf-mem-lv-fail">fail</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="pass" checked /><span class="bf-mem-lv-pass">pass</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="info" checked /><span class="bf-mem-lv-info">info</span></label>
+                                <label class="checkbox_label"><input type="checkbox" class="bf-mem-log-level" value="debug" /><span class="bf-mem-lv-debug">debug</span></label>
+                                <label class="checkbox_label" id="bf_mem_log_level_verbose_wrap"><input type="checkbox" class="bf-mem-log-level" value="verbose" /><span class="bf-mem-lv-verbose">verbose</span></label>
+                            </div>
+                            <div class="bf-mem-debug-filter-row">
+                                <select id="bf_mem_log_subsystem" class="text_pole">
+                                    <option value="">All subsystems</option>
+                                    <option value="pipeline">pipeline</option>
+                                    <option value="agent1">agent1</option>
+                                    <option value="agent3">agent3</option>
+                                    <option value="finder">finder</option>
+                                    <option value="retrieval">retrieval</option>
+                                    <option value="db">db</option>
+                                    <option value="entity">entity</option>
+                                    <option value="reflection">reflection</option>
+                                    <option value="settings">settings</option>
+                                    <option value="import">import</option>
+                                    <option value="cache">cache</option>
+                                </select>
+                                <input type="search" id="bf_mem_log_search" class="text_pole" placeholder="Search runId / text&hellip;" />
+                            </div>
+                        </div>
+
                         <div class="bf-mem-debug-actions">
                             <button id="bf_mem_clear_log" class="menu_button">
                                 <i class="fa-solid fa-eraser"></i> Clear
@@ -482,7 +515,21 @@
                             <button id="bf_mem_copy_log" class="menu_button">
                                 <i class="fa-solid fa-copy"></i> Copy
                             </button>
+                            <button id="bf_mem_export_json" class="menu_button">
+                                <i class="fa-solid fa-file-code"></i> Export JSON
+                            </button>
+                            <span id="bf_mem_log_count" class="bf-mem-log-count"></span>
                         </div>
+
+                        <!-- "Why not fact X?" retrieval probe -->
+                        <div class="bf-mem-debug-probe">
+                            <input type="text" id="bf_mem_probe_key" class="text_pole" placeholder="Category/key or key&hellip;" />
+                            <button id="bf_mem_probe_btn" class="menu_button" title="Explain why a fact was / wasn't retrieved">
+                                <i class="fa-solid fa-magnifying-glass"></i> Why not?
+                            </button>
+                            <div id="bf_mem_probe_result" class="bf-mem-probe-result"></div>
+                        </div>
+
                         <div id="bf_mem_debug_log" class="bf-mem-debug-log"></div>
                     </div>
                 </div>
