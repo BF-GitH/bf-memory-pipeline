@@ -49,6 +49,55 @@ export function normalizeKind(v) {
     return VALID_KINDS.has(k) ? k : DEFAULT_KIND;
 }
 
+// Scope feature: a fact's recall axis — does it stick to a PERSON (traits/state/behavior),
+// a PLACE/world thing (recalled when the location matters even if its owner is absent), or
+// an EVENT (something that happened, anchored to place + people + time). Optional; when a
+// fact lacks it we INFER deterministically from category/track (see deriveScope).
+const VALID_SCOPES = new Set(['character', 'place', 'event']);
+
+// Shared "drawer" subject for unnamed/incidental people (NPC feature). Facts about a one-off
+// or unnamed person route here so they don't mint a fresh subject per walk-on; the provisional
+// name/descriptor is retained on the fact (involved/about) for a later promotion step.
+export const NPC_SUBJECT = 'npc';
+
+/**
+ * Normalize a scope to one of character|place|event, or '' when absent/invalid (so callers
+ * can fall back to inference). Lowercased, trimmed.
+ * @param {*} v
+ * @returns {('character'|'place'|'event'|'')}
+ */
+export function normalizeScope(v) {
+    const s = String(v || '').trim().toLowerCase();
+    return VALID_SCOPES.has(s) ? s : '';
+}
+
+/**
+ * Resolve a fact's scope (scope feature). Prefers an explicit `scope` field (emitted by
+ * Agent 3 via the `scope:` marker); otherwise INFERS deterministically from category +
+ * track/sequence:
+ *   - track/sequence step           -> event
+ *   - History                       -> event
+ *   - World                         -> place
+ *   - Status                        -> character (current state of someone) unless its
+ *                                      subject clearly names a place (handled by callers via
+ *                                      explicit scope/subj; here Status defaults to character)
+ *   - Identity/Behavior/Relationships/Unsorted/other -> character
+ * Back-compat: facts written before this feature have no `scope` and resolve via inference.
+ * @param {FactSchema} fact
+ * @returns {('character'|'place'|'event')}
+ */
+export function deriveScope(fact) {
+    const explicit = normalizeScope(fact?.scope);
+    if (explicit) return explicit;
+    if (isSequenceFact(fact)) return 'event';
+    switch (String(fact?.category || '').toLowerCase()) {
+        case 'history': return 'event';
+        case 'world': return 'place';
+        case 'status': return 'character';
+        default: return 'character';
+    }
+}
+
 /**
  * True when a fact is CURRENTLY valid (supersession feature). A fact is active unless it
  * has been explicitly superseded (`active === false`). Absent `active` => active, so
@@ -389,8 +438,9 @@ export function upsertFact(db, fact) {
             const mergedRels = mergeRelationships(existing.relationships, seqFact.relationships);
             const mergedContext = mergeContext(existing.context, seqFact.context);
             const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
+            const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
             const sal = mergeSalience(existing, seqFact);
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, ...sal, lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
         } else {
             db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
         }
@@ -444,6 +494,8 @@ export function upsertFact(db, fact) {
         // Layer A: union aliases (dedupe) so re-mentions accumulate nicknames/descriptors
         // rather than overwrite. Match-only — never shown to the writer.
         const mergedAliases = mergeAliases(existing.aliases, fact.aliases);
+        // Involved feature: union participants so a bare re-mention can't wipe a prior list.
+        const mergedInvolved = mergeInvolved(existing.involved, fact.involved);
         // Merge salience: keep the HIGHER importance (a fact only grows more foundational
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
@@ -479,7 +531,7 @@ export function upsertFact(db, fact) {
             // supersession markers (it's the current truth again).
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, ...sal, active: true,
+                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, active: true,
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
             };
             db.updatedAt = now;
@@ -488,7 +540,7 @@ export function upsertFact(db, fact) {
 
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, ...sal, lastUpdated: Date.now() };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
     } else {
         db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
     }
@@ -526,8 +578,16 @@ function stripSupersededSuffix(key) {
  * Derive the SUBJECT axis of a fact (the who/what it is about) — feature: subject axis.
  * Prefers an explicit `subject` field (emitted by Agent 3 via the `subj:` marker); falls
  * back deterministically to the token before the first underscore in the key
- * (`felix_apartment_bed` -> `felix`). Returns '' when neither is derivable. Lowercased,
+ * (`<NAME>_<PLACE>_<OBJECT>` -> `<NAME>`). Returns '' when neither is derivable. Lowercased,
  * trimmed. Back-compat: facts with no `subject` field still resolve via the key prefix.
+ *
+ * PLACE-FILING FIX (scope feature): for a `scope:place` fact the SUBJECT must be the PLACE,
+ * not the owning character — otherwise a key like `<NAME>_<PLACE>` files the location under
+ * the character and it can't be recalled when the owner is absent. So when a fact resolves to
+ * scope `place` we PREFER its explicit `subject` (the place, which Agent 3 supplies via
+ * `subj:`); only if no explicit subject was given do we fall back to the SECOND key token
+ * (`<NAME>_<PLACE>...` -> `<PLACE>`), and finally the first token. Character-scope derivation
+ * is unchanged (first token / explicit subject), so existing facts are unaffected.
  * @param {FactSchema} fact
  * @returns {string}
  */
@@ -537,6 +597,13 @@ export function deriveSubject(fact) {
     if (explicit) return explicit;
     const key = String(fact.key || '').trim().toLowerCase();
     if (!key) return '';
+    // Place facts: the location owns the fact, not the prefix character. With no explicit
+    // subject, take the token AFTER the first underscore (the place token) when present.
+    if (normalizeScope(fact.scope) === 'place') {
+        const tokens = key.split('_').filter(Boolean);
+        if (tokens.length >= 2) return tokens[1];
+        return tokens[0] || '';
+    }
     const us = key.indexOf('_');
     return us > 0 ? key.slice(0, us) : key;
 }
@@ -712,6 +779,33 @@ function mergeSalience(existing, incoming) {
  * @returns {string[]|undefined}
  */
 function mergeAliases(existing, incoming) {
+    const seen = new Set();
+    const out = [];
+    for (const list of [existing, incoming]) {
+        if (!Array.isArray(list)) continue;
+        for (const a of list) {
+            const s = String(a ?? '').trim();
+            if (!s) continue;
+            const k = s.toLowerCase();
+            if (seen.has(k)) continue;
+            seen.add(k);
+            out.push(s);
+        }
+    }
+    return out.length ? out : undefined;
+}
+
+/**
+ * Union `involved` participants across a re-mention (involved feature) — accumulate entities
+ * rather than overwrite, so a re-mention that omits `involved` doesn't wipe a previously
+ * derived list. Dedupes case-insensitively (first-seen casing), preserves order. Returns
+ * undefined when empty so a fact without participants stays lean (back-compat). Mirrors
+ * mergeAliases.
+ * @param {string[]|undefined} existing
+ * @param {string[]|undefined} incoming
+ * @returns {string[]|undefined}
+ */
+function mergeInvolved(existing, incoming) {
     const seen = new Set();
     const out = [];
     for (const list of [existing, incoming]) {
@@ -1209,6 +1303,25 @@ async function deleteAttachmentFile(url) {
  * @property {number} [validAt] - OPTIONAL provenance: the source message index (or ms time)
  *   at which the fact became true. Defaults to the source message index at write time.
  *   Absent on older facts (backward-compatible).
+ * @property {('character'|'place'|'event')} [scope] - OPTIONAL recall axis (scope feature).
+ *   `character` = sticks to a person (traits/state/behavior); `place` = a location/world thing
+ *   recalled when the PLACE matters even if its owner is absent; `event` = something that
+ *   happened (anchored to place + people + time). Emitted by Agent 3 via the `scope:` marker;
+ *   when absent it is INFERRED deterministically from category/track (see deriveScope). Drives
+ *   place-filing (deriveSubject files `scope:place` facts under the place, not the character).
+ *   Backward-compatible: facts without it infer a scope on read.
+ * @property {string[]} [involved] - OPTIONAL participants/entities IN the fact (who/what the
+ *   fact concerns), DISTINCT from `knownBy` (who may KNOW it) and `subject` (the primary owner).
+ *   Emitted by Agent 3 via the `with:` marker; AUTO-FILLED when omitted from names in `knownBy`
+ *   plus capitalized entity tokens in the value. Cheap and OPTIONAL — never required. Pairs with
+ *   `location` so retrieval can later traverse place⇄event⇄people. Absent on older facts.
+ * @property {string} [about] - OPTIONAL provisional name/descriptor of the real person an NPC
+ *   fact is about (NPC drawer feature). Set when a fact about an unnamed/incidental person is
+ *   routed to the shared `npc` subject, so a later promotion step can migrate the right facts
+ *   out to a named subject. Absent on facts that aren't NPC-drawered (backward-compatible).
+ * @property {string} [location] - OPTIONAL where-link for an event (location-link feature): a
+ *   place key/subject naming WHERE the fact happened. Emitted by Agent 3 via the `at:` marker on
+ *   events. Pairs with `involved` (who) for place⇄event⇄people retrieval. Absent on older facts.
  */
 
 /**

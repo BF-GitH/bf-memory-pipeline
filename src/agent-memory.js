@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -45,7 +45,7 @@ CATEGORIES: Identity, Relationships, World, History, Status, Behavior. If a fact
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | subj:who_or_what | aka:nickname,role | conf:high | >context note
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | subj:who_or_what | scope:character | with:<NAME>,<OBJECT> | at:<PLACE> | aka:nickname,role | conf:high | >context note
 .
 #WHY <one sentence>
 
@@ -60,6 +60,14 @@ ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-sepa
 IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ Identity/user_name = <NAME> | !5 | kind:trait\`. Do NOT omit them.
 
 SUBJECT (recommended): append \`| subj:<who_or_what>\` naming the character/place the fact is ABOUT (e.g. \`subj:<NAME>\`). If you omit it, the system derives the subject from the key prefix, so prefer keys that START with the subject (\`<NAME>_hair = ...\`).
+
+SCOPE (recommended): append \`| scope:character|place|event\`. \`character\` = sticks to a person (traits/state/behavior); \`place\` = a location/world thing recalled when the PLACE matters even if its owner is absent; \`event\` = something that happened (anchored to a place + people + time). If omitted the system infers it from category (World→place, History→event, else character). For a PLACE fact also set \`| subj:<PLACE>\` so the location files under the place, not its owner — write \`+ World/<NAME>_<PLACE>_decor = ... | subj:<PLACE> | scope:place\`.
+
+INVOLVED (optional): append \`| with:<A>,<B>\` listing the participants/entities IN the fact (distinct from @WhoKnows = who KNOWS it). If omitted the system auto-fills it. Use it especially to NAME an unnamed person (see NPC below).
+
+NPC DRAWER (important): for a fact about an UNNAMED or one-off/incidental person (a passing stranger, "the man by the window", an unnamed waiter), file it under the shared subject by writing \`| subj:npc\` AND name the person in \`| with:<the descriptor>\` (e.g. \`| subj:npc | with:the man by the window\`). Keep the category/kind as normal. This stops walk-ons from cluttering the store; a later step promotes them once they get a real name.
+
+LOCATION (optional, events): for an \`scope:event\` fact, append \`| at:<PLACE>\` naming WHERE it happened (a place subject/key). Pair with \`with:\` (who) so the event links place⇄people. Example: \`+ History/char_admission = ... | scope:event | at:<PLACE> | with:<NAME>\`.
 
 CONFIDENCE (optional): append \`| conf:high|med|low\` (or a 0-1 number) when the fact is uncertain or inferred rather than plainly stated. Omit for plainly-stated facts (treated as high).
 
@@ -394,6 +402,9 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let aliases = [];      // Layer A (alias retrieval): optional alt names/nicknames (`aka:` marker)
         let subject = '';      // Subject axis (feature): optional who/what the fact is about (`subj:` marker)
         let confidence = null; // Provenance (feature): optional 0-1 number or low|med|high (`conf:` marker)
+        let scope = '';        // Scope (feature): optional character|place|event (`scope:` marker)
+        let involved = [];     // Involved (feature): optional participants/entities IN the fact (`with:` marker)
+        let location = '';     // Location-link (feature): optional WHERE an event happened (`at:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -442,6 +453,34 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             const subjMatch = seg.match(/^subj\s*:\s*(.+)$/i);
             if (subjMatch) {
                 subject = subjMatch[1].trim();
+                continue;
+            }
+
+            // scope:<character|place|event> — OPTIONAL recall axis (scope feature). `scope:`
+            // does NOT collide with the existing |/@/#/rel:/@src:/>/track:/!N/kind:/subj:/aka:/
+            // conf:/~ grammar. When omitted the scope is INFERRED from category/track downstream.
+            const scopeMatch = seg.match(/^scope\s*:\s*(character|place|event)\b/i);
+            if (scopeMatch) {
+                scope = scopeMatch[1].toLowerCase();
+                continue;
+            }
+
+            // with:<a, b, c> — OPTIONAL participants/entities IN the fact (involved feature).
+            // DISTINCT from @KnownBy (who KNOWS it) and subj: (the primary owner). `with:`
+            // does NOT collide with the existing grammar (no marker starts with `w`). When
+            // omitted, `involved` is AUTO-FILLED downstream from knownBy + value entities.
+            const withMatch = seg.match(/^with\s*:\s*(.+)$/i);
+            if (withMatch) {
+                involved = withMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // at:<place> — OPTIONAL where-link for an EVENT (location-link feature): the place
+            // key/subject WHERE the fact happened. `at:` does NOT collide (the only other
+            // `a`-prefixed marker is `aka:`, matched above by its own regex). Pairs with `with:`.
+            const atMatch = seg.match(/^at\s*:\s*(.+)$/i);
+            if (atMatch) {
+                location = atMatch[1].trim();
                 continue;
             }
 
@@ -563,9 +602,46 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         if (Number.isInteger(importance)) update.importance = importance;
         if (kind) update.kind = kind;
         if (inferred.length) update.inferredFields = inferred;
+        // Scope (feature): attach an explicit scope when given, else INFER it deterministically
+        // from category/track. Always present downstream so place-filing/recall can use it.
+        const resolvedScope = normalizeScope(scope) || inferScopeFromCategory(category, track);
+        update.scope = resolvedScope;
+
         // Subject axis (feature): attach an explicit subject when given, else derive it
         // deterministically from the key prefix so the field is always present downstream.
-        update.subject = subject || deriveSubjectFromKey(key);
+        let resolvedSubject = subject || deriveSubjectFromKey(key);
+
+        // PLACE-FILING FIX (scope feature): for a place fact, the SUBJECT must be the PLACE,
+        // not the owning character. When the writer didn't give an explicit `subj:`, take the
+        // SECOND key token (`<NAME>_<PLACE>...` -> `<PLACE>`) so the location is recallable
+        // independently. (database.deriveSubject applies the same rule defensively on read.)
+        if (resolvedScope === 'place' && !subject) {
+            const tokens = String(key || '').split('_').filter(Boolean);
+            if (tokens.length >= 2) resolvedSubject = tokens[1];
+        }
+
+        // NPC drawer (feature): a fact about an UNNAMED/incidental person routes to the shared
+        // `npc` subject (KIND/category unchanged) so walk-ons don't mint a fresh subject each.
+        // The provisional name/descriptor is RETAINED on the fact (`about`, and folded into
+        // `involved`) so a later promotion step can migrate the right facts out. Never applies
+        // to place/event scope or to {{user}}/{{char}}.
+        let about = '';
+        if (resolvedScope === 'character' && looksLikeUnnamedPerson(resolvedSubject)) {
+            about = resolvedSubject;          // keep the descriptor for later promotion
+            if (!involved.includes(about)) involved = [about, ...involved];
+            resolvedSubject = NPC_SUBJECT;
+        }
+        update.subject = resolvedSubject;
+
+        // Involved (feature): emit the writer's `with:` list when given, else AUTO-FILL from
+        // knownBy + capitalized entity tokens in the value. Optional/cheap — only attached when
+        // non-empty so back-compat facts stay lean.
+        const resolvedInvolved = involved.length ? involved : autoFillInvolved(knownBy, value);
+        if (resolvedInvolved.length) update.involved = resolvedInvolved;
+        // NPC drawer: retain the provisional descriptor so promotion can find the right facts.
+        if (about) update.about = about;
+        // Location-link (feature): attach the event's where-link when the writer gave `at:`.
+        if (location) update.location = location;
         // Provenance (feature): confidence when stated; validAt defaults to the source
         // message index (when the fact became true). Both kept optional/back-compat.
         if (confidence !== null && confidence !== '') update.confidence = confidence;
@@ -616,6 +692,87 @@ function inferImportance(category, kind, key) {
     if (kind === 'state') return 2;            // current mood/location fades fast
     if (kind === 'event') return 2;            // a single occurrence is usually minor
     return 3;                                  // ordinary default
+}
+
+/**
+ * Infer a fact `scope` (character|place|event) from category + track when the writer omitted
+ * the `scope:` marker (scope feature). Deterministic, mirrors database.deriveScope:
+ *   - track/sequence step -> event
+ *   - History             -> event
+ *   - World               -> place
+ *   - Status              -> character (current state of someone)
+ *   - everything else (Identity/Behavior/Relationships/Unsorted) -> character
+ * @param {string} category
+ * @param {string} track - non-empty when the fact is a sequence step
+ * @returns {('character'|'place'|'event')}
+ */
+function inferScopeFromCategory(category, track) {
+    if (track) return 'event';
+    switch (String(category || '').toLowerCase()) {
+        case 'history': return 'event';
+        case 'world': return 'place';
+        case 'status': return 'character';
+        default: return 'character';
+    }
+}
+
+/**
+ * Auto-fill the `involved` participant list (involved feature) when Agent 3 omitted the
+ * `with:` marker. Cheap and conservative — derives from names already present in `knownBy`
+ * plus capitalized entity tokens in the value (proper-noun-ish words: leading uppercase,
+ * not the {{user}}/{{char}} macro residue, not a 1-char token). Deduped case-insensitively,
+ * order preserved. Returns [] when nothing is derivable (caller leaves the field off).
+ * @param {string[]} knownBy
+ * @param {string} value
+ * @returns {string[]}
+ */
+function autoFillInvolved(knownBy, value) {
+    const seen = new Set();
+    const out = [];
+    const add = (raw) => {
+        const s = String(raw ?? '').trim();
+        if (!s) return;
+        const k = s.toLowerCase();
+        if (seen.has(k)) return;
+        seen.add(k);
+        out.push(s);
+    };
+    for (const n of (Array.isArray(knownBy) ? knownBy : [])) add(n);
+    // Capitalized entity tokens in the value: a word starting uppercase, length >= 2. Strips
+    // surrounding punctuation. Skips ALL-CAPS-only short tokens are still allowed (acronyms).
+    const v = String(value || '');
+    const tokenRe = /\b([A-Z][A-Za-z'\-]+)\b/g;
+    let m;
+    while ((m = tokenRe.exec(v)) !== null) {
+        const tok = m[1];
+        if (tok.length < 2) continue;
+        add(tok);
+    }
+    return out;
+}
+
+/**
+ * Detect whether a fact is about an UNNAMED / incidental person (NPC drawer feature). True
+ * when the subject reads like a generic descriptor rather than a proper name — e.g. a role
+ * or "the man by the window" — so the fact should route to the shared `npc` subject while
+ * retaining its provisional descriptor for a later promotion step. Conservative: only fires
+ * when the subject starts with a lowercase article/descriptor word or is empty AND the writer
+ * gave no explicit proper subject. Never fires for {{user}}/{{char}} or a capitalized name.
+ * @param {string} subject - the explicit-or-derived subject (may be '')
+ * @returns {boolean}
+ */
+function looksLikeUnnamedPerson(subject) {
+    const s = String(subject || '').trim();
+    if (!s) return false;
+    const lower = s.toLowerCase();
+    if (lower === 'user' || lower === 'char' || lower === NPC_SUBJECT) return false;
+    // Descriptor-style subjects: start with an article/quantifier ("the man by the window",
+    // "a waiter"), OR a multi-word phrase whose first word is lowercase (a description, not a
+    // proper name). A single capitalized token or a Capitalized multi-word proper name is
+    // treated as a real name and NOT drawered (conservative — avoids hiding named characters).
+    if (/^(the|a|an|some|that|this|one|another)\b/i.test(s)) return true;
+    if (/\s/.test(s) && /^[a-z]/.test(s)) return true;
+    return false;
 }
 
 /**
@@ -713,6 +870,15 @@ async function applyUpdates(updates, existingDatabases) {
         // Subject axis (feature): forward the (explicit-or-derived) subject so it's stored
         // as a real index axis. Confidence/validAt are provenance stamps (back-compat optional).
         if (update.subject) factToWrite.subject = update.subject;
+        // Scope (feature): forward the (explicit-or-inferred) recall axis so deriveSubject/
+        // retrieval can file place facts under the place and traverse place⇄event⇄people.
+        if (update.scope) factToWrite.scope = update.scope;
+        // Involved (feature): forward participants (writer-given or auto-filled) when present.
+        if (Array.isArray(update.involved) && update.involved.length) factToWrite.involved = update.involved;
+        // NPC drawer (feature): forward the provisional descriptor for a later promotion step.
+        if (update.about) factToWrite.about = update.about;
+        // Location-link (feature): forward the event's where-link when present.
+        if (update.location) factToWrite.location = update.location;
         if (update.confidence !== undefined && update.confidence !== null && update.confidence !== '') {
             factToWrite.confidence = update.confidence;
         }
