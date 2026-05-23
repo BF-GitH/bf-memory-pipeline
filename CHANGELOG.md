@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.18.0] - 2026-05-23
+
+### Changed — 3-layer fact model (rough → aspect → character-tag) + default skeleton
+Restructures how facts are organized and retrieved, fixing two problems: (1) nothing seeded the structure, so a fresh chat had zero layers until a fact landed; (2) the character was the Layer-2 menu branch, so every character surfaced in the menu and the detail finder pulled ALL of a character's facts (token cost). Backward-compatible — legacy facts/categories are remapped on read.
+
+**New 3-layer model.** ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js))
+- **Layer 1 — `category`** (rough, genre-agnostic): `People · Places · Things · Relationships · Events · World · Unsorted`. A legacy-category map (`mapLegacyCategory`, scope-sensitive) re-buckets the old Identity/World/Status/Behavior/History categories on read, so existing databases keep working.
+- **Layer 2 — `aspect`** (new field, fixed vocab per category, character-agnostic): e.g. People→ identity/appearance/body/background/role/status/mood/goals/behavior/skills; Places→ residence/public/region/feature; Events→ milestone/scene/action; etc. (`TAXONOMY` constant.) Agent 3 emits it via `aspect:`; falls back to a per-category default when omitted.
+- **Layer 3 — character tag.** The character is now a TAG carried in `involved` (`with:@<NAME>` / `@npc`), NOT the menu branch. A person's facts live across many category/aspect branches and are pulled by tag-filter, not by a per-character branch.
+
+**Default skeleton from turn 1.** The full Layer-1 + Layer-2 taxonomy is a code constant; `buildSkeletonDatabases`/`withSkeleton` present the complete empty skeleton (categories + aspects, counts 0) in the menu and the Database tab from the very first turn — no more "No databases yet." Empty-file spam is avoided: category files are written on first fact (write-on-first-fact), not seeded as empty uploads. ([src/database.js](src/database.js), [src/settings.js](src/settings.js))
+
+**Menu + finder rewired to category/aspect with a character tag-filter.** ([src/agent-draft.js](src/agent-draft.js), [src/pipeline.js](src/pipeline.js), [src/agent-finder.js](src/agent-finder.js))
+- `summarizeMenu` + `collectBranchFacts` now key off `category/aspect` (character-agnostic), so the menu Agent 1 sees stays small no matter how many characters exist.
+- Agent 1 picks `Category` / `Category/aspect` `#Branches`, and optionally names the focus character(s) in a new `#Focus:` line (which never becomes a branch).
+- New `filterCandidatesByFocus` keeps, for the detail finder, the focus character's facts + all non-character (place/event/world) facts + untagged facts + the always-included `Unsorted` catch-all, and drops other characters' character-scoped facts in the same aspects — so the finder is never handed every character's stuff. Applied before `expandLinks`, so place⇄event⇄people link-following and place-recall still function. Empty/over-narrow candidate sets fall back to deterministic retrieval.
+
 ## [0.17.0] - 2026-05-23
 
 ### Added — entity scope + link-following retrieval + character registry (Phase 4)
