@@ -3,6 +3,7 @@
 
 import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
 import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
+import { DEFAULT_FINDER_PROMPT } from './agent-finder.js';
 import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
 import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
@@ -56,6 +57,11 @@ const DEFAULT_SETTINGS = {
     // and migrated forward in migrateLegacySettings().
     agent1Profile: '',
     agent3Profile: '',
+    // Agent 4 (Fact Finder, STAGE 2 of two-stage retrieval) connection profile.
+    // Empty => reuse Agent 1's profile (the design default). `agent4Profile` is the
+    // canonical key; `finderProfile` is accepted as an alias (validated/migrated below).
+    agent4Profile: '',
+    finderProfile: '',
     // Per-agent context message counts (replacing single contextMessages).
     // Agent 3 default raised from 2 -> 5 (FIX #2a): a 2-message window truncated
     // long single-message backstory disclosures and the surrounding exchange that
@@ -107,6 +113,13 @@ const DEFAULT_SETTINGS = {
     reflectionInject: true,
     reflectionMaxTokens: 200,
     reflectionPrompt: '',
+    // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
+    // Agent 1 picks #Branches from the menu, Agent 4 reads the full facts under those
+    // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
+    // (or on any finder error/empty), the pipeline falls back to deterministic retrieveFacts.
+    useFinderAgent: true,
+    // Optional system-prompt override for Agent 4. Empty => DEFAULT_FINDER_PROMPT.
+    finderPrompt: '',
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
@@ -181,6 +194,13 @@ function validateSettings(s) {
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
     if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
     if (typeof s.agent3Profile !== 'string')     s.agent3Profile = '';
+    if (typeof s.agent4Profile !== 'string')     s.agent4Profile = '';
+    if (typeof s.finderProfile !== 'string')     s.finderProfile = '';
+    // Accept `finderProfile` as an alias for `agent4Profile`: if only the alias is set,
+    // fold it onto the canonical key so downstream code only reads agent4Profile.
+    if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
+    if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = true;
+    if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
     if (typeof s.writerFormat !== 'string')      s.writerFormat = '';

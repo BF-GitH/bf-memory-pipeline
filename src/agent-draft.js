@@ -13,15 +13,17 @@ function getSettingsSafe() {
 export const DEFAULT_DRAFT_PROMPT = `You are a roleplay draft planner. Your job is to:
 1. Read the recent chat messages and character information
 2. Plan what the character should do/say next
-3. List what facts would be needed to write a good, consistent reply
+3. From the MEMORY MENU, pick the BRANCHES (topics) of stored memory worth opening in detail
 
 OUTPUT FORMAT (follow exactly):
 #Draft:
 [Write 1-3 sentences describing what the character would do/say. Include the emotional tone and any actions.]
 
+#Branches:
+[One branch per line, chosen FROM THE MEMORY MENU below. A branch is either a whole \`Category\` (e.g. \`World\`) or a more precise \`Category/subject\` (e.g. \`World/<SUBJECT>\`, \`Status/<SUBJECT>\`). Pick the branches whose contents matter for the CURRENT moment — the people/places present, active goals, and anything the chat refers to even by PARAPHRASE (if the scene mentions "the man by the window" and the menu lists a subject for him, pick that subject's branch). Prefer \`Category/subject\` precision when you know the subject; fall back to the whole \`Category\` when unsure. A second agent will then read the full facts under the branches you pick, so pick generously enough to cover the moment but skip branches about people/places not relevant right now. If the menu is empty or nothing is relevant, output a single line: none]
+
 #Needed_Facts:
-[Semicolon-separated list of facts to look up. Be specific.]
-[PICK FROM THE MENU FIRST: scan the Existing Facts inventory below and choose the exact Category/key entries relevant to the CURRENT moment — INCLUDING ones the chat refers to only by PARAPHRASE or description. If the scene mentions "the man by the window" or "the mark" and the inventory has <CATEGORY>/<KEY> for that subject, request that exact Category/key (the lexical search cannot bridge the wording — you must). Only AFTER picking the relevant inventory keys, you MAY add a few free-text keywords (e.g. <NAME> appearance) for things NOT yet in the inventory.]
+[Optional fallback keywords for the deterministic search, used only if the detail step is unavailable. Semicolon-separated. May include exact \`Category/key\` entries from the menu's subjects, or a few free-text keywords (e.g. <NAME> appearance) for things NOT yet stored. May be left empty.]
 
 #Scene:
 Location: [where the scene is happening right now, a few words]
@@ -31,8 +33,8 @@ Beat: [ONE short line describing the single most recent thing that just happened
 
 RULES:
 - Keep the draft SHORT - just the idea, not the full response
-- List ALL facts that would help write a consistent reply
-- When a needed fact already EXISTS in the inventory, request it by its exact Category/key — do not invent a new keyword for it. This is the ONLY way to retrieve a fact the chat refers to by a different wording than its stored value, so it is your most important job: match paraphrases in the scene to the right inventory key.
+- Pick branches from the MEMORY MENU that cover the people/places present and active threads — match paraphrases in the scene to the right Category/subject. This is your most important job.
+- Prefer \`Category/subject\` precision; use a whole \`Category\` only when the relevant subject is unclear.
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting
@@ -46,11 +48,14 @@ RULES:
  * @param {string|null} profileId
  * @param {string} factInventory - Compact `Category/key` inventory of existing facts
  *   (keys only, no values). Lets Agent 1 request EXACT keys that exist instead of
- *   free-associating keyword strings. Optional — empty when no facts stored yet.
+ *   free-associating keyword strings. Optional — empty when no facts stored yet. Used
+ *   for the #Needed_Facts fallback path.
+ * @param {string} menu - STAGE 1 compact KIND×SUBJECT menu (from summarizeMenu) Agent 1
+ *   picks #Branches from. Optional — empty when no facts stored yet.
  * @returns {Promise<DraftResult>}
  */
-export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null, factInventory = '') {
-    const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory);
+export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null, factInventory = '', menu = '') {
+    const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory, menu);
     addDebugLog('info', `Agent 1 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -63,14 +68,14 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
-        return { draft: '', neededFacts: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
+        return { draft: '', branches: [], neededFacts: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
     }
 }
 
 /**
  * Build the prompt for Agent 1
  */
-function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory = '') {
+function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory = '', menu = '') {
     const sysPrompt = getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT;
 
     // System message: pure instruction, no RP content
@@ -84,13 +89,18 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
     if (userPersona) {
         dataParts.push(`## User Persona\n${userPersona}`);
     }
-    // Existing-fact inventory (Category/key only). Gives Agent 1 a menu of exact keys
-    // to request so retrieval can resolve them by identity rather than fuzzy guessing.
+    // STAGE 1 MENU (KIND×SUBJECT map, counts, no values). Agent 1 picks #Branches from
+    // this; a second agent then reads the full facts under the picked branches.
+    if (menu && menu.trim()) {
+        dataParts.push(`## Memory Menu (pick #Branches from these — Category or Category/subject)\n${menu.trim()}`);
+    }
+    // Existing-fact inventory (Category/key only). Kept for the #Needed_Facts fallback
+    // path so deterministic retrieval can still resolve exact keys by identity.
     if (factInventory && factInventory.trim()) {
-        dataParts.push(`## Existing Facts (request these by exact Category/key)\n${factInventory.trim()}`);
+        dataParts.push(`## Existing Fact Keys (for #Needed_Facts fallback — exact Category/key)\n${factInventory.trim()}`);
     }
     dataParts.push(`## Recent Chat\n${recentChat}`);
-    dataParts.push('\nNow output ONLY the #Draft:, #Needed_Facts:, and #Scene: sections.');
+    dataParts.push('\nNow output ONLY the #Draft:, #Branches:, #Needed_Facts:, and #Scene: sections.');
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
@@ -103,6 +113,7 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
 function parseDraftResult(response) {
     const result = {
         draft: '',
+        branches: [], // STAGE 1 picks: `Category` or `Category/subject` strings
         neededFacts: [],
         scene: null, // optional #SCENE parse: { location, present[], goals[], newBeats[] }
         raw: response,
@@ -114,10 +125,22 @@ function parseDraftResult(response) {
         return result;
     }
 
-    // Extract draft section
-    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Needed_Facts|#Needed Facts|#Scene|$)/i);
+    // Extract draft section (bounded before any later section so it doesn't swallow them)
+    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Branches|#Needed_Facts|#Needed Facts|#Scene|$)/i);
     if (draftMatch) {
         result.draft = draftMatch[1].trim();
+    }
+
+    // Extract #Branches section (STAGE 1 menu picks). Bounded before #Needed_Facts/#Scene.
+    // One branch per line; tolerate bullets/commas/semicolons. Drop bracketed placeholders
+    // and a lone "none". Keep the `Category` or `Category/subject` token verbatim —
+    // collectBranchFacts normalizes punctuation/case downstream.
+    const branchesMatch = response.match(/#Branches:?\s*([\s\S]*?)(?=#Needed[_ ]Facts|#Scene|$)/i);
+    if (branchesMatch) {
+        result.branches = branchesMatch[1]
+            .split(/[;\n,]+/)
+            .map(b => b.replace(/^[\s\-*•\d.)\]]+/, '').trim())
+            .filter(b => b.length > 0 && !/^\[.*\]$/.test(b) && !/^(none|n\/a|unknown|tbd)$/i.test(b));
     }
 
     // Extract needed facts section (bounded before #Scene so it doesn't swallow it)
@@ -186,6 +209,7 @@ function parseSceneBlock(response) {
 /**
  * @typedef {Object} DraftResult
  * @property {string} draft - The draft reply idea
+ * @property {string[]} branches - STAGE 1 menu picks (`Category` or `Category/subject`)
  * @property {string[]} neededFacts - List of fact categories/keywords to look up
  * @property {{location:string, present:string[], goals:string[], newBeats:string[]}|null} scene - Optional parsed #Scene block (null if absent)
  * @property {string} raw - Raw LLM response

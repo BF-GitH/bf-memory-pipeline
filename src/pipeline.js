@@ -3,12 +3,13 @@
 // ST's EventEmitter awaits async handlers, so generation waits for us.
 
 import { runDraftAgent } from './agent-draft.js';
+import { runFinderAgent, formatChosenFacts } from './agent-finder.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys } from './database.js';
-import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
+import { retrieveFacts, extractContextKeywords, isFactVisible } from './fact-retrieval.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts } from './database.js';
+import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, setScene, getScene, getReflection } from './settings.js';
 
@@ -384,19 +385,21 @@ async function runPipelineInline(data) {
     // Load databases once up front — reused for both Agent 1's fact inventory and
     // Agent 3's existing-DB context, avoiding a duplicate fetch.
     const databases = await getAllDatabases();
-    // Compact keys-only inventory (Category/key, no values) so Agent 1 can request
-    // EXACT keys that exist instead of free-associating keyword strings.
+    // Compact keys-only inventory (Category/key, no values) — kept for the #Needed_Facts
+    // fallback path so deterministic retrieval can resolve exact keys by identity.
     const factInventory = summarizeKeys(databases);
-    addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}`);
+    // STAGE 1 menu: compact KIND×SUBJECT map (counts, NO values) Agent 1 picks branches from.
+    const factMenu = summarizeMenu(databases);
+    addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
     try {
         isInternalCall = true;
         const promises = [];
 
-        // Agent 1: Draft
+        // Agent 1: Draft + STAGE 1 menu picker (returns #Branches)
         promises.push(
-            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory)
-                .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
+            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory, factMenu)
+                .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
         );
 
         // Agent 3: Memory update — single call that sees BOTH the latest user message
@@ -551,11 +554,15 @@ async function runPipelineInline(data) {
     // the retrieved facts with no draft. Memory > nothing.
     if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
-        draftResult = { draft: '', neededFacts: [], scene: null, raw: '' };
+        draftResult = { draft: '', branches: [], neededFacts: [], scene: null, raw: '' };
     }
+    // Older Agent 1 result shapes (or partial parses) may lack branches/neededFacts.
+    if (!Array.isArray(draftResult.branches)) draftResult.branches = [];
+    if (!Array.isArray(draftResult.neededFacts)) draftResult.neededFacts = [];
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
-    addDebugLog('info', `Needed facts: ${draftResult.neededFacts.join('; ')}`);
+    addDebugLog('info', `Branches picked: ${draftResult.branches.join('; ') || '(none)'}`);
+    addDebugLog('info', `Needed facts (fallback): ${draftResult.neededFacts.join('; ')}`);
 
     // --- Scene card: persist Agent 1's #SCENE parse (no extra LLM call) ---
     // Only when enabled, the run wasn't cancelled, and the character didn't change
@@ -573,45 +580,94 @@ async function runPipelineInline(data) {
         }
     }
 
-    // --- Fact Retrieval: merge speculative + Agent 1's specific requests ---
-    updateStatus('running', 'Merging facts...');
+    // --- Fact Retrieval: STAGE 2 (detail finder) with deterministic fallback ---
+    updateStatus('running', 'Selecting facts...');
 
-    // Find keywords Agent 1 requested that weren't already in speculative retrieval
-    const speculativeKeywordSet = new Set(contextKeywords.map(k => k.toLowerCase()));
-    const deltaKeywords = draftResult.neededFacts.filter(k => !speculativeKeywordSet.has(k.toLowerCase()));
-
-    let retrieval = speculativeRetrieval || { facts: [], formatted: '', stats: { primary: 0, secondary: 0, tertiary: 0 } };
-
-    if (deltaKeywords.length > 0) {
-        addDebugLog('info', `Delta retrieval for Agent 1 keywords: ${deltaKeywords.join(', ')}`);
-        const deltaRetrieval = await retrieveFacts(deltaKeywords, []);
-
-        // Merge: add delta facts not already in speculative results
-        const existingKeys = new Set(retrieval.facts.map(r => `${r.category}:${r.fact.key}`));
-        for (const fact of deltaRetrieval.facts) {
-            const id = `${fact.category}:${fact.fact.key}`;
-            if (!existingKeys.has(id)) {
-                retrieval.facts.push(fact);
+    // DETERMINISTIC FALLBACK builder (FALLBACK requirement). Used when the finder is
+    // disabled, errors, times out, or returns nothing. Reuses the existing speculative +
+    // delta-keyword merge so behavior matches the pre-two-stage pipeline, and ALWAYS folds
+    // in every active Unsorted fact so a failed detail pass can never blank that catch-all.
+    // A failed detail pass must never blank memory.
+    const buildDeterministicRetrieval = async () => {
+        const speculativeKeywordSet = new Set(contextKeywords.map(k => k.toLowerCase()));
+        const deltaKeywords = draftResult.neededFacts.filter(k => !speculativeKeywordSet.has(k.toLowerCase()));
+        const det = speculativeRetrieval || { facts: [], formatted: '', stats: { primary: 0, secondary: 0, tertiary: 0 } };
+        if (deltaKeywords.length > 0) {
+            addDebugLog('info', `Delta retrieval for Agent 1 keywords: ${deltaKeywords.join(', ')}`);
+            const deltaRetrieval = await retrieveFacts(deltaKeywords, []);
+            const existingKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
+            for (const fact of deltaRetrieval.facts) {
+                const id = `${fact.category}:${fact.fact.key}`;
+                if (!existingKeys.has(id)) { det.facts.push(fact); existingKeys.add(id); }
+            }
+        } else {
+            addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
+        }
+        // ALWAYS include active Unsorted facts (visibility-filtered), even on the fallback path.
+        const existingKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
+        for (const { fact, category } of collectBranchFacts(databases, ['Unsorted'])) {
+            const id = `${category}:${fact.key}`;
+            if (!existingKeys.has(id) && isFactVisible(fact)) {
+                det.facts.push({ fact, category, tier: 'primary' });
                 existingKeys.add(id);
             }
         }
-
-        // Recalculate stats and formatted output
-        retrieval.stats = {
-            primary: retrieval.facts.filter(r => r.tier === 'primary').length,
-            secondary: retrieval.facts.filter(r => r.tier === 'secondary').length,
-            tertiary: retrieval.facts.filter(r => r.tier === 'tertiary').length,
+        det.stats = {
+            primary: det.facts.filter(r => r.tier === 'primary').length,
+            secondary: det.facts.filter(r => r.tier === 'secondary').length,
+            tertiary: det.facts.filter(r => r.tier === 'tertiary').length,
         };
-        retrieval.formatted = retrieval.facts.length > 0
-            ? retrieval.facts.map(({ fact, category }) => {
+        det.formatted = det.facts.length > 0
+            ? det.facts.map(({ fact, category }) => {
                 const knownBy = (fact.knownBy || []).join(', ');
                 const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-                // Keep the KEY (Feature #2b): `Category/key = value`, matching formatFactsForWriter.
                 return `${prefix} ${category}/${fact.key} = ${fact.value}`;
             }).join('\n')
             : '(No stored facts available)';
+        return det;
+    };
+
+    let retrieval = null;
+    const wantFinder = settings.useFinderAgent !== false; // default true
+    if (wantFinder) {
+        // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
+        // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
+        // Visibility-filter defensively (the finder must never see a hidden fact).
+        const candidatesAll = collectBranchFacts(databases, draftResult.branches);
+        const candidates = candidatesAll.filter(({ fact }) => isFactVisible(fact));
+        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted`);
+        try {
+            const finder = await runFinderAgent({
+                candidates,
+                draft: draftResult.draft,
+                recentChat: formattedChat,
+                characterInfo,
+                userPersona,
+                profileId: getAgent4ProfileId(settings),
+            });
+            // Use finder results when it succeeded AND chose something. Empty/error => fall back.
+            if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
+                const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
+                retrieval = {
+                    facts,
+                    formatted: finder.formatted || formatChosenFacts(finder.facts),
+                    stats: { primary: facts.length, secondary: 0, tertiary: 0 },
+                };
+                addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`);
+            } else {
+                addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`);
+            }
+        } catch (finderErr) {
+            addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`);
+        }
     } else {
-        addDebugLog('info', 'No delta keywords needed — speculative retrieval covered everything');
+        addDebugLog('info', 'Finder agent disabled (useFinderAgent=false) — using deterministic retrieval');
+    }
+
+    // FALLBACK: finder disabled, errored, or empty → deterministic retrieval (over Agent 1's
+    // keyword requests + speculative) which ALWAYS still includes active Unsorted facts.
+    if (!retrieval) {
+        retrieval = await buildDeterministicRetrieval();
     }
 
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);

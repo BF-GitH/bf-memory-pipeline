@@ -78,6 +78,27 @@ export function getAgent3ProfileId(settings) {
 }
 
 /**
+ * Get the Agent 4 (Fact Finder) profile ID from settings. The finder REUSES Agent 1's
+ * connection profile by default (the two-stage-retrieval design); a dedicated
+ * `agent4Profile` overrides that when configured. Returns null to use the current
+ * connection. Like the others, this does NOT switch any profile.
+ * @param {object} settings - Extension settings
+ * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
+ */
+export function getAgent4ProfileId(settings) {
+    if (!settings?.useMemoryProfile) return null;
+    // Dedicated finder profile wins when set and still present.
+    const dedicated = settings?.agent4Profile || settings?.finderProfile || '';
+    if (dedicated) {
+        const exists = getConnectionProfiles().some(p => p.id === dedicated);
+        if (exists) return dedicated;
+        addDebugLog('fail', `Agent 4 profile "${dedicated}" not found in connection manager — reusing Agent 1's`);
+    }
+    // Default: reuse Agent 1's profile.
+    return getAgent1ProfileId(settings);
+}
+
+/**
  * @deprecated Use getAgent1ProfileId() or getAgent3ProfileId() instead.
  * Kept for backward compat. Returns the Agent 1 profile.
  * @param {object} settings - Extension settings
