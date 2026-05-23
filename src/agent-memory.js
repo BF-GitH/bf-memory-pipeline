@@ -165,7 +165,7 @@ Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place i
 + People/user_location  = <NEW_PLACE>                 | aspect:current_location | subj:{{user}} | @{{user}},{{char}} | #location | !3 | kind:state | ~
 + Events/user_relocated = <OLD_PLACE> to <NEW_PLACE>  | aspect:milestone | subj:{{user}} | @{{user}},{{char}} | #event | !2 | kind:event
 .
-#WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add an Events fact for the move.
+#WHY Same existing key user_location → it's a CHANGEABLE state, so \`~\` supersedes the old value (kept as history) and this becomes current. Add an Events fact for the move.
 
 ---
 Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} pretended to already have proof.*
