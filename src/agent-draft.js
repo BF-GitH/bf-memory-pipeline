@@ -20,13 +20,13 @@ OUTPUT FORMAT (follow exactly):
 [Write 1-3 sentences describing what the character would do/say. Include the emotional tone and any actions.]
 
 #Branches:
-[One branch per line, chosen FROM THE MEMORY MENU below. A branch is either a whole \`Category\` (e.g. \`World\`) or a more precise \`Category/subject\` (e.g. \`World/<SUBJECT>\`, \`Status/<SUBJECT>\`). Pick the branches whose contents matter for the CURRENT moment — the people/places present, active goals, and anything the chat refers to even by PARAPHRASE (if the scene mentions "the man by the window" and the menu lists a subject for him, pick that subject's branch). Prefer \`Category/subject\` precision when you know the subject; fall back to the whole \`Category\` when unsure. A second agent will then read the full facts under the branches you pick, so pick generously enough to cover the moment but skip branches about people/places not relevant right now. If the menu is empty or nothing is relevant, output a single line: none]
+[One branch per line, chosen FROM THE MEMORY MENU below. The menu is organized in TWO layers: a \`Category\` (the domain, e.g. \`People\`, \`Places\`, \`Events\`) and, under it, an \`aspect\` (a sub-bucket, e.g. \`identity\`, \`appearance\`, \`status\`). A branch is either a whole \`Category\` (e.g. \`People\`) or a precise \`Category/aspect\` (e.g. \`People/appearance\`, \`Places/feature\`). A specific CHARACTER is NOT a branch — facts about a person live across many categories/aspects, so pick the aspects that matter (e.g. for who someone is, pick \`People/identity\`; for current state, \`People/status\`). Pick the branches whose contents matter for the CURRENT moment — the people/places present, active goals, and anything the chat refers to even by PARAPHRASE. Prefer \`Category/aspect\` precision; fall back to the whole \`Category\` when unsure. A second agent will then read the full facts under the branches you pick, so pick generously enough to cover the moment but skip aspects not relevant right now. If nothing is relevant, output a single line: none]
 
 #Needed_Facts:
-[Optional fallback keywords for the deterministic search, used only if the detail step is unavailable. Semicolon-separated. May include exact \`Category/key\` entries from the menu's subjects, or a few free-text keywords (e.g. <NAME> appearance) for things NOT yet stored. May be left empty.]
+[Optional fallback keywords for the deterministic search, used only if the detail step is unavailable. Semicolon-separated. May include exact \`Category/key\` entries, or a few free-text keywords (e.g. <NAME> appearance) for things NOT yet stored. May be left empty.]
 
 #NextHint:
-[OPTIONAL. A tiny breadcrumb naming the few topics/branches likely to matter in the NEXT scene (where this exchange seems to be heading). Semicolon-separated; \`Category\` or \`Category/subject\` tokens preferred, or short keywords. Keep it to at most ~5 items. This is backstage-only — it is NOT shown to anyone and NOT used to write this reply. Leave empty if unsure.]
+[OPTIONAL. A tiny breadcrumb naming the few topics/branches likely to matter in the NEXT scene (where this exchange seems to be heading). Semicolon-separated; \`Category\` or \`Category/aspect\` tokens preferred, or short keywords. Keep it to at most ~5 items. This is backstage-only — it is NOT shown to anyone and NOT used to write this reply. Leave empty if unsure.]
 
 #Scene:
 Location: [where the scene is happening right now, a few words]
@@ -36,8 +36,8 @@ Beat: [ONE short line describing the single most recent thing that just happened
 
 RULES:
 - Keep the draft SHORT - just the idea, not the full response
-- Pick branches from the MEMORY MENU that cover the people/places present and active threads — match paraphrases in the scene to the right Category/subject. This is your most important job.
-- Prefer \`Category/subject\` precision; use a whole \`Category\` only when the relevant subject is unclear.
+- Pick branches from the MEMORY MENU that cover the people/places present and active threads — match paraphrases in the scene to the right Category/aspect. This is your most important job.
+- Prefer \`Category/aspect\` precision; use a whole \`Category\` only when the relevant aspect is unclear.
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting
@@ -53,8 +53,8 @@ RULES:
  *   (keys only, no values). Lets Agent 1 request EXACT keys that exist instead of
  *   free-associating keyword strings. Optional — empty when no facts stored yet. Used
  *   for the #Needed_Facts fallback path.
- * @param {string} menu - STAGE 1 compact KIND×SUBJECT menu (from summarizeMenu) Agent 1
- *   picks #Branches from. Optional — empty when no facts stored yet.
+ * @param {string} menu - STAGE 1 compact CATEGORY×ASPECT menu (from summarizeMenu) Agent 1
+ *   picks #Branches from. Always populated (the Layer-1 skeleton is seeded even with 0 facts).
  * @returns {Promise<DraftResult>}
  */
 export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null, factInventory = '', menu = '') {

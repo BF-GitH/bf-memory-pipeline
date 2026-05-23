@@ -49,6 +49,168 @@ export function normalizeKind(v) {
     return VALID_KINDS.has(k) ? k : DEFAULT_KIND;
 }
 
+// =============================================================================
+// 3-LAYER FACT-ORGANIZATION MODEL (taxonomy). Replaces the old single `category`
+// axis + character-as-`subject` branch. The character is now a deep TAG, never a
+// menu branch, so characters don't each become a top-level branch (which dragged
+// ALL of a character's facts into the detail finder — a token cost).
+//
+//   LAYER 1 = `category`  — rough, genre-agnostic DOMAIN. Canonical set below.
+//   LAYER 2 = `aspect`    — a granular, CHARACTER-AGNOSTIC sub-bucket WITHIN the
+//                           category, picked from a small FIXED vocab per category.
+//   LAYER 3 = CHARACTER TAG(s) — the who-it's-about, carried in `involved`/`subject`
+//                           as `@<name>`/`@npc`, NOT as the menu axis.
+//
+// The full Layer-1 + Layer-2 skeleton is a CODE CONSTANT (TAXONOMY) so it can be
+// SEEDED into the menu / Database tab from turn 1 even with zero facts.
+// =============================================================================
+
+// LAYER 1 — canonical category set (menu order; Unsorted always last as the catch-all).
+export const L1_CATEGORIES = ['People', 'Places', 'Things', 'Relationships', 'Events', 'World', 'Unsorted'];
+
+// LAYER 2 — fixed aspect vocab PER category (generic, character-agnostic). The FIRST
+// entry of each list doubles as that category's default/fallback aspect when Agent 3
+// is unsure (see defaultAspectFor / normalizeAspect).
+export const TAXONOMY = {
+    People:        ['identity', 'appearance', 'body', 'background', 'role', 'status', 'mood', 'goals', 'behavior', 'skills'],
+    Places:        ['residence', 'public', 'region', 'feature'],
+    Things:        ['object', 'key-item', 'substance'],
+    Relationships: ['bond', 'tension', 'history'],
+    Events:        ['milestone', 'scene', 'action'],
+    World:         ['rule', 'lore', 'faction', 'time'],
+    Unsorted:      ['misc'],
+};
+
+// Per-category fallback aspect (used when Agent 3 omits/invalid `aspect:`). `status` is a
+// sensible neutral default for People (current-state); every other category falls back to
+// its first vocab entry. Kept explicit so the choice is auditable.
+const DEFAULT_ASPECT = {
+    People: 'status',
+    Places: 'feature',
+    Things: 'object',
+    Relationships: 'bond',
+    Events: 'scene',
+    World: 'lore',
+    Unsorted: 'misc',
+};
+
+/**
+ * BACK-COMPAT category map (old 7-bucket set -> new Layer-1 set). Existing DBs shipped
+ * with categories Identity/Relationships/World/Status/Behavior/History/Unsorted; this maps
+ * them onto the new People/Places/Things/Relationships/Events/World/Unsorted set on READ so
+ * old facts re-bucket instead of breaking. Status of a PERSON -> People, but a Status fact
+ * whose scope is `place` files under Places; World stays World unless its scope is place/event
+ * (then Places/Events). Case-insensitive. Unknown categories (already-new or custom) pass
+ * through unchanged (capitalization-normalized to the canonical spelling when it matches a
+ * Layer-1 name).
+ * @param {string} category - the stored category name
+ * @param {FactSchema} [fact] - optional fact for scope-sensitive remap (Status/World)
+ * @returns {string} a canonical Layer-1 category name
+ */
+export function mapLegacyCategory(category, fact) {
+    const c = String(category || '').trim().toLowerCase();
+    if (!c) return 'Unsorted';
+    const scope = fact ? normalizeScope(fact.scope) : '';
+    switch (c) {
+        case 'identity':
+        case 'behavior':
+            return 'People';
+        case 'status':
+            return scope === 'place' ? 'Places' : 'People';
+        case 'world':
+            if (scope === 'place') return 'Places';
+            if (scope === 'event') return 'Events';
+            return 'World';
+        case 'history':
+            return 'Events';
+        case 'relationships':
+            return 'Relationships';
+        case 'unsorted':
+            return 'Unsorted';
+        default:
+            // Already a new Layer-1 name (any case) — normalize to canonical spelling.
+            for (const canon of L1_CATEGORIES) {
+                if (canon.toLowerCase() === c) return canon;
+            }
+            // Genuinely unknown/custom — keep verbatim so we never silently drop a real bucket.
+            return category;
+    }
+}
+
+/**
+ * The fixed Layer-2 aspect vocab for a Layer-1 category (after legacy-mapping the name).
+ * Returns Unsorted's vocab for an unknown category so a custom bucket still has a default.
+ * @param {string} category
+ * @returns {string[]}
+ */
+export function aspectVocabFor(category) {
+    const canon = mapLegacyCategory(category);
+    return TAXONOMY[canon] || TAXONOMY.Unsorted;
+}
+
+/** The default/fallback aspect for a (legacy-mapped) category. */
+export function defaultAspectFor(category) {
+    const canon = mapLegacyCategory(category);
+    return DEFAULT_ASPECT[canon] || (TAXONOMY[canon] && TAXONOMY[canon][0]) || 'misc';
+}
+
+/**
+ * Normalize an aspect against the fixed vocab for its category (Layer 2). Lowercased,
+ * trimmed; falls back to the category's default aspect when absent/invalid so a fact
+ * ALWAYS resolves to a real bucket. Back-compat: facts written before this feature have
+ * no `aspect` and resolve to the default here.
+ * @param {*} v - raw aspect value
+ * @param {string} category
+ * @returns {string}
+ */
+export function normalizeAspect(v, category) {
+    const a = String(v || '').trim().toLowerCase();
+    const vocab = aspectVocabFor(category);
+    if (a && vocab.includes(a)) return a;
+    return defaultAspectFor(category);
+}
+
+/**
+ * Resolve a fact's Layer-2 aspect: prefer the explicit `aspect` field (emitted by Agent 3
+ * via the `aspect:` marker), normalized against the category's fixed vocab; otherwise the
+ * category default. Always returns a valid aspect for the fact's (legacy-mapped) category.
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+export function deriveAspect(fact) {
+    if (!fact) return 'misc';
+    return normalizeAspect(fact.aspect, fact.category);
+}
+
+/**
+ * Build the empty Layer-1 skeleton: a `{ category -> empty DatabaseSchema }` map covering
+ * every canonical Layer-1 category, with ZERO facts. Used to SEED the menu / Database tab
+ * so the full taxonomy is present from turn 1 even before any fact lands. These skeleton
+ * DBs are kept IN MEMORY only — they are NOT persisted as empty attachment files (that
+ * would spam the backend with 7 empty uploads per chat); a category file is written only
+ * when a real fact lands (write-on-first-fact, via saveDatabase from applyUpdates).
+ * @returns {Object<string, DatabaseSchema>}
+ */
+export function buildSkeletonDatabases() {
+    const out = {};
+    for (const cat of L1_CATEGORIES) out[cat] = createEmptyDatabase(cat);
+    return out;
+}
+
+/**
+ * Merge the empty Layer-1 skeleton UNDER a real database map (real DBs win): every canonical
+ * category is guaranteed present (empty when it has no stored facts) so the menu / Database
+ * tab always show the full taxonomy, while any category that already has facts is preserved
+ * untouched. Pure / non-persisting. Custom (non-canonical) categories pass through.
+ * @param {Object<string, DatabaseSchema>} databases - real (loaded) databases
+ * @returns {Object<string, DatabaseSchema>}
+ */
+export function withSkeleton(databases) {
+    const out = buildSkeletonDatabases();
+    for (const [cat, db] of Object.entries(databases || {})) out[cat] = db;
+    return out;
+}
+
 // Scope feature: a fact's recall axis — does it stick to a PERSON (traits/state/behavior),
 // a PLACE/world thing (recalled when the location matters even if its owner is absent), or
 // an EVENT (something that happened, anchored to place + people + time). Optional; when a
@@ -90,11 +252,13 @@ export function deriveScope(fact) {
     const explicit = normalizeScope(fact?.scope);
     if (explicit) return explicit;
     if (isSequenceFact(fact)) return 'event';
-    switch (String(fact?.category || '').toLowerCase()) {
-        case 'history': return 'event';
+    // 3-layer model: switch on the canonical Layer-1 category (mapLegacyCategory also accepts
+    // the OLD names, so a fact stored under a legacy category still infers correctly on read).
+    switch (mapLegacyCategory(fact?.category).toLowerCase()) {
+        case 'events': return 'event';
+        case 'places': return 'place';
         case 'world': return 'place';
-        case 'status': return 'character';
-        default: return 'character';
+        default: return 'character'; // People/Things/Relationships/Unsorted -> character
     }
 }
 
@@ -207,7 +371,35 @@ export async function getAllDatabases() {
             const content = await fetchAttachmentContent(attachment.url);
             if (content) {
                 const db = JSON.parse(content);
-                databases[db.category] = db;
+                // BACK-COMPAT (3-layer model): a DB stored under an OLD category name
+                // (Identity/Status/Behavior/History) is re-bucketed onto the new Layer-1
+                // set on read. We remap PER-FACT (scope-sensitive) and merge into the
+                // canonical category — old Identity+Behavior+Status all fold into People,
+                // History into Events, etc. — so existing chats keep working without a
+                // migration write. New-category DBs map to themselves (no-op).
+                for (const fact of (db.facts || [])) {
+                    const target = mapLegacyCategory(db.category, fact);
+                    // Stamp the per-fact category so deriveScope/aspect and the menu read the
+                    // resolved Layer-1 home (the fact may diverge from the file's category when
+                    // a scope-sensitive remap split a legacy bucket).
+                    fact.category = target;
+                    if (!databases[target]) databases[target] = createEmptyDatabase(target);
+                    // MIGRATION SAFETY: when BOTH a legacy file (e.g. bf_memory_db_identity.json)
+                    // and the new-named file (bf_memory_db_people.json) coexist on disk during the
+                    // transition, both remap into the same bucket — dedupe by key so the merged
+                    // bucket never carries a duplicate of the same fact.
+                    if (databases[target].facts.some(f => f.key === fact.key)) continue;
+                    databases[target].facts.push(fact);
+                    // Carry the earliest createdAt forward for the merged bucket.
+                    if (Number(db.createdAt) && (!databases[target].createdAt || db.createdAt < databases[target].createdAt)) {
+                        databases[target].createdAt = db.createdAt;
+                    }
+                }
+                // Preserve an empty (factless) stored DB under its mapped name too.
+                if (!(db.facts || []).length) {
+                    const target = mapLegacyCategory(db.category);
+                    if (!databases[target]) databases[target] = createEmptyDatabase(target);
+                }
             }
         } catch (e) {
             console.error(`[BFMemory] Failed to load DB: ${attachment.name}`, e);
@@ -1056,11 +1248,12 @@ export function summarizeKeys(databases) {
     return lines.join('\n');
 }
 
-// Canonical category order for the MENU (two-stage retrieval). Unsorted always last —
-// it's the catch-all and is ALWAYS sent to the finder regardless of picks, so listing it
-// last keeps the menu readable. Categories not in this list (custom buckets) are appended
-// after, in insertion order, so the menu never silently drops a real category.
-export const MENU_CATEGORY_ORDER = ['Identity', 'Relationships', 'World', 'History', 'Status', 'Behavior', 'Unsorted'];
+// Canonical category order for the MENU (two-stage retrieval) — now the Layer-1 set.
+// Unsorted always last — it's the catch-all and is ALWAYS sent to the finder regardless of
+// picks, so listing it last keeps the menu readable. Categories not in this list (custom
+// buckets) are appended after, in insertion order, so the menu never silently drops a real
+// category. (Old name kept for callers; equals L1_CATEGORIES.)
+export const MENU_CATEGORY_ORDER = L1_CATEGORIES;
 
 /** Case-insensitive lookup of a database by category name. Returns [name, db] or null. */
 function findDbByCategory(databases, category) {
@@ -1073,25 +1266,29 @@ function findDbByCategory(databases, category) {
 }
 
 /**
- * STAGE 1 — build the compact MENU (the picker's map of the store). Lists each KIND
- * (category) and, under it, the SUBJECTS present (from deriveSubject) with active-fact
- * counts. NO values — it's the structure, not the contents — so it stays small even when
- * the DB is large. Example line: `World: <NAME>(11), <PLACE>(4)`. Subjects with an empty
- * derived subject are grouped under `(N)`. Only ACTIVE facts are counted/shown (superseded
- * history is omitted — it's never a retrieval target). Categories with zero active facts
- * are skipped. Deterministic ordering: MENU_CATEGORY_ORDER first, then any extras; subjects
- * sorted by descending count then name.
+ * STAGE 1 — build the compact MENU (the picker's map of the store). 3-LAYER MODEL: the
+ * menu axis is now CATEGORY (Layer 1) × ASPECT (Layer 2) — the CHARACTER is a deep tag,
+ * NOT a branch, so a character no longer surfaces as a top-level branch (the bug this
+ * model fixes). Each line lists a Layer-1 category and, under it, its FIXED Layer-2 aspect
+ * vocab with active-fact counts. NO values — structure only — so it stays small.
+ * Example line: `People: identity(3), appearance(2), status(1)`.
+ *
+ * DEFAULT SKELETON: the FULL taxonomy is always shown — every canonical Layer-1 category
+ * and every aspect in its vocab — even when a category (or the whole store) has zero facts,
+ * so Agent 1 can pick any branch from turn 1. Aspects with no active facts render as `(0)`.
+ * Only ACTIVE facts are counted (superseded history is never a retrieval target). Aspects
+ * are shown in their fixed vocab order (then any non-vocab aspect that somehow appears, by
+ * count). Deterministic category ordering: L1 order first, then any custom extras.
  * @param {Object<string, DatabaseSchema>} databases
- * @returns {string} Multi-line menu (one category per line), or '' when nothing stored.
+ * @returns {string} Multi-line menu (one category per line). Never empty (skeleton seeded).
  */
 export function summarizeMenu(databases) {
-    if (!databases || Object.keys(databases).length === 0) return '';
-    // Ordered list of category names: canonical order first, then any custom extras.
-    const present = Object.keys(databases);
-    const presentLower = new Set(present.map(c => c.toLowerCase()));
+    const dbs = withSkeleton(databases || {});
+    // Ordered list of category names: canonical Layer-1 order first, then any custom extras.
+    const present = Object.keys(dbs);
     const ordered = [];
     for (const c of MENU_CATEGORY_ORDER) {
-        if (presentLower.has(c.toLowerCase())) ordered.push(c);
+        if (present.some(p => p.toLowerCase() === c.toLowerCase())) ordered.push(c);
     }
     for (const c of present) {
         if (!MENU_CATEGORY_ORDER.some(m => m.toLowerCase() === c.toLowerCase())) ordered.push(c);
@@ -1099,19 +1296,24 @@ export function summarizeMenu(databases) {
 
     const lines = [];
     for (const cat of ordered) {
-        const found = findDbByCategory(databases, cat);
+        const found = findDbByCategory(dbs, cat);
         if (!found) continue;
         const [name, db] = found;
-        // Count active facts per subject.
+        // Count active facts per Layer-2 aspect.
         const counts = new Map();
         for (const fact of (db.facts || [])) {
             if (!isActiveFact(fact)) continue;
-            const subj = deriveSubject(fact); // may be '' for subject-less facts
-            counts.set(subj, (counts.get(subj) || 0) + 1);
+            const asp = deriveAspect(fact);
+            counts.set(asp, (counts.get(asp) || 0) + 1);
         }
-        if (counts.size === 0) continue; // skip empty categories
-        const entries = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || String(a[0]).localeCompare(String(b[0])));
-        const parts = entries.map(([subj, n]) => subj ? `${subj}(${n})` : `(${n})`);
+        // Render the FULL fixed vocab (even at count 0) so the skeleton is always visible,
+        // then append any out-of-vocab aspect that nonetheless has facts.
+        const vocab = aspectVocabFor(name);
+        const parts = vocab.map(a => `${a}(${counts.get(a) || 0})`);
+        const extras = [...counts.keys()]
+            .filter(a => !vocab.includes(a))
+            .sort((a, b) => (counts.get(b) - counts.get(a)) || String(a).localeCompare(String(b)));
+        for (const a of extras) parts.push(`${a}(${counts.get(a)})`);
         lines.push(`${name}: ${parts.join(', ')}`);
     }
     return lines.join('\n');
@@ -1119,14 +1321,15 @@ export function summarizeMenu(databases) {
 
 /**
  * STAGE 2 input — collect the FULL active facts living under the branches Agent 1 picked,
- * PLUS (always, unconditionally) every active fact in the Unsorted catch-all. A branch is a
- * `Category` (all subjects in it) or `Category/subject` (just that subject, matched via
- * deriveSubject). Matching is case-insensitive and tolerant of surrounding punctuation
- * Agent 1 may wrap a pick in. Superseded history is excluded. Returns results in the same
- * `{ fact, category }` shape retrieveFacts/formatFactsForWriter use, deduped by
- * `category:key`. Unknown/hallucinated branches simply match nothing.
+ * PLUS (always, unconditionally) every active fact in the Unsorted catch-all. 3-LAYER MODEL:
+ * a branch is a `Category` (all aspects in it) or `Category/aspect` (just that Layer-2 aspect,
+ * matched via deriveAspect) — the CHARACTER is a tag, never a branch, so picking a branch no
+ * longer drags in every fact of a character. Matching is case-insensitive and tolerant of
+ * surrounding punctuation Agent 1 may wrap a pick in. Superseded history is excluded. Returns
+ * results in the same `{ fact, category }` shape retrieveFacts/formatFactsForWriter use,
+ * deduped by `category:key`. Unknown/hallucinated branches simply match nothing.
  * @param {Object<string, DatabaseSchema>} databases
- * @param {string[]} branches - Agent 1's branch picks (`Category` or `Category/subject`)
+ * @param {string[]} branches - Agent 1's branch picks (`Category` or `Category/aspect`)
  * @returns {Array<{fact: Object, category: string}>}
  */
 export function collectBranchFacts(databases, branches) {
@@ -1147,9 +1350,9 @@ export function collectBranchFacts(databases, branches) {
         out.push({ fact, category });
     };
 
-    // Parse picks into a set of wanted categories and category/subject pairs.
-    const wantWholeCat = new Set();       // lowercased category names (all subjects)
-    const wantCatSubject = new Set();     // `category||subject` lowercased pairs
+    // Parse picks into a set of wanted categories and category/aspect pairs.
+    const wantWholeCat = new Set();       // lowercased category names (all aspects)
+    const wantCatAspect = new Set();      // `category||aspect` lowercased pairs
     for (const raw of (branches || [])) {
         const s = String(raw ?? '');
         const slashIdx = s.indexOf('/');
@@ -1158,9 +1361,9 @@ export function collectBranchFacts(databases, branches) {
             if (cat) wantWholeCat.add(cat);
         } else {
             const cat = norm(s.slice(0, slashIdx));
-            const subj = norm(s.slice(slashIdx + 1));
-            if (cat && subj) wantCatSubject.add(`${cat}||${subj}`);
-            else if (cat) wantWholeCat.add(cat); // `Category/` with empty subject -> whole category
+            const asp = norm(s.slice(slashIdx + 1));
+            if (cat && asp) wantCatAspect.add(`${cat}||${asp}`);
+            else if (cat) wantWholeCat.add(cat); // `Category/` with empty aspect -> whole category
         }
     }
 
@@ -1171,8 +1374,8 @@ export function collectBranchFacts(databases, branches) {
         for (const fact of (db.facts || [])) {
             if (!isActiveFact(fact)) continue;
             if (wholeCat || isUnsorted) { push(category, fact); continue; }
-            const subj = deriveSubject(fact);
-            if (subj && wantCatSubject.has(`${catLower}||${subj}`)) push(category, fact);
+            const asp = deriveAspect(fact);
+            if (asp && wantCatAspect.has(`${catLower}||${asp}`)) push(category, fact);
         }
     }
     return out;
@@ -1292,6 +1495,12 @@ async function deleteAttachmentFile(url) {
  * @property {string} [supersededBy] - OPTIONAL key of the fact that replaced this value
  *   (history breadcrumb). For in-place supersession the key is unchanged, so this equals
  *   the fact's own key. Absent while active.
+ * @property {string} [aspect] - OPTIONAL Layer-2 aspect (3-layer model): a granular,
+ *   character-agnostic sub-bucket WITHIN the fact's Layer-1 `category`, picked from a FIXED
+ *   per-category vocab (see TAXONOMY). Emitted by Agent 3 via the `aspect:` marker; when
+ *   absent/invalid it resolves to the category's default aspect via deriveAspect(). This is
+ *   the menu's Layer-2 branch axis (replacing the old character-as-subject branch).
+ *   Backward-compatible: facts without it resolve to the default aspect on read.
  * @property {string} [subject] - OPTIONAL subject axis (feature: subject axis): the who/what
  *   the fact is about (a character or place name, e.g. `<name>`). Emitted by Agent 3 via the
  *   `subj:` marker; when absent it is DERIVED deterministically from the key prefix (the

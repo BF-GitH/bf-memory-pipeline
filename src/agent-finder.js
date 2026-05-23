@@ -12,7 +12,7 @@
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 import { isFactVisible } from './fact-retrieval.js';
-import { deriveSubject } from './database.js';
+import { deriveSubject, deriveAspect } from './database.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_FINDER_PROMPT)
 function getSettingsSafe() {
@@ -173,12 +173,13 @@ function parseFinderResult(response, candidates, maxFacts) {
             if (chosen.length >= maxFacts) break;
             continue;
         }
-        // Tolerate a `Category/subject` pick (no exact key): admit all candidates in that
-        // category whose derived subject matches. Keeps the finder useful if it picks at
-        // subject granularity instead of leaf-key granularity.
+        // Tolerate a non-leaf pick (no exact key): admit all candidates in that category
+        // whose derived Layer-2 ASPECT matches (the 3-layer menu axis), OR — for back-compat —
+        // whose derived subject matches. Keeps the finder useful if it picks at branch
+        // granularity (`Category/aspect`) instead of leaf-key granularity.
         for (const c of candidates) {
             if (norm(c.category) !== cat) continue;
-            if (deriveSubject(c.fact) !== key) continue;
+            if (deriveAspect(c.fact) !== key && deriveSubject(c.fact) !== key) continue;
             const id = `${c.category}:${c.fact.key}`;
             if (taken.has(id)) continue;
             taken.add(id);

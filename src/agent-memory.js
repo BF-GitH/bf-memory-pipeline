@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -40,12 +40,23 @@ DO NOT STORE:
 - Generic biology ("breathing", "heart beat").
 - Items momentarily in hand. Only \`carries / owns / wears\` persists.
 
-CATEGORIES: Identity, Relationships, World, History, Status, Behavior. If a fact fits NONE of these six, put it in Unsorted (the catch-all) rather than forcing a wrong category.
+FILING — TWO FIXED LAYERS (pick BOTH on every fact):
+- LAYER 1 \`Category\` (the domain), one of: People, Places, Things, Relationships, Events, World, Unsorted. (World = rules/lore/factions/setting. Unsorted = catch-all when none fit.)
+- LAYER 2 \`aspect:\` (a sub-bucket WITHIN the category), picked from the FIXED menu for that category:
+    People → identity, appearance, body, background, role, status, mood, goals, behavior, skills
+    Places → residence, public, region, feature
+    Things → object, key-item, substance
+    Relationships → bond, tension, history
+    Events → milestone, scene, action
+    World → rule, lore, faction, time
+    Unsorted → misc
+  If unsure of the aspect, omit it (a category default is used). NEVER invent an aspect outside the menu.
+- The CHARACTER a fact is about is NOT a category or aspect — it is a TAG. Tag it with \`| with:@<name>\` (use \`@npc\` for an unnamed/incidental person). The same character can appear under many categories/aspects.
 
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | subj:who_or_what | scope:character | with:<NAME>,<OBJECT> | at:<PLACE> | aka:nickname,role | conf:high | >context note
++ Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | >context note
 .
 #WHY <one sentence>
 
@@ -57,17 +68,19 @@ CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY wh
 
 ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
-IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ Identity/user_name = <NAME> | !5 | kind:trait\`. Do NOT omit them.
+IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
 
-SUBJECT (recommended): append \`| subj:<who_or_what>\` naming the character/place the fact is ABOUT (e.g. \`subj:<NAME>\`). If you omit it, the system derives the subject from the key prefix, so prefer keys that START with the subject (\`<NAME>_hair = ...\`).
+ASPECT (recommended): append \`| aspect:<value>\` choosing the Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current mood is \`People\` + \`aspect:mood\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
 
-SCOPE (recommended): append \`| scope:character|place|event\`. \`character\` = sticks to a person (traits/state/behavior); \`place\` = a location/world thing recalled when the PLACE matters even if its owner is absent; \`event\` = something that happened (anchored to a place + people + time). If omitted the system infers it from category (World→place, History→event, else character). For a PLACE fact also set \`| subj:<PLACE>\` so the location files under the place, not its owner — write \`+ World/<NAME>_<PLACE>_decor = ... | subj:<PLACE> | scope:place\`.
+CHARACTER TAG (recommended): name the character a People/Things/Relationships fact is ABOUT with \`| subj:<name>\` (the owner), AND list every participant with \`| with:@<name>,@<other>\`. The character is a TAG, never the Layer-1 category or Layer-2 aspect — the same person appears across many categories/aspects. For an unnamed/incidental person use \`| subj:npc\` (see NPC). For a PLACE fact set \`| subj:<PLACE>\` instead so the location files under the place.
 
-INVOLVED (optional): append \`| with:<A>,<B>\` listing the participants/entities IN the fact (distinct from @WhoKnows = who KNOWS it). If omitted the system auto-fills it. Use it especially to NAME an unnamed person (see NPC below).
+SCOPE (recommended): append \`| scope:character|place|event\`. \`character\` = sticks to a person (traits/state/behavior); \`place\` = a location/world thing recalled when the PLACE matters even if its owner is absent; \`event\` = something that happened (anchored to a place + people + time). If omitted the system infers it from category (Places/World→place, Events→event, else character). For a PLACE fact also set \`| subj:<PLACE>\` so the location files under the place, not its owner — write \`+ Places/<NAME>_<PLACE>_decor = ... | aspect:feature | subj:<PLACE> | scope:place\`.
 
-NPC DRAWER (important): for a fact about an UNNAMED or one-off/incidental person (a passing stranger, "the man by the window", an unnamed waiter), file it under the shared subject by writing \`| subj:npc\` AND name the person in \`| with:<the descriptor>\` (e.g. \`| subj:npc | with:the man by the window\`). Keep the category/kind as normal. This stops walk-ons from cluttering the store; a later step promotes them once they get a real name.
+INVOLVED (recommended): append \`| with:@<A>,@<B>\` listing the participants/entities IN the fact — this is the CHARACTER TAG axis (distinct from @WhoKnows = who KNOWS it). If omitted the system auto-fills it from names in the value. Use it especially to NAME an unnamed person (see NPC below).
 
-LOCATION (optional, events): for an \`scope:event\` fact, append \`| at:<PLACE>\` naming WHERE it happened (a place subject/key). Pair with \`with:\` (who) so the event links place⇄people. Example: \`+ History/char_admission = ... | scope:event | at:<PLACE> | with:<NAME>\`.
+NPC DRAWER (important): for a fact about an UNNAMED or one-off/incidental person (a passing stranger, "the man by the window", an unnamed waiter), file it under the shared subject by writing \`| subj:npc\` AND name the person in \`| with:the man by the window\` (the descriptor). Keep the category/aspect/kind as normal. This stops walk-ons from cluttering the store; a later step promotes them once they get a real name.
+
+LOCATION (optional, events): for an \`scope:event\` fact, append \`| at:<PLACE>\` naming WHERE it happened (a place subject/key). Pair with \`with:\` (who) so the event links place⇄people. Example: \`+ Events/char_admission = ... | aspect:milestone | scope:event | at:<PLACE> | with:@<NAME>\`.
 
 CONFIDENCE (optional): append \`| conf:high|med|low\` (or a 0-1 number) when the fact is uncertain or inferred rather than plainly stated. Omit for plainly-stated facts (treated as high).
 
@@ -95,7 +108,7 @@ ATOMIC FORMAT — always write this instead:
 
 + Something/item_status = missing
 
-+ Behavior/tell_name = defensive tell
++ People/tell_name = defensive tell
 
 # EXAMPLES (6)
 
@@ -103,24 +116,24 @@ ATOMIC FORMAT — always write this instead:
 Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD>, I'm allergic to <ALLERGEN>, and honestly I'm exhausted today."
 
 #MEM
-+ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity | @src:user | !5 | kind:trait
-+ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job | @src:user | !4 | kind:trait
-+ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role | @src:user | !4 | kind:trait
-+ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
-+ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
-+ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
-+ Status/user_mood        = exhausted  | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
++ People/user_name      = <NAME>     | aspect:identity   | subj:{{user}} | @{{user}},{{char}} | #identity | @src:user | !5 | kind:trait
++ People/user_employer  = <ORG>      | aspect:role       | subj:{{user}} | @{{user}},{{char}} | #identity,job | @src:user | !4 | kind:trait
++ People/user_role      = <ROLE>     | aspect:role       | subj:{{user}} | @{{user}},{{char}} | #role | @src:user | !4 | kind:trait
++ People/user_location  = <CITY>     | aspect:status     | subj:{{user}} | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
++ People/user_likes_food = <FOOD>    | aspect:background | subj:{{user}} | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
++ People/user_allergy   = <ALLERGEN> | aspect:body       | subj:{{user}} | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
++ People/user_mood      = exhausted  | aspect:mood       | subj:{{user}} | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
 .
-#WHY Foundational identity (name) is a high-importance durable trait (!5); current mood is a low-importance transient state (!1, kind:state) that should fade first under cap.
+#WHY All People facts about {{user}} (the character is a tag via subj/with, not a branch); Layer-2 aspect splits them (identity/role/body/mood). Name is a high-importance durable trait (!5); mood is a low-importance transient state (!1) that fades first under cap.
 
 ---
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
 
 #MEM
-+ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char | !3 | kind:trait | aka:the scar,old scar
-+ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory | @src:char | !3 | kind:trait
++ People/char_scar         = true           | aspect:appearance | subj:{{char}} | @{{char}},{{user}} | #appearance | @src:char | !3 | kind:trait | aka:the scar,old scar
++ People/char_scar_origin  = childhood fall | aspect:background | subj:{{char}} | @{{char}},{{user}} | #backstory | @src:char | !3 | kind:trait
 .
-#WHY Lasting reveal in asterisks → atomic split: existence + origin. \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
+#WHY Lasting reveal in asterisks → atomic split: existence (appearance) + origin (background). \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
 
 ---
 Input: [USER:{{user}}] *grins and shrugs.*
@@ -140,24 +153,24 @@ Input: [USER:{{user}}] [OOC: can we slow the pacing down?]
 Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too close.*
 
 #MEM
-+ Behavior/char_collar_tug = defensive tell | @{{char}},{{user}} | #tell,mannerism | !2 | kind:trait
++ People/char_collar_tug = defensive tell | aspect:behavior | subj:{{char}} | @{{char}},{{user}} | #tell,mannerism | !2 | kind:trait
 .
-#WHY Recurring mannerism with explicit trigger — distinct from one-off transient pose.
+#WHY Recurring mannerism with explicit trigger (People/behavior) — distinct from one-off transient pose.
 
 ---
 Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place is wrong."
 
 #MEM
-+ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location | !3 | kind:state | ~
-+ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event | !2 | kind:event
++ People/user_location  = <NEW_PLACE>                 | aspect:status | subj:{{user}} | @{{user}},{{char}} | #location | !3 | kind:state | ~
++ Events/user_relocated = <OLD_PLACE> to <NEW_PLACE>  | aspect:milestone | subj:{{user}} | @{{user}},{{char}} | #event | !2 | kind:event
 .
-#WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add a History event for the move.
+#WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add an Events fact for the move.
 
 ---
 Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} pretended to already have proof.*
 
 #MEM
-+ History/char_admission = took the <ITEM> | @{{char}},{{user}} | #event | @src:char | !3 | kind:event | >only admitted because <NAME> bluffed having proof; not a free confession
++ Events/char_admission = took the <ITEM> | aspect:milestone | subj:{{char}} | @{{char}},{{user}} | #event | @src:char | !3 | kind:event | >only admitted because <NAME> bluffed having proof; not a free confession
 .
 #WHY The admission is misleading without the note that it was baited — context attached because the situation changes its meaning.
 
@@ -165,12 +178,12 @@ Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} p
 Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then continues on to the <PLACE_C>.*
 
 #MEM
-+ World/char_location_1 = <PLACE_A> | @{{char}} | #location | !2 | kind:event | track:char_location
-+ World/char_location_2 = <PLACE_B> | @{{char}} | #location | !2 | kind:event | track:char_location
-+ World/char_location_3 = <PLACE_C> | @{{char}} | #location | !2 | kind:event | track:char_location
-+ Status/char_location  = <PLACE_C> | @{{char}} | #location | !3 | kind:state
++ Events/char_location_1 = <PLACE_A> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
++ Events/char_location_2 = <PLACE_B> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
++ Events/char_location_3 = <PLACE_C> | aspect:action | subj:{{char}} | @{{char}} | #location | !2 | kind:event | track:char_location
++ People/char_location   = <PLACE_C> | aspect:status | subj:{{char}} | @{{char}} | #location | !3 | kind:state
 .
-#WHY Ordered movement → one tracked step per place (history) PLUS a single overwriting current-location fact.
+#WHY Ordered movement → one tracked Events step per place (history) PLUS a single overwriting current-location fact on People/status.
 
 ---
 
@@ -339,10 +352,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         return result;
     }
 
-    // VALID_CATEGORIES — the six topical buckets plus `unsorted`, the mandatory
-    // "Lost & Found" catch-all (feature #1). A fact whose category matches none of the
-    // six is routed to Unsorted instead of being silently mis-filed as Status.
-    const VALID_CATEGORIES = ['identity', 'relationships', 'world', 'history', 'status', 'behavior', 'unsorted'];
+    // The mandatory "Lost & Found" catch-all (feature #1): a fact whose category resolves to
+    // no canonical Layer-1 name is routed here instead of being silently mis-filed.
     const UNSORTED_CATEGORY = 'Unsorted';
 
     for (const rawLine of memBlock.split('\n')) {
@@ -369,16 +380,19 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             category = pathPart.slice(0, slashIdx).trim();
             key = pathPart.slice(slashIdx + 1).trim();
         } else {
-            // No slash — treat whole thing as key, default to Status
-            category = 'Status';
+            // No slash — treat whole thing as key, default to People (the most common home
+            // for a bare fact in the 3-layer model; was Status under the old taxonomy).
+            category = 'People';
             key = pathPart;
         }
 
-        // Normalize category (capitalize first letter)
-        category = category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
-        if (!VALID_CATEGORIES.includes(category.toLowerCase())) {
-            // Feature #1: an unrecognized category goes to the Unsorted catch-all (NOT
-            // silently mis-filed as Status). It's a real, valid home; later phases read it.
+        // 3-LAYER MODEL: resolve the raw category to a canonical Layer-1 name. mapLegacyCategory
+        // accepts BOTH the new set (People/Places/Things/Relationships/Events/World/Unsorted)
+        // and the OLD set (Identity/Status/Behavior/History/...), folding legacy names onto the
+        // new ones so a model still emitting old categories keeps working. A truly unrecognized
+        // category routes to the Unsorted catch-all (feature #1) rather than being mis-filed.
+        category = mapLegacyCategory(category);
+        if (!L1_CATEGORIES.includes(category)) {
             category = UNSORTED_CATEGORY;
         }
 
@@ -401,6 +415,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let supersedes = false; // Supersession feature: optional `~` marker (replaces prior value)
         let aliases = [];      // Layer A (alias retrieval): optional alt names/nicknames (`aka:` marker)
         let subject = '';      // Subject axis (feature): optional who/what the fact is about (`subj:` marker)
+        let aspect = '';       // Layer-2 aspect (3-layer model): optional sub-bucket within the category (`aspect:` marker)
         let confidence = null; // Provenance (feature): optional 0-1 number or low|med|high (`conf:` marker)
         let scope = '';        // Scope (feature): optional character|place|event (`scope:` marker)
         let involved = [];     // Involved (feature): optional participants/entities IN the fact (`with:` marker)
@@ -456,6 +471,17 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
                 continue;
             }
 
+            // aspect:<vocab> — OPTIONAL Layer-2 aspect (3-layer model): a granular sub-bucket
+            // WITHIN the Layer-1 category, picked from the fixed per-category vocab. `aspect:`
+            // does NOT collide with the existing |/@/#/rel:/@src:/>/track:/!N/kind:/subj:/scope:/
+            // with:/at:/conf:/aka:/~ grammar (no marker starts with `aspect`). When omitted or
+            // out-of-vocab it resolves to the category default via database.normalizeAspect.
+            const aspectMatch = seg.match(/^aspect\s*:\s*(.+)$/i);
+            if (aspectMatch) {
+                aspect = aspectMatch[1].trim().toLowerCase();
+                continue;
+            }
+
             // scope:<character|place|event> — OPTIONAL recall axis (scope feature). `scope:`
             // does NOT collide with the existing |/@/#/rel:/@src:/>/track:/!N/kind:/subj:/aka:/
             // conf:/~ grammar. When omitted the scope is INFERRED from category/track downstream.
@@ -471,7 +497,14 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             // omitted, `involved` is AUTO-FILLED downstream from knownBy + value entities.
             const withMatch = seg.match(/^with\s*:\s*(.+)$/i);
             if (withMatch) {
-                involved = withMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+                // 3-layer model: the character tag is written as `@<name>` (and `@npc` for an
+                // unnamed person). Strip the leading `@` sigil so `involved` holds clean names —
+                // this keeps the character-registry discovery (agent-entities.js, which reads
+                // `involved`/`subject`/`about`) working unchanged. A bare descriptor (no `@`)
+                // is also accepted (used for the NPC drawer's provisional descriptor).
+                involved = withMatch[1].split(',')
+                    .map(s => s.trim().replace(/^@/, '').trim())
+                    .filter(Boolean);
                 continue;
             }
 
@@ -567,15 +600,17 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         // INFER a sensible value from observable signals instead of silently accepting the
         // bland default, and FLAG inferred-vs-stated so the UI can surface it. The clamp in
         // database.js stays as a final safety net.
+        // Layer-2 aspect (3-layer model): resolve early so kind/importance inference can use it.
+        const resolvedAspect = normalizeAspect(aspect, category);
         const kindStated = !!kind;
         const importanceStated = Number.isInteger(importance);
         const inferred = [];
         if (!kindStated) {
-            kind = inferKindFromCategory(category, track);
+            kind = inferKindFromCategory(category, track, resolvedAspect);
             inferred.push('kind');
         }
         if (!importanceStated) {
-            importance = inferImportance(category, kind, key);
+            importance = inferImportance(category, kind, key, resolvedAspect);
             inferred.push('importance');
         }
 
@@ -602,6 +637,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         if (Number.isInteger(importance)) update.importance = importance;
         if (kind) update.kind = kind;
         if (inferred.length) update.inferredFields = inferred;
+        // Layer-2 aspect (3-layer model): the resolved aspect (computed above). Always present
+        // downstream so the menu/branch axis is well-defined.
+        update.aspect = resolvedAspect;
+
         // Scope (feature): attach an explicit scope when given, else INFER it deterministically
         // from category/track. Always present downstream so place-filing/recall can use it.
         const resolvedScope = normalizeScope(scope) || inferScopeFromCategory(category, track);
@@ -667,11 +706,14 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
  * @param {string} track - non-empty when the fact is a sequence step
  * @returns {('trait'|'state'|'event')}
  */
-function inferKindFromCategory(category, track) {
+function inferKindFromCategory(category, track, aspect) {
     if (track) return 'event';
+    const asp = String(aspect || '').toLowerCase();
     switch (String(category || '').toLowerCase()) {
-        case 'status': return 'state';
-        case 'history': return 'event';
+        case 'events': return 'event';
+        case 'people':
+            // Transient People aspects (current state) -> state; durable People facts -> trait.
+            return (asp === 'status' || asp === 'mood' || asp === 'goals') ? 'state' : 'trait';
         default: return 'trait';
     }
 }
@@ -686,9 +728,11 @@ function inferKindFromCategory(category, track) {
  * @param {string} key
  * @returns {number} 1..5
  */
-function inferImportance(category, kind, key) {
+function inferImportance(category, kind, key, aspect) {
     const cat = String(category || '').toLowerCase();
-    if (cat === 'identity') return 4;          // names/species/age skew foundational
+    const asp = String(aspect || '').toLowerCase();
+    // People identity/background skew foundational (names/species/age/origin).
+    if (cat === 'people' && (asp === 'identity' || asp === 'background')) return 4;
     if (kind === 'state') return 2;            // current mood/location fades fast
     if (kind === 'event') return 2;            // a single occurrence is usually minor
     return 3;                                  // ordinary default
@@ -709,10 +753,10 @@ function inferImportance(category, kind, key) {
 function inferScopeFromCategory(category, track) {
     if (track) return 'event';
     switch (String(category || '').toLowerCase()) {
-        case 'history': return 'event';
+        case 'events': return 'event';
+        case 'places': return 'place';
         case 'world': return 'place';
-        case 'status': return 'character';
-        default: return 'character';
+        default: return 'character'; // People/Things/Relationships/Unsorted -> character
     }
 }
 
@@ -867,6 +911,9 @@ async function applyUpdates(updates, existingDatabases) {
         // always present (stated or inferred in the parser).
         if (Number.isInteger(update.importance)) factToWrite.importance = update.importance;
         if (update.kind) factToWrite.kind = update.kind;
+        // Layer-2 aspect (3-layer model): forward the resolved aspect so the menu/branch
+        // axis is stored on the fact (always present after parse).
+        if (update.aspect) factToWrite.aspect = update.aspect;
         // Subject axis (feature): forward the (explicit-or-derived) subject so it's stored
         // as a real index axis. Confidence/validAt are provenance stamps (back-compat optional).
         if (update.subject) factToWrite.subject = update.subject;

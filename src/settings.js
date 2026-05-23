@@ -992,9 +992,17 @@ function setupTabs() {
 // --- Database View ---
 
 async function refreshDatabaseView() {
-    const { getAllDatabases } = await import('./database.js');
-    const databases = await getAllDatabases();
-    const categories = Object.keys(databases);
+    const { getAllDatabases, withSkeleton, MENU_CATEGORY_ORDER, aspectVocabFor, deriveAspect, isActiveFact } = await import('./database.js');
+    const real = await getAllDatabases();
+    // 3-layer model: overlay the empty Layer-1 skeleton so the FULL taxonomy (every category,
+    // count 0 when empty) is always shown — never "No databases yet". The skeleton is purely
+    // in-memory here (no empty files are written; categories persist only when a fact lands).
+    const databases = withSkeleton(real);
+    // Stable Layer-1 order first, then any custom extras.
+    const ordered = [];
+    for (const c of MENU_CATEGORY_ORDER) if (databases[c]) ordered.push(c);
+    for (const c of Object.keys(databases)) if (!ordered.includes(c)) ordered.push(c);
+    const categories = ordered;
 
     const statsEl = document.getElementById('bf_mem_db_stats');
     const listEl = document.getElementById('bf_mem_db_list');
@@ -1004,15 +1012,19 @@ async function refreshDatabaseView() {
     const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
     statsEl.innerHTML = `<b>${categories.length}</b> databases | <b>${totalFacts}</b> total facts`;
 
-    if (categories.length === 0) {
-        listEl.innerHTML = '<div class="bf-mem-empty">No databases yet. They will be created as you chat.</div>';
-        return;
-    }
-
     listEl.innerHTML = categories.map(cat => {
         const db = databases[cat];
         const factCount = db.facts.length;
         const knowers = [...new Set(db.facts.flatMap(f => f.knownBy || []))];
+        // Layer-2 aspect breakdown: show the full fixed vocab for this category with active
+        // counts (0 when empty) so the skeleton is visible even before any fact lands.
+        const aspectCounts = new Map();
+        for (const f of db.facts) {
+            if (!isActiveFact(f)) continue;
+            const a = deriveAspect(f);
+            aspectCounts.set(a, (aspectCounts.get(a) || 0) + 1);
+        }
+        const aspectStr = aspectVocabFor(cat).map(a => `${a}:${aspectCounts.get(a) || 0}`).join(', ');
         return `
             <div class="bf-mem-db-card" data-category="${escapeHtml(cat)}">
                 <div class="bf-mem-db-card-header">
@@ -1020,6 +1032,7 @@ async function refreshDatabaseView() {
                     <span class="bf-mem-db-card-count">${factCount}/50</span>
                 </div>
                 <div class="bf-mem-db-card-meta">
+                    <div class="bf-mem-db-card-aspects">${escapeHtml(aspectStr)}</div>
                     ${knowers.length ? `Known by: ${escapeHtml(knowers.join(', '))}` : ''}
                 </div>
                 <div class="bf-mem-db-card-actions">
@@ -1160,8 +1173,11 @@ async function loadDbProfile(profileName) {
         await deleteDatabase(category);
     }
 
-    // Load profile databases
+    // Load profile databases. Skip EMPTY (factless) categories — the Layer-1 skeleton is
+    // shown in-memory (withSkeleton); empty categories aren't persisted as attachment files
+    // (write-on-first-fact), avoiding empty-upload spam.
     for (const [category, db] of Object.entries(profile.databases || {})) {
+        if (!db || !Array.isArray(db.facts) || db.facts.length === 0) continue;
         await saveDatabase({ ...db, category });
     }
 
@@ -1460,12 +1476,19 @@ async function autoSaveDbProfile() {
             // Only auto-create if we're entering a chat for the first time
             if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
             if (!extensionSettings.dbProfiles[chatLabel]) {
+                // 3-layer model: seed the new profile's in-memory databases with the empty
+                // Layer-1 skeleton so the full taxonomy "exists" from turn 1 (visible in the
+                // menu / Database tab, pickable by Agent 1). These are EMPTY (zero facts) and
+                // are NOT written as attachment files here — a category file is persisted only
+                // when a real fact lands (write-on-first-fact via Agent 3 / saveDatabase), so
+                // we never spam the backend with empty uploads.
+                const { buildSkeletonDatabases } = await import('./database.js');
                 extensionSettings.dbProfiles[chatLabel] = {
-                    databases: {},
+                    databases: buildSkeletonDatabases(),
                     savedAt: Date.now(),
                     linkedChats: [chatId],
                 };
-                addDebugLog('info', `Auto-created DB profile "${chatLabel}" for chat ${chatId}`);
+                addDebugLog('info', `Auto-created DB profile "${chatLabel}" (seeded Layer-1 skeleton) for chat ${chatId}`);
             } else {
                 // Profile with that name exists, link this chat to it
                 linkChatToProfile(chatLabel, chatId);
@@ -1484,8 +1507,11 @@ async function autoSaveDbProfile() {
                 await deleteDatabase(category);
             }
 
-            // Load saved
+            // Load saved. Skip EMPTY (factless) categories: the Layer-1 skeleton is seeded in
+            // memory and shown via withSkeleton — persisting empty categories as attachments
+            // would spam the backend with empty uploads (write-on-first-fact instead).
             for (const [category, db] of Object.entries(profile.databases || {})) {
+                if (!db || !Array.isArray(db.facts) || db.facts.length === 0) continue;
                 await saveDatabase({ ...db, category });
             }
 
