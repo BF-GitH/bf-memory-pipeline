@@ -11,6 +11,62 @@ const DB_PREFIX = 'bf_memory_db_';
 // beyond this cap is now logged (FIX #4) instead of happening silently.
 const MAX_FACTS_PER_DB = 50;
 
+// Salience defaults (importance/kind feature). Applied when a fact lacks the field so
+// older facts behave sensibly. importance is 1-5 (3 = neutral), kind is trait/state/event.
+export const DEFAULT_IMPORTANCE = 3;
+export const DEFAULT_KIND = 'trait';
+const VALID_KINDS = new Set(['trait', 'state', 'event']);
+
+// Salience-aware eviction tuning (saveDatabase). A fact's keep-score blends normalized
+// importance with a recency term, and `kind` sets how fast recency decays:
+//   score = IMPORTANCE_WEIGHT*(importance/5) + RECENCY_WEIGHT*recencyDecay(age, kind)
+// Traits decay slowly (long half-life → near-permanent protection for foundational
+// identity facts even when stale); states/events decay fast so transient goals/moods
+// lose to permanent traits when the cap forces a cut. Lowest score is evicted first.
+const IMPORTANCE_WEIGHT = 0.65;
+const RECENCY_WEIGHT = 0.35;
+// Half-lives in days (recency term = 0.5 ** (ageDays / halfLife)).
+const HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
+
+/**
+ * Clamp an importance value to an integer 1-5, defaulting when absent/invalid.
+ * @param {*} v
+ * @returns {number} 1..5
+ */
+export function clampImportance(v) {
+    const n = Math.round(Number(v));
+    if (!Number.isFinite(n)) return DEFAULT_IMPORTANCE;
+    return Math.min(5, Math.max(1, n));
+}
+
+/**
+ * Normalize a kind to one of trait|state|event, defaulting when absent/invalid.
+ * @param {*} v
+ * @returns {('trait'|'state'|'event')}
+ */
+export function normalizeKind(v) {
+    const k = String(v || '').trim().toLowerCase();
+    return VALID_KINDS.has(k) ? k : DEFAULT_KIND;
+}
+
+/**
+ * Compute a salience keep-score for a non-sequence fact. Higher = more worth keeping.
+ * Blends importance (foundational-ness) with kind-modulated recency decay so durable
+ * traits survive even when old, while transient states/events fade fast.
+ * @param {FactSchema} fact
+ * @param {number} now - reference timestamp (ms)
+ * @returns {number}
+ */
+function salienceScore(fact, now) {
+    const importance = clampImportance(fact?.importance);
+    const kind = normalizeKind(fact?.kind);
+    const last = Number(fact?.lastUpdated) || 0;
+    const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500; // never-updated → very old
+    const halfLife = HALF_LIFE_DAYS[kind] || HALF_LIFE_DAYS.trait;
+    const recency = Math.pow(0.5, ageDays / halfLife); // 1 (fresh) → 0 (ancient)
+    return IMPORTANCE_WEIGHT * (importance / 5) + RECENCY_WEIGHT * recency;
+}
+
 function getContext() {
     return SillyTavern.getContext();
 }
@@ -73,22 +129,28 @@ export async function saveDatabase(db) {
     // Enforce max facts limit.
     if (db.facts.length > MAX_FACTS_PER_DB) {
         const evictCount = db.facts.length - MAX_FACTS_PER_DB;
-        // Feature #4 — continuity-aware eviction. A sequence track is a contiguous
-        // chain (step ords 1..N); eviction must NOT punch holes mid-chain or wipe a
-        // whole track. Policy:
-        //   1) Evict NON-sequence facts first, oldest-lastUpdated first (existing rule).
+        // Feature #4 + salience — continuity-aware, salience-aware eviction. A sequence
+        // track is a contiguous chain (step ords 1..N); eviction must NOT punch holes
+        // mid-chain or wipe a whole track. Policy:
+        //   1) Evict NON-sequence facts first, LOWEST salience score first (importance +
+        //      kind-modulated recency) so foundational traits survive and transient
+        //      states/goals are shed first — replaces the old plain oldest-first rule.
         //   2) If still over cap, trim each track from its OLDEST steps inward (lowest
         //      ord first), keeping the latest steps so the recent chain (and the
-        //      "current" tail used by retrieval) stays intact and contiguous.
+        //      "current" tail used by retrieval) stays intact and contiguous (unchanged).
+        const now = Date.now();
         const seqFacts = db.facts.filter(isSequenceFact);
         const nonSeqFacts = db.facts.filter(f => !isSequenceFact(f));
 
-        // Step 1: drop oldest non-sequence facts.
-        nonSeqFacts.sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+        // Step 1: drop lowest-salience non-sequence facts (sort descending so pop() takes
+        // the lowest score). Record the score on each evicted fact for the debug log.
+        nonSeqFacts.sort((a, b) => salienceScore(b, now) - salienceScore(a, now));
         const evicted = [];
         let overflow = (nonSeqFacts.length + seqFacts.length) - MAX_FACTS_PER_DB;
         while (overflow > 0 && nonSeqFacts.length > 0) {
-            evicted.push(nonSeqFacts.pop());
+            const f = nonSeqFacts.pop();
+            f.__evictScore = salienceScore(f, now); // transient annotation for logging
+            evicted.push(f);
             overflow--;
         }
 
@@ -129,9 +191,19 @@ export async function saveDatabase(db) {
         // console.warn, so late-session facts vanished from exports with no trace
         // in the user-visible debug log. Surface it. (Cap value unchanged — see
         // MAX_FACTS_PER_DB note; raising it is the owner's cost decision.)
-        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length + evictCount} facts, evicting ${evictCount} least-recently-updated`);
-        const evictedKeys = evicted.map(f => f.key).filter(Boolean).join(', ');
-        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, non-sequence oldest-first then oldest track steps): ${evictedKeys}`);
+        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length + evictCount} facts, evicting ${evictCount} lowest-salience`);
+        // Report the score reason: each non-sequence eviction shows key, score, importance
+        // and kind so the user can see WHY it lost. Track-step evictions have no score.
+        const evictedDesc = evicted.map(f => {
+            if (typeof f.__evictScore === 'number') {
+                const imp = clampImportance(f.importance);
+                const kind = normalizeKind(f.kind);
+                return `${f.key || '?'} (score ${f.__evictScore.toFixed(2)}, imp ${imp}, ${kind})`;
+            }
+            return `${f.key || '?'} (track step)`;
+        }).filter(Boolean).join(', ');
+        for (const f of evicted) delete f.__evictScore; // strip transient annotation (don't persist)
+        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, lowest-salience non-sequence first then oldest track steps): ${evictedDesc}`);
     }
 
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
@@ -250,9 +322,10 @@ export function upsertFact(db, fact) {
             const existing = db.facts[exactKeyIdx];
             const mergedRels = mergeRelationships(existing.relationships, seqFact.relationships);
             const mergedContext = mergeContext(existing.context, seqFact.context);
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, lastUpdated: Date.now() };
+            const sal = mergeSalience(existing, seqFact);
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, ...sal, lastUpdated: Date.now() };
         } else {
-            db.facts.push({ ...seqFact, lastUpdated: Date.now() });
+            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
         }
         db.updatedAt = Date.now();
         return db;
@@ -282,11 +355,15 @@ export function upsertFact(db, fact) {
         // it provides its own (Feature #3) — so re-mentioning a fact without context
         // doesn't wipe a previously-attached note.
         const mergedContext = mergeContext(existing.context, fact.context);
+        // Merge salience: keep the HIGHER importance (a fact only grows more foundational
+        // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
+        // kind if the writer provided one, else keep existing.
+        const sal = mergeSalience(existing, fact);
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, lastUpdated: Date.now() };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, ...sal, lastUpdated: Date.now() };
     } else {
-        db.facts.push({ ...fact, lastUpdated: Date.now() });
+        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
     }
     db.updatedAt = Date.now();
     return db;
@@ -320,6 +397,48 @@ function nextOrdForTrack(db, track) {
         }
     }
     return max + 1;
+}
+
+/**
+ * Stamp normalized importance/kind onto a fresh (NEW) fact. Only writes the fields when
+ * the incoming fact actually provided them, so a fact written without them stays lean
+ * and falls back to DEFAULT_IMPORTANCE/DEFAULT_KIND at read time (back-compat).
+ * @param {FactSchema} fact
+ * @returns {{importance?: number, kind?: string}}
+ */
+function normalizeSalienceFields(fact) {
+    const out = {};
+    if (fact && fact.importance !== undefined && fact.importance !== null) {
+        out.importance = clampImportance(fact.importance);
+    }
+    if (fact && fact.kind !== undefined && fact.kind !== null && String(fact.kind).trim()) {
+        out.kind = normalizeKind(fact.kind);
+    }
+    return out;
+}
+
+/**
+ * Merge salience (importance/kind) on a fact update. Keep the HIGHER importance so a
+ * fact never loses foundational weight from a bare re-mention; prefer the incoming kind
+ * when provided, else keep the existing. Returns only the fields that should be set so
+ * a spread can't clobber an existing value with undefined.
+ * @param {FactSchema} existing
+ * @param {FactSchema} incoming
+ * @returns {{importance?: number, kind?: string}}
+ */
+function mergeSalience(existing, incoming) {
+    const out = {};
+    const hasIncImp = incoming && incoming.importance !== undefined && incoming.importance !== null;
+    const hasExImp = existing && existing.importance !== undefined && existing.importance !== null;
+    if (hasIncImp || hasExImp) {
+        const inc = hasIncImp ? clampImportance(incoming.importance) : -Infinity;
+        const ex = hasExImp ? clampImportance(existing.importance) : -Infinity;
+        out.importance = Math.max(inc, ex);
+    }
+    const incKind = incoming && incoming.kind !== undefined && incoming.kind !== null && String(incoming.kind).trim();
+    if (incKind) out.kind = normalizeKind(incoming.kind);
+    else if (existing && existing.kind) out.kind = normalizeKind(existing.kind);
+    return out;
 }
 
 /** Prefer an incoming context note; fall back to the existing one. Empty → undefined. */
@@ -593,6 +712,14 @@ async function deleteAttachmentFile(url) {
  *   exempt from reconcile-on-write collapse.
  * @property {number} [ord] - OPTIONAL monotonic step number within `track` (1-based),
  *   auto-assigned at write time.
+ * @property {number} [importance] - OPTIONAL salience 1-5 (Feature: importance/kind).
+ *   How foundational/poignant the fact is (5 = core identity, 1 = trivial transient).
+ *   Default 3 when absent (see DEFAULT_IMPORTANCE). Drives salience-aware eviction and
+ *   retrieval ordering. Absent on facts from older versions (backward-compatible).
+ * @property {('trait'|'state'|'event')} [kind] - OPTIONAL fact kind. `trait` = durable
+ *   (age, name, personality); `state` = current/transient (mood, current goal/location);
+ *   `event` = something that happened (often a track step). Default 'trait' when absent
+ *   (see DEFAULT_KIND). Modulates how fast a fact decays during eviction.
  */
 
 /**

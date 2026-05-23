@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact } from './database.js';
+import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, clampImportance, normalizeKind } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -127,16 +127,26 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // Always keep all primary; then fill secondary up to MAX_SECONDARY, then tertiary up
     // to MAX_TERTIARY. The legacy secondaryChance/tertiaryChance settings are no longer
     // used for gating (kept in settings for persistence; see settings.js note).
+    // SALIENCE-RANKED capping. Primary facts are ALWAYS kept (unsorted, unchanged). When
+    // secondary/tertiary candidates exceed their caps we must drop some — rank them by a
+    // DETERMINISTIC salience score (importance + recency, no Math.random) so higher-
+    // importance and more-recent facts win the slots instead of arbitrary match order.
     const MAX_SECONDARY = 12;
     const MAX_TERTIARY = 6;
-    let secondaryKept = 0;
-    let tertiaryKept = 0;
-    const filteredResults = directResults.filter(result => {
-        if (result.tier === 'primary') return true;
-        if (result.tier === 'secondary') return secondaryKept++ < MAX_SECONDARY;
-        if (result.tier === 'tertiary') return tertiaryKept++ < MAX_TERTIARY;
-        return false;
-    });
+    const now = Date.now();
+    const primary = directResults.filter(r => r.tier === 'primary');
+    const secondary = directResults.filter(r => r.tier === 'secondary');
+    const tertiary = directResults.filter(r => r.tier === 'tertiary');
+    // Stable-ish descending sort by salience (ties keep original relative order in V8's
+    // stable sort, so still deterministic).
+    const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
+    secondary.sort(byScore);
+    tertiary.sort(byScore);
+    const filteredResults = [
+        ...primary,
+        ...secondary.slice(0, MAX_SECONDARY),
+        ...tertiary.slice(0, MAX_TERTIARY),
+    ];
 
     // Filter by knownBy: only include facts the current character knows.
     // Empty knownBy means "everyone knows" (no filter).
@@ -208,6 +218,29 @@ function resolveExactKeys(databases, requests) {
         addDebugLog('info', `Exact-key resolution: ${results.length} fact(s) matched by identity`);
     }
     return results;
+}
+
+/**
+ * Deterministic salience score used to RANK which secondary/tertiary facts fill the
+ * limited slots (no Math.random). Mirrors the eviction blend at a coarse level: higher
+ * importance and more-recent facts score higher. kind modulates recency the same way as
+ * eviction (traits decay slowly; states/events fade fast). Primary facts never go through
+ * this — they're always kept — so this only orders the overflow tiers.
+ * @param {Object} fact
+ * @param {number} now - reference timestamp (ms)
+ * @returns {number}
+ */
+const RETRIEVAL_IMPORTANCE_WEIGHT = 0.65;
+const RETRIEVAL_RECENCY_WEIGHT = 0.35;
+const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
+function retrievalSalience(fact, now) {
+    const importance = clampImportance(fact?.importance);
+    const kind = normalizeKind(fact?.kind);
+    const last = Number(fact?.lastUpdated) || 0;
+    const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
+    const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
+    const recency = Math.pow(0.5, ageDays / halfLife);
+    return RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency;
 }
 
 /**

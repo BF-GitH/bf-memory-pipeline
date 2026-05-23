@@ -45,7 +45,7 @@ CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | >context note
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | >context note
 .
 #WHY <one sentence>
 
@@ -54,6 +54,8 @@ If nothing: just \`.\` immediately.
 SOURCE TAG (optional but preferred): append \`| @src:user\` if the fact was disclosed in the [USER] message, or \`| @src:char\` if it came from the [CHAR] message. This attributes each fact to the correct message. If you cannot tell, omit it.
 
 CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY when the fact's meaning depends on the surrounding situation and would be misread without it — e.g. a strategic admission that only makes sense once you know another party baited it. Do NOT add a context note to ordinary facts; most facts have none. The note is stored separately and never affects keyword search.
+
+IMPORTANCE + KIND (optional but preferred): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 3 = ordinary, 1 = trivial/passing) and \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Omit if unsure (defaults: !3, kind:trait).
 
 SEQUENCE STEPS (optional): for things that form a genuine ORDERED SERIES over time — a character's location changing place to place, plot milestones in order — emit each step as its OWN fact with \`| track:<track_name>\`. Use a stable track name tied to the subject (e.g. \`<char>_location\`). Give each step a numbered key (\`<char>_location_1\`, \`_2\`, ...); do NOT worry about getting the number right — the system assigns the real order. ALSO keep one plain overwriting current-state fact (e.g. \`<char>_location = <current_place>\`, with NO track) so "where are they now" stays a single cheap fact. Only use tracks for real ordered series, never for unrelated facts.
 
@@ -82,17 +84,18 @@ ATOMIC FORMAT — always write this instead:
 # EXAMPLES (6)
 
 ---
-Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD> and I'm allergic to <ALLERGEN>."
+Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD>, I'm allergic to <ALLERGEN>, and honestly I'm exhausted today."
 
 #MEM
-+ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity | @src:user
-+ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job | @src:user
-+ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role | @src:user
-+ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location | @src:user
-+ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food | @src:user
-+ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy | @src:user
++ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity | @src:user | !5 | kind:trait
++ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job | @src:user | !4 | kind:trait
++ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role | @src:user | !4 | kind:trait
++ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location | @src:user | !4 | kind:trait
++ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food | @src:user | !3 | kind:trait
++ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy | @src:user | !4 | kind:trait
++ Status/user_mood        = exhausted  | @{{user}},{{char}} | #mood | @src:user | !1 | kind:state
 .
-#WHY Rich self-disclosure → split each property into its own atomic fact.
+#WHY Foundational identity (name) is a high-importance durable trait (!5); current mood is a low-importance transient state (!1, kind:state) that should fade first under cap.
 
 ---
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
@@ -368,9 +371,27 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let context = '';   // Feature #3: optional prose note (delimiter: a `>` segment)
         let track = '';     // Feature #4: optional sequence track name (`track:<name>`)
         let ord = null;     // Feature #4: optional explicit step number (auto-assigned if absent)
+        let importance = null; // Salience feature: optional 1-5 (`!N` marker)
+        let kind = '';         // Salience feature: optional trait|state|event (`kind:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
+
+            // !N — OPTIONAL importance 1-5 (salience feature). `!` was chosen because it
+            // does NOT collide with the existing |/@/#/rel:/@src:/>/track: grammar.
+            const impMatch = seg.match(/^!\s*([1-5])\b/);
+            if (impMatch) {
+                importance = parseInt(impMatch[1], 10);
+                continue;
+            }
+
+            // kind:<trait|state|event> — OPTIONAL fact kind (salience feature). Anything
+            // else is ignored and falls back to the default kind at storage time.
+            const kindMatch = seg.match(/^kind\s*:\s*(trait|state|event)\b/i);
+            if (kindMatch) {
+                kind = kindMatch[1].toLowerCase();
+                continue;
+            }
 
             // >context — OPTIONAL prose note (Feature #3). `>` was chosen because it
             // does NOT collide with the existing |/@/#/rel:/@src: grammar. Only attach
@@ -458,6 +479,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             update.track = track;
             if (Number.isInteger(ord) && ord > 0) update.ord = ord;
         }
+        // Salience feature: only attach importance/kind when the writer provided them, so
+        // facts without them stay lean and fall back to defaults at storage/read time.
+        if (Number.isInteger(importance)) update.importance = importance;
+        if (kind) update.kind = kind;
         result.updates.push(update);
     }
 
@@ -538,6 +563,10 @@ async function applyUpdates(updates, existingDatabases) {
             factToWrite.track = update.track;
             if (Number.isInteger(update.ord) && update.ord > 0) factToWrite.ord = update.ord;
         }
+        // Salience feature: forward importance/kind so upsertFact can merge (keep higher
+        // importance) and persist them for eviction + retrieval scoring.
+        if (Number.isInteger(update.importance)) factToWrite.importance = update.importance;
+        if (update.kind) factToWrite.kind = update.kind;
         upsertFact(db, factToWrite);
         const relCount = update.relationships?.length || 0;
         addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
