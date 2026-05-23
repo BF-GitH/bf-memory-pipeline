@@ -414,6 +414,25 @@ export function upsertFact(db, fact) {
             existingIdx = db.facts.findIndex(f => !isSequenceFact(f) && normalizeFactKey(f.key) === normIncoming);
         }
     }
+    // 3) STRONGER PARALLEL-KEY DEDUP (feature #5): if STILL no match and the incoming
+    //    write is a changeable `state`, look for an existing CURRENT state fact with the
+    //    SAME subject + SAME leading facet/aspect under a parallel key (the real-data bug:
+    //    four live `fiona_clothing*` facts for one evolving thing). Only the incoming
+    //    `state` kind is considered — untyped/trait/event writes never trigger this, to
+    //    stay conservative. The match is then routed through the existing supersession
+    //    path below (which snapshots the old value as history), so a parallel near-dup
+    //    updates the canonical fact instead of coexisting. We pin the canonical key to the
+    //    matched fact's key so subsequent writes converge on it.
+    if (existingIdx < 0 && normalizeKind(fact.kind) === 'state'
+        && fact.kind !== undefined && fact.kind !== null && String(fact.kind).trim()) {
+        const parallelIdx = findParallelStateKey(db, fact, -1);
+        if (parallelIdx >= 0) {
+            existingIdx = parallelIdx;
+            // Adopt the existing canonical key so the merge updates-in-place / supersedes
+            // rather than renaming (mirrors the in-place-correction policy below).
+            fact = { ...fact, key: db.facts[parallelIdx].key };
+        }
+    }
     if (existingIdx >= 0) {
         const existing = db.facts[existingIdx];
         // Merge relationships (union) rather than replace, so prior tier links survive.
@@ -501,6 +520,114 @@ function makeSupersededKey(db, canonicalKey) {
 /** Strip the superseded-snapshot suffix (and its numeric tail) back to the canonical key. */
 function stripSupersededSuffix(key) {
     return String(key || '').replace(new RegExp(`${SUPERSEDED_SUFFIX}\\d*$`), '');
+}
+
+/**
+ * Derive the SUBJECT axis of a fact (the who/what it is about) — feature: subject axis.
+ * Prefers an explicit `subject` field (emitted by Agent 3 via the `subj:` marker); falls
+ * back deterministically to the token before the first underscore in the key
+ * (`felix_apartment_bed` -> `felix`). Returns '' when neither is derivable. Lowercased,
+ * trimmed. Back-compat: facts with no `subject` field still resolve via the key prefix.
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+export function deriveSubject(fact) {
+    if (!fact) return '';
+    const explicit = String(fact.subject || '').trim().toLowerCase();
+    if (explicit) return explicit;
+    const key = String(fact.key || '').trim().toLowerCase();
+    if (!key) return '';
+    const us = key.indexOf('_');
+    return us > 0 ? key.slice(0, us) : key;
+}
+
+/**
+ * Derive the FACET/aspect of a fact: the key with its subject prefix removed and the
+ * trailing qualifier token (the last `_segment`) dropped, normalized. This groups
+ * temporal-state variants of ONE evolving thing
+ * (`fiona_clothing`, `fiona_clothing_change`, `fiona_clothing_current`) onto one aspect
+ * (`clothing`) so STRONGER-DEDUP can supersede instead of minting parallel keys, while
+ * keeping genuinely distinct sub-properties (`x_womens_clothing_stock` vs `..._reason`)
+ * apart only when they share NO leading facet token. Used together with a strict gate in
+ * upsertFact (state-only, same-subject, shared leading facet token) so the match stays
+ * conservative. Returns '' when the key is just the subject (no facet).
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+function factAspect(fact) {
+    const key = String(fact?.key || '').trim().toLowerCase();
+    if (!key) return '';
+    const subject = deriveSubject(fact);
+    // Strip a leading "subject_" prefix from the key when the subject came from the key.
+    let rest = key;
+    if (subject && key === subject) return ''; // key is just the subject — no facet
+    if (subject && key.startsWith(subject + '_')) rest = key.slice(subject.length + 1);
+    const tokens = rest.split('_').filter(Boolean);
+    if (tokens.length === 0) return '';
+    // Drop the trailing qualifier token when there's more than one facet token, so
+    // `clothing_change`/`clothing_current` collapse to `clothing` but a single-token
+    // facet (`clothing`) is preserved as-is.
+    const facetTokens = tokens.length > 1 ? tokens.slice(0, -1) : tokens;
+    return facetTokens.join('');
+}
+
+/**
+ * Leading facet token of a fact (first token after the subject prefix). Used as the
+ * conservative shared-aspect gate for STRONGER-DEDUP — two state facts must agree on
+ * this token (and subject) before parallel-key reconciliation is even considered.
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+function leadingFacetToken(fact) {
+    const key = String(fact?.key || '').trim().toLowerCase();
+    if (!key) return '';
+    const subject = deriveSubject(fact);
+    let rest = key;
+    if (subject && key === subject) return '';
+    if (subject && key.startsWith(subject + '_')) rest = key.slice(subject.length + 1);
+    const tokens = rest.split('_').filter(Boolean);
+    return tokens[0] || '';
+}
+
+/**
+ * STRONGER-DEDUP (feature #5): find an existing NON-sequence STATE fact that the incoming
+ * write should supersede because it describes the SAME subject + SAME evolving aspect
+ * under a parallel key (e.g. incoming `fiona_clothing_current` vs stored `fiona_clothing`).
+ * Conservative gate — ALL must hold:
+ *   - both incoming and candidate resolve to a non-empty, EQUAL subject,
+ *   - both share the same leading facet token (so `clothing*` only merges with `clothing*`),
+ *   - the candidate is a CURRENT `state` fact (durable traits/events are never collapsed),
+ *   - the incoming write is itself a state (or untyped — see caller; untyped is excluded),
+ *   - neither is a sequence/track fact (handled separately, append-only),
+ *   - the candidate is not the exact-key match already found.
+ * Returns the matched index or -1. Reuses the supersession path so the old value is kept
+ * as inactive history rather than silently overwritten.
+ * @param {DatabaseSchema} db
+ * @param {FactSchema} incoming
+ * @param {number} excludeIdx - index already matched by exact/normalized key (skip it)
+ * @returns {number}
+ */
+function findParallelStateKey(db, incoming, excludeIdx) {
+    if (!db || !Array.isArray(db.facts)) return -1;
+    if (isSequenceFact(incoming)) return -1;
+    const incSubject = deriveSubject(incoming);
+    if (!incSubject) return -1;
+    const incLead = leadingFacetToken(incoming);
+    if (!incLead) return -1;
+    const incAspect = factAspect(incoming);
+    if (!incAspect) return -1;
+    for (let i = 0; i < db.facts.length; i++) {
+        if (i === excludeIdx) continue;
+        const f = db.facts[i];
+        if (isSequenceFact(f)) continue;
+        if (f.active === false) continue;            // never reconcile onto history snapshots
+        if (normalizeKind(f.kind) !== 'state') continue; // only changeable state collapses
+        if (deriveSubject(f) !== incSubject) continue;
+        if (leadingFacetToken(f) !== incLead) continue;
+        if (factAspect(f) !== incAspect) continue;
+        return i;
+    }
+    return -1;
 }
 
 /**
@@ -909,6 +1036,17 @@ async function deleteAttachmentFile(url) {
  * @property {string} [supersededBy] - OPTIONAL key of the fact that replaced this value
  *   (history breadcrumb). For in-place supersession the key is unchanged, so this equals
  *   the fact's own key. Absent while active.
+ * @property {string} [subject] - OPTIONAL subject axis (feature: subject axis): the who/what
+ *   the fact is about (a character or place name, e.g. `felix`). Emitted by Agent 3 via the
+ *   `subj:` marker; when absent it is DERIVED deterministically from the key prefix (the
+ *   token before the first underscore) by deriveSubject(). Will become a retrieval index
+ *   axis. Backward-compatible: facts without it derive a subject from the key on read.
+ * @property {(number|string)} [confidence] - OPTIONAL provenance: how sure the fact is.
+ *   Either a 0-1 number or one of `low`/`med`/`high` (Agent 3 emits via the `conf:` marker).
+ *   Absent on older facts (backward-compatible).
+ * @property {number} [validAt] - OPTIONAL provenance: the source message index (or ms time)
+ *   at which the fact became true. Defaults to the source message index at write time.
+ *   Absent on older facts (backward-compatible).
  */
 
 /**

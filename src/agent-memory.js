@@ -40,12 +40,12 @@ DO NOT STORE:
 - Generic biology ("breathing", "heart beat").
 - Items momentarily in hand. Only \`carries / owns / wears\` persists.
 
-CATEGORIES: Identity, Relationships, World, History, Status, Behavior
+CATEGORIES: Identity, Relationships, World, History, Status, Behavior. If a fact fits NONE of these six, put it in Unsorted (the catch-all) rather than forcing a wrong category.
 
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | aka:nickname,role | >context note
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | subj:who_or_what | aka:nickname,role | conf:high | >context note
 .
 #WHY <one sentence>
 
@@ -57,7 +57,11 @@ CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY wh
 
 ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
-IMPORTANCE + KIND (optional but preferred): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 3 = ordinary, 1 = trivial/passing) and \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Omit if unsure (defaults: !3, kind:trait).
+IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ Identity/user_name = <NAME> | !5 | kind:trait\`. Do NOT omit them.
+
+SUBJECT (recommended): append \`| subj:<who_or_what>\` naming the character/place the fact is ABOUT (e.g. \`subj:<NAME>\`). If you omit it, the system derives the subject from the key prefix, so prefer keys that START with the subject (\`<NAME>_hair = ...\`).
+
+CONFIDENCE (optional): append \`| conf:high|med|low\` (or a 0-1 number) when the fact is uncertain or inferred rather than plainly stated. Omit for plainly-stated facts (treated as high).
 
 SUPERSEDES (optional): when a write REPLACES the prior value of an existing CHANGEABLE-STATE fact (a status, a current location, a goal now resolved — not a durable trait like a name), append \`| ~\` to mark the old value as ended history while the key becomes the new current truth. Only for \`kind:state\` facts whose value genuinely changed; omit for trait corrections and unchanged re-mentions (the system also infers this for changed kind:state facts, so \`~\` is optional).
 
@@ -105,8 +109,8 @@ Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I lov
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
 
 #MEM
-+ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char | aka:the scar,old scar
-+ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory | @src:char
++ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char | !3 | kind:trait | aka:the scar,old scar
++ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory | @src:char | !3 | kind:trait
 .
 #WHY Lasting reveal in asterisks → atomic split: existence + origin. \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
 
@@ -128,7 +132,7 @@ Input: [USER:{{user}}] [OOC: can we slow the pacing down?]
 Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too close.*
 
 #MEM
-+ Behavior/char_collar_tug = defensive tell | @{{char}},{{user}} | #tell,mannerism
++ Behavior/char_collar_tug = defensive tell | @{{char}},{{user}} | #tell,mannerism | !2 | kind:trait
 .
 #WHY Recurring mannerism with explicit trigger — distinct from one-off transient pose.
 
@@ -136,8 +140,8 @@ Input: [CHAR:{{char}}] *Adjusts collar — a reflex whenever a topic hits too cl
 Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place is wrong."
 
 #MEM
-+ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location | kind:state | ~
-+ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event | kind:event
++ Identity/user_location  = <NEW_PLACE>                | @{{user}},{{char}} | #location | !3 | kind:state | ~
++ History/user_relocated  = <OLD_PLACE> to <NEW_PLACE> | @{{user}},{{char}} | #event | !2 | kind:event
 .
 #WHY Same existing key user_location → it's a CHANGEABLE state, so `~` supersedes the old value (kept as history) and this becomes current. Add a History event for the move.
 
@@ -145,7 +149,7 @@ Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place i
 Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} pretended to already have proof.*
 
 #MEM
-+ History/char_admission = took the <ITEM> | @{{char}},{{user}} | #event | @src:char | >only admitted because <NAME> bluffed having proof; not a free confession
++ History/char_admission = took the <ITEM> | @{{char}},{{user}} | #event | @src:char | !3 | kind:event | >only admitted because <NAME> bluffed having proof; not a free confession
 .
 #WHY The admission is misleading without the note that it was baited — context attached because the situation changes its meaning.
 
@@ -153,10 +157,10 @@ Input: [CHAR:{{char}}] "Fine — yes, I took it." *only said it after {{user}} p
 Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then continues on to the <PLACE_C>.*
 
 #MEM
-+ World/char_location_1 = <PLACE_A> | @{{char}} | #location | track:char_location
-+ World/char_location_2 = <PLACE_B> | @{{char}} | #location | track:char_location
-+ World/char_location_3 = <PLACE_C> | @{{char}} | #location | track:char_location
-+ Status/char_location  = <PLACE_C> | @{{char}} | #location
++ World/char_location_1 = <PLACE_A> | @{{char}} | #location | !2 | kind:event | track:char_location
++ World/char_location_2 = <PLACE_B> | @{{char}} | #location | !2 | kind:event | track:char_location
++ World/char_location_3 = <PLACE_C> | @{{char}} | #location | !2 | kind:event | track:char_location
++ Status/char_location  = <PLACE_C> | @{{char}} | #location | !3 | kind:state
 .
 #WHY Ordered movement → one tracked step per place (history) PLUS a single overwriting current-location fact.
 
@@ -327,7 +331,11 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         return result;
     }
 
-    const VALID_CATEGORIES = ['identity', 'relationships', 'world', 'history', 'status', 'behavior'];
+    // VALID_CATEGORIES — the six topical buckets plus `unsorted`, the mandatory
+    // "Lost & Found" catch-all (feature #1). A fact whose category matches none of the
+    // six is routed to Unsorted instead of being silently mis-filed as Status.
+    const VALID_CATEGORIES = ['identity', 'relationships', 'world', 'history', 'status', 'behavior', 'unsorted'];
+    const UNSORTED_CATEGORY = 'Unsorted';
 
     for (const rawLine of memBlock.split('\n')) {
         // Strip leading bullets, numbering, whitespace
@@ -361,7 +369,9 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         // Normalize category (capitalize first letter)
         category = category.charAt(0).toUpperCase() + category.slice(1).toLowerCase();
         if (!VALID_CATEGORIES.includes(category.toLowerCase())) {
-            category = 'Status'; // fallback
+            // Feature #1: an unrecognized category goes to the Unsorted catch-all (NOT
+            // silently mis-filed as Status). It's a real, valid home; later phases read it.
+            category = UNSORTED_CATEGORY;
         }
 
         // Clean key to snake_case
@@ -382,6 +392,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let kind = '';         // Salience feature: optional trait|state|event (`kind:` marker)
         let supersedes = false; // Supersession feature: optional `~` marker (replaces prior value)
         let aliases = [];      // Layer A (alias retrieval): optional alt names/nicknames (`aka:` marker)
+        let subject = '';      // Subject axis (feature): optional who/what the fact is about (`subj:` marker)
+        let confidence = null; // Provenance (feature): optional 0-1 number or low|med|high (`conf:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -420,6 +432,25 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             const akaMatch = seg.match(/^aka\s*:\s*(.+)$/i);
             if (akaMatch) {
                 aliases = akaMatch[1].split(',').map(s => s.trim()).filter(Boolean);
+                continue;
+            }
+
+            // subj:<who_or_what> — OPTIONAL subject axis (feature: subject axis). Names the
+            // character/place the fact is ABOUT. `subj:` was chosen because it does NOT
+            // collide with the existing |/@/#/rel:/@src:/>/track:/!N/kind:/aka:/~ grammar.
+            // When omitted, the subject is DERIVED from the key prefix at storage time.
+            const subjMatch = seg.match(/^subj\s*:\s*(.+)$/i);
+            if (subjMatch) {
+                subject = subjMatch[1].trim();
+                continue;
+            }
+
+            // conf:<high|med|low|0-1> — OPTIONAL provenance confidence (feature: provenance).
+            // `conf:` does NOT collide with the existing grammar. Accepts a word or a 0-1 number.
+            const confMatch = seg.match(/^conf\s*:\s*(high|med(?:ium)?|low|0?\.\d+|0|1(?:\.0+)?)\b/i);
+            if (confMatch) {
+                const c = confMatch[1].toLowerCase();
+                confidence = /^[0-9.]+$/.test(c) ? parseFloat(c) : (c === 'medium' ? 'med' : c);
                 continue;
             }
 
@@ -492,6 +523,23 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             ? userMsgIndex
             : messageIndex;
 
+        // MANDATORY importance + kind (feature #3): the model is now told to put both on
+        // every fact, but we don't trust it to never omit them. When a field is missing we
+        // INFER a sensible value from observable signals instead of silently accepting the
+        // bland default, and FLAG inferred-vs-stated so the UI can surface it. The clamp in
+        // database.js stays as a final safety net.
+        const kindStated = !!kind;
+        const importanceStated = Number.isInteger(importance);
+        const inferred = [];
+        if (!kindStated) {
+            kind = inferKindFromCategory(category, track);
+            inferred.push('kind');
+        }
+        if (!importanceStated) {
+            importance = inferImportance(category, kind, key);
+            inferred.push('importance');
+        }
+
         const update = {
             action: 'add',
             category,
@@ -509,10 +557,19 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             update.track = track;
             if (Number.isInteger(ord) && ord > 0) update.ord = ord;
         }
-        // Salience feature: only attach importance/kind when the writer provided them, so
-        // facts without them stay lean and fall back to defaults at storage/read time.
+        // Salience feature (now effectively MANDATORY): importance/kind are ALWAYS set —
+        // either stated by the model or inferred above. `inferredFields` flags which were
+        // filled in by us (vs stated) so the UI/debug can show it.
         if (Number.isInteger(importance)) update.importance = importance;
         if (kind) update.kind = kind;
+        if (inferred.length) update.inferredFields = inferred;
+        // Subject axis (feature): attach an explicit subject when given, else derive it
+        // deterministically from the key prefix so the field is always present downstream.
+        update.subject = subject || deriveSubjectFromKey(key);
+        // Provenance (feature): confidence when stated; validAt defaults to the source
+        // message index (when the fact became true). Both kept optional/back-compat.
+        if (confidence !== null && confidence !== '') update.confidence = confidence;
+        if (Number.isInteger(sourceIndex)) update.validAt = sourceIndex;
         // Supersession feature: only attach the explicit signal when present (lean / back-compat).
         if (supersedes) update.supersedes = true;
         // Layer A: only attach aliases when the writer provided some (keep object lean / back-compat).
@@ -522,6 +579,57 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
 
     console.log(`[BFMemory] Agent 3: ${result.updates.length} updates, summary: "${result.summary.substring(0, 100)}"`);
     return result;
+}
+
+/**
+ * Infer a fact `kind` from its category when the writer omitted it (feature #3). Status is
+ * the only inherently changeable bucket -> `state`; History is past occurrences -> `event`;
+ * a track step (an ordered series item) is an `event`; everything else (Identity, Behavior,
+ * Relationships, World, Unsorted) defaults to a durable `trait`. Conservative — biased
+ * toward the slow-decaying `trait` so an inferred fact is never aggressively evicted.
+ * @param {string} category
+ * @param {string} track - non-empty when the fact is a sequence step
+ * @returns {('trait'|'state'|'event')}
+ */
+function inferKindFromCategory(category, track) {
+    if (track) return 'event';
+    switch (String(category || '').toLowerCase()) {
+        case 'status': return 'state';
+        case 'history': return 'event';
+        default: return 'trait';
+    }
+}
+
+/**
+ * Infer an `importance` (1-5) when the writer omitted it (feature #3). Small heuristic:
+ * Identity facts are foundational (4); transient states are low (2); events are minor (2);
+ * everything else is ordinary (3). Deliberately conservative so an inferred value never
+ * outranks a model-stated !5 nor sinks below the old default by much.
+ * @param {string} category
+ * @param {string} kind
+ * @param {string} key
+ * @returns {number} 1..5
+ */
+function inferImportance(category, kind, key) {
+    const cat = String(category || '').toLowerCase();
+    if (cat === 'identity') return 4;          // names/species/age skew foundational
+    if (kind === 'state') return 2;            // current mood/location fades fast
+    if (kind === 'event') return 2;            // a single occurrence is usually minor
+    return 3;                                  // ordinary default
+}
+
+/**
+ * Deterministic subject derivation from a key prefix (token before the first underscore),
+ * mirroring database.deriveSubject's key-fallback path so the parser can stamp a subject
+ * without importing storage internals. `felix_apartment_bed` -> `felix`.
+ * @param {string} key
+ * @returns {string}
+ */
+function deriveSubjectFromKey(key) {
+    const k = String(key || '').trim().toLowerCase();
+    if (!k) return '';
+    const us = k.indexOf('_');
+    return us > 0 ? k.slice(0, us) : k;
 }
 
 /**
@@ -598,9 +706,17 @@ async function applyUpdates(updates, existingDatabases) {
             if (Number.isInteger(update.ord) && update.ord > 0) factToWrite.ord = update.ord;
         }
         // Salience feature: forward importance/kind so upsertFact can merge (keep higher
-        // importance) and persist them for eviction + retrieval scoring.
+        // importance) and persist them for eviction + retrieval scoring. These are now
+        // always present (stated or inferred in the parser).
         if (Number.isInteger(update.importance)) factToWrite.importance = update.importance;
         if (update.kind) factToWrite.kind = update.kind;
+        // Subject axis (feature): forward the (explicit-or-derived) subject so it's stored
+        // as a real index axis. Confidence/validAt are provenance stamps (back-compat optional).
+        if (update.subject) factToWrite.subject = update.subject;
+        if (update.confidence !== undefined && update.confidence !== null && update.confidence !== '') {
+            factToWrite.confidence = update.confidence;
+        }
+        if (Number.isInteger(update.validAt)) factToWrite.validAt = update.validAt;
         // Supersession feature: forward the explicit signal so upsertFact marks the prior
         // value of a changeable-state fact as superseded history (transient flag, not persisted).
         if (update.supersedes) factToWrite.supersedes = true;
