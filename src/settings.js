@@ -5,6 +5,7 @@ import { getConnectionProfiles, getCurrentProfileId } from './profiler.js';
 import { DEFAULT_DRAFT_PROMPT } from './agent-draft.js';
 import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
 import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
+import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 
 let Popup, POPUP_TYPE;
 async function ensurePopup() {
@@ -42,6 +43,10 @@ let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutp
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
 // null = no scene yet (back-compatible: absent scene behaves as no scene card).
 let sceneCard = null; // { location, present[], goals[], beats[], updatedAt, runId }
+// Reflection / consolidation summary — the rolling "story so far" + last synthesized
+// observations. Persisted per-chat in chat_metadata.bf_mem_reflection, reloaded on
+// CHAT_CHANGED. null = none yet (back-compatible: absent reflection = no injection).
+let reflection = null; // { summary, observations[], updatedAt, runId }
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -89,6 +94,19 @@ const DEFAULT_SETTINGS = {
     sceneCardEnabled: true,
     // Hard cap on the injected scene block, in approx tokens. Truncated defensively.
     sceneCardMaxTokens: 150,
+    // Reflection / consolidation pass (memory-research Phase 3). Periodically (every
+    // reflectionInterval successful pipeline runs) makes ONE extra LLM call — reusing
+    // Agent 3's connection profile — to compress accumulated detail into (a) a rolling
+    // "story so far" summary and (b) higher-order observation facts. INFREQUENT + cost-
+    // aware by design (the owner has been burned by expensive full-chat passes). Default
+    // ON but with a conservative interval. Absent (older settings) → defaults apply.
+    reflectionEnabled: true,
+    reflectionInterval: 12,
+    // Optionally inject the "story so far" summary into the writer prompt (BELOW the scene
+    // card, ABOVE facts), hard-capped to its own small token budget. Default ON but small.
+    reflectionInject: true,
+    reflectionMaxTokens: 200,
+    reflectionPrompt: '',
     draftPrompt: '',
     memoryPrompt: '',
     writerFormat: '',
@@ -149,6 +167,13 @@ function validateSettings(s) {
         s.enabled = false;
     }
     s.sceneCardMaxTokens = Math.floor(clamp(s.sceneCardMaxTokens, 30, 400, 150));
+    // Reflection: interval clamped to a sane range (min 4 so it can't fire every turn);
+    // token cap for the injected summary clamped small (it's continuity glue, not a dump).
+    s.reflectionInterval = Math.floor(clamp(s.reflectionInterval, 4, 100, 12));
+    s.reflectionMaxTokens = Math.floor(clamp(s.reflectionMaxTokens, 50, 500, 200));
+    if (typeof s.reflectionEnabled !== 'boolean') s.reflectionEnabled = true;
+    if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = true;
+    if (typeof s.reflectionPrompt !== 'string')   s.reflectionPrompt = '';
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
@@ -598,6 +623,89 @@ function renderScene() {
         row('Present', (s.present || []).join(', ')) +
         row('Goals', (s.goals || []).join('; ')) +
         row('Recently', (s.beats || []).join('; '));
+}
+
+// --- Reflection / Consolidation (persistent — stored in chat_metadata.bf_mem_reflection) ---
+// Rolling "story so far" summary + last synthesized observations. Mirrors the scene-card
+// persistence pattern: per-chat, shape-checked reload, best-effort save.
+
+const REFLECTION_META_KEY = 'bf_mem_reflection';
+
+/** Coerce a stored value into the reflection shape, or null if unusable. */
+function normalizeReflection(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const summary = typeof raw.summary === 'string' ? raw.summary.trim() : '';
+    const observations = Array.isArray(raw.observations)
+        ? raw.observations.map(x => String(x ?? '').trim()).filter(Boolean)
+        : [];
+    if (!summary && observations.length === 0) return null;
+    return {
+        summary,
+        observations,
+        updatedAt: Number(raw.updatedAt) || Date.now(),
+        runId: typeof raw.runId === 'string' ? raw.runId : '',
+    };
+}
+
+function loadReflectionFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizeReflection(md[REFLECTION_META_KEY]);
+    } catch { return null; }
+}
+
+function saveReflectionToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[REFLECTION_META_KEY] = reflection;
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+/** Current reflection summary object (or null). Read by pipeline.js for injection. */
+export function getReflection() {
+    return reflection;
+}
+
+/**
+ * Store a fresh reflection (replaces the prior one — it's a rolling summary, not a log).
+ * @param {{summary?:string, observations?:string[]}} patch
+ * @param {string} runId
+ */
+export function setReflection(patch, runId = '') {
+    const next = normalizeReflection({ ...(patch || {}), updatedAt: Date.now(), runId });
+    if (!next) return; // nothing meaningful to store
+    reflection = next;
+    saveReflectionToMeta();
+    renderReflection();
+}
+
+/** Re-load the reflection from the current chat's metadata. Called on CHAT_CHANGED. */
+export function reloadReflectionFromChat() {
+    reflection = loadReflectionFromMeta();
+    renderReflection();
+}
+
+/** Render the read-only live reflection summary in the Agent 3 tab (if present). */
+function renderReflection() {
+    const el = document.getElementById('bf_mem_reflection_view');
+    if (!el) return;
+    if (!reflection) {
+        el.innerHTML = '<div class="bf-mem-summary-empty">No reflection yet. It is generated periodically once the pipeline has run several turns.</div>';
+        return;
+    }
+    const r = reflection;
+    let html = '';
+    if (r.summary) html += `<div class="bf-mem-fact-line">${escapeHtml(r.summary)}</div>`;
+    if ((r.observations || []).length) {
+        html += '<div class="bf-mem-fact-meta" style="margin-top:6px;">' +
+            r.observations.map(o => `<span class="bf-mem-chip bf-mem-chip-tag">${escapeHtml(o)}</span>`).join(' ') +
+            '</div>';
+    }
+    el.innerHTML = html || '<div class="bf-mem-summary-empty">No reflection yet.</div>';
 }
 
 function fmt(n) { return (typeof n === 'number' && Number.isFinite(n)) ? n.toLocaleString() : '—'; }
@@ -1572,6 +1680,37 @@ export async function initSettings() {
     // Render the current live scene card (read-only)
     renderScene();
 
+    // Reflection / consolidation (Agent 3 tab)
+    $('#bf_mem_reflection_enabled').prop('checked', extensionSettings.reflectionEnabled).on('change', function () {
+        extensionSettings.reflectionEnabled = $(this).prop('checked');
+        saveSettings();
+    });
+    $('#bf_mem_reflection_inject').prop('checked', extensionSettings.reflectionInject).on('change', function () {
+        extensionSettings.reflectionInject = $(this).prop('checked');
+        saveSettings();
+    });
+    $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
+    $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
+    $('#bf_mem_reflection_interval').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.reflectionInterval = val;
+        $('#bf_mem_reflection_interval_val').text(val);
+        saveSettings();
+    });
+    $('#bf_mem_reflection_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
+        const val = $(this).val();
+        extensionSettings.reflectionPrompt = (val === DEFAULT_REFLECT_PROMPT) ? '' : val;
+        saveSettings();
+    });
+    $('#bf_mem_reset_reflection_prompt').on('click', () => {
+        extensionSettings.reflectionPrompt = '';
+        $('#bf_mem_reflection_prompt').val(DEFAULT_REFLECT_PROMPT);
+        saveSettings();
+        toastr.info('Reflection prompt reset', 'BF Memory');
+    });
+    // Render the current live reflection summary (read-only)
+    renderReflection();
+
     // --- Prompts Tab ---
     $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).off('input').on('input', function () {
         const val = $(this).val();
@@ -1807,6 +1946,7 @@ export async function initSettings() {
         reloadFactsFromChat();
         reloadTokensFromChat();
         reloadSceneFromChat();
+        reloadReflectionFromChat();
     });
 
     // Initial load: pull any previously-persisted log entries + facts for the current chat
@@ -1814,6 +1954,7 @@ export async function initSettings() {
     reloadFactsFromChat();
     reloadTokensFromChat();
     reloadSceneFromChat();
+    reloadReflectionFromChat();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

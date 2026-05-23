@@ -187,6 +187,32 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-lightbulb"></i> Reflection / Consolidation</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_reflection_enabled" />
+                            <span>Enable periodic reflection pass</span>
+                        </label>
+                        <small class="bf-mem-hint">Every N turns, makes ONE extra LLM call (reusing Agent 3's profile) to compress the session into a rolling "story so far" summary plus higher-order observation facts. Conservative + cost-aware — it runs infrequently and never blocks the reply.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Reflection Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
+                            <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
+                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent consolidation.</small>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:8px;">
+                            <input type="checkbox" id="bf_mem_reflection_inject" />
+                            <span>Inject "story so far" into the writer prompt</span>
+                        </label>
+                        <small class="bf-mem-hint">Prepends the rolling summary (below the scene card, above facts), hard-capped to a small token budget. Off = the summary is still stored and observations still written, just not injected.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Current Reflection (live)</label>
+                            <div id="bf_mem_reflection_view" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No reflection yet. It is generated periodically once the pipeline has run several turns.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-pen"></i> Memory Updater Prompt
                         <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
@@ -196,6 +222,18 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Memory updater system prompt..."></textarea>
                         <small class="bf-mem-hint">Tells Agent 3 how to extract and update facts.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Reflection Prompt
+                        <button id="bf_mem_reset_reflection_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_reflection_prompt" class="bf-mem-textarea" rows="10" placeholder="Reflection / consolidation system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the reflection pass how to write the "story so far" summary and synthesize observations.</small>
                     </div>
                 </div>
             </div>

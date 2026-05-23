@@ -5,11 +5,12 @@
 import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
+import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, setScene, getScene } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, setScene, getScene, getReflection } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -21,6 +22,12 @@ let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETI
 let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
 let groupSkipToastShown = false; // show-once toast when skipping group chats
 let runRecordedInput = false; // true once setRunTokens fired this generation cycle; gates main-output attribution so swipes don't desync the counters
+// Reflection / consolidation: count successful pipeline runs (Agent 3 committed facts).
+// When this hits reflectionInterval we schedule ONE consolidation LLM call on the
+// post-turn path (after MESSAGE_RECEIVED), off the latency-critical generation path.
+let successfulRunsSinceReflection = 0;
+let reflectionPending = null; // {runId, charAvatar} captured at the run that armed it; consumed on MESSAGE_RECEIVED
+let reflectionInFlight = false; // guard so overlapping turns can't double-fire the pass
 
 /**
  * Count tokens for a chat-completion message array (role wrappers included).
@@ -635,6 +642,22 @@ async function runPipelineInline(data) {
         sceneBlock = buildSceneBlock(scene, settings.sceneCardMaxTokens || 150);
         if (sceneBlock) addDebugLog('info', `Scene block injected (${sceneBlock.length} chars): ${sceneBlock}`);
     }
+
+    // Reflection "story so far": injected BELOW the scene card, ABOVE the facts, behind its
+    // own enable + small token cap. Optional — when off (or no summary yet) nothing changes.
+    if (settings.reflectionEnabled && settings.reflectionInject) {
+        const refl = getReflection();
+        if (refl?.summary) {
+            const charBudget = Math.max(40, Math.floor((Number(settings.reflectionMaxTokens) || 200) * 4));
+            let story = refl.summary;
+            if (story.length > charBudget) story = story.slice(0, charBudget - 1).trimEnd() + '…';
+            const storyBlock = `[Story so far] ${story}`;
+            // Append below the scene block (both sit above the facts in buildWriterInjection).
+            sceneBlock = sceneBlock ? `${sceneBlock}\n\n${storyBlock}` : storyBlock;
+            addDebugLog('info', `Reflection summary injected (${storyBlock.length} chars)`);
+        }
+    }
+
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, sceneBlock);
     lastInjection = injection; // Cache for swipes/regens (scene block included)
 
@@ -663,8 +686,70 @@ async function runPipelineInline(data) {
         addDebugLog('fail', 'Failed to inject memory context');
     }
 
+    // --- Reflection / consolidation trigger (cost-aware, off the latency-critical path) ---
+    // Count this as a successful run and, on hitting the interval, ARM a reflection pass to
+    // run AFTER the reply lands (MESSAGE_RECEIVED). We never run it inline here — it would
+    // add a second LLM call to the pre-generation blocking path. Gated by enable; the
+    // not-cancelled/not-group/not-internal checks already gate this whole function.
+    if (settings.reflectionEnabled) {
+        successfulRunsSinceReflection++;
+        const interval = Math.max(4, settings.reflectionInterval || 12);
+        if (successfulRunsSinceReflection >= interval && !reflectionPending && !reflectionInFlight) {
+            reflectionPending = { runId, charAvatar: capturedCharAvatar, profileId: getAgent3ProfileId(settings), characterInfo, userPersona };
+            addDebugLog('info', `[${runId}] Reflection armed (will run after reply; ${successfulRunsSinceReflection}/${interval} runs)`);
+        }
+    }
+
     hideWorkingIndicator();
     updateStatus('running', 'Generating with facts...');
+}
+
+/**
+ * Run an armed reflection pass. Called from MESSAGE_RECEIVED so it never blocks the
+ * latency-critical pre-generation path. Fully guarded: skips if disabled, cancelled,
+ * in a group chat, the character changed since arming, or another pass is in flight.
+ * Wrapped in try/catch — a reflection failure must never break the pipeline.
+ */
+async function maybeRunReflection() {
+    const pending = reflectionPending;
+    if (!pending || reflectionInFlight) return;
+    const settings = getSettings();
+    if (!settings || !settings.enabled || !settings.reflectionEnabled) { reflectionPending = null; return; }
+    if (pipelineCancelled) { reflectionPending = null; return; }
+    const ctx = SillyTavern.getContext();
+    if (ctx.groupId || ctx.selected_group) { reflectionPending = null; return; }
+    // Character-changed guard (same class as Agent 3 writes): don't synthesize observations
+    // onto the wrong character's attachments if the user switched mid-session.
+    const currentCharAvatar = ctx.characters?.[ctx.characterId]?.avatar || '';
+    if (currentCharAvatar !== pending.charAvatar) {
+        addDebugLog('info', `[${pending.runId}] Reflection skipped (character changed since arming)`);
+        reflectionPending = null;
+        return;
+    }
+
+    reflectionPending = null;
+    reflectionInFlight = true;
+    successfulRunsSinceReflection = 0; // reset the cadence regardless of outcome
+    isInternalCall = true; // ensure the reflection LLM call can't re-trigger the pipeline
+    try {
+        updateStatus('running', 'Reflecting (consolidating memory)...');
+        await runReflection({
+            runId: pending.runId,
+            scene: getScene(),
+            prevReflection: getReflection(),
+            characterInfo: pending.characterInfo || '',
+            userPersona: pending.userPersona || '',
+            profileId: pending.profileId || null,
+        });
+        // Persist any observation facts the pass wrote to the active DB profile.
+        try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch { /* best-effort */ }
+    } catch (err) {
+        addDebugLog('fail', `Reflection pass failed (non-fatal): ${err.message || err}`);
+    } finally {
+        reflectionInFlight = false;
+        isInternalCall = false;
+        updateStatus('idle');
+    }
 }
 
 // --- Main Pipeline Init ---
@@ -739,6 +824,10 @@ export function initPipeline() {
         } catch { /* ignore */ }
         // One run = one input record = one output attribution. Disarm until the next run.
         runRecordedInput = false;
+
+        // Reflection / consolidation: now that the reply has landed, run an armed pass
+        // off the latency-critical path. Fully self-guarded + try/catch'd internally.
+        maybeRunReflection();
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -813,6 +902,10 @@ export function initPipeline() {
         pipelineJustInjected = false;
         groupSkipToastShown = false;
         chatChangedAt = Date.now();
+        // Reflection cadence is per-chat: reset the counter and drop any armed pass so a
+        // chat switch can't fire a consolidation against the new chat using old context.
+        successfulRunsSinceReflection = 0;
+        reflectionPending = null;
         hideWorkingIndicator();
         updateStatus('idle');
 
