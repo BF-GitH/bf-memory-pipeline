@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -11,12 +11,13 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Most messages have ZERO facts. Max 5.
+export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for ~5 facts on a normal turn, but go higher (up to ~12) when a message genuinely discloses that much. Missing a clearly-stated reveal is worse than one extra fact.
 
 # CRITICAL RULES
 
 ATOMIC VALUES ONLY:
-- Value is 1–5 words. NO sentences. NO connectives (and / with / who / that).
+- Normal facts: value is 1–5 words. NO sentences. NO connectives (and / with / who / that).
+- EXCEPTION — genuine backstory / biographical reveals may use a short clause (up to ~10 words) when atomizing would lose meaning (e.g. \`origin = orphaned at <AGE>, raised by <RELATION>\`). Still split where you cleanly can.
 - One property per fact. Multi-attribute statements → multiple facts.
 - Encode verbs in the KEY, not the value:
     BAD:  some_thing = uses a red one that smells nice
@@ -131,7 +132,9 @@ Input: [USER:{{user}}] "Scratch that — I moved last week, the previous place i
 
 ---
 
-When uncertain whether something is a persistent fact, SKIP. A missing atomic fact is recoverable next turn; a wrong/verbose fact poisons future retrieval.`;
+CAPTURE clearly-stated reveals even on a long turn: names, ages, origins, family, occupation, relationships, species, abilities, possessions, world facts, and lasting traits stated as fact are all worth storing. Don't drop them just because the message is long or you already have a few facts.
+
+Only SKIP when something is genuinely ambiguous, hypothetical, or a one-off transient. A clearly-disclosed fact should be captured even if you're slightly unsure of phrasing — atomize it conservatively. Reserve skipping for the truly uncertain; a wrong/verbose fact poisons retrieval, but a dropped clear reveal is the bug we're fixing.`;
 
 /**
  * Run Agent 3: Analyze message and update databases
@@ -162,13 +165,18 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex, userMsgIndex);
 
-        // Apply updates to databases
+        // Apply updates to databases. applyUpdates annotates each update with a
+        // .status (NEW/UPDATED/SKIPPED) + .changed boolean and returns the subset
+        // that actually changed stored state (the "committed" facts).
+        let applied = [];
         if (parsed.updates.length > 0) {
             addDebugLog('info', `Agent 3 applying ${parsed.updates.length} updates...`);
-            await applyUpdates(parsed.updates, existingDatabases);
+            applied = await applyUpdates(parsed.updates, existingDatabases);
         }
 
-        return { ...parsed, tokensIn, tokensOut };
+        // Backward-compatible: still expose .updates (the full proposed set, now
+        // annotated). .applied is the new committed/changed subset for pipeline.js.
+        return { ...parsed, applied, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Agent 3 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 3 (Memory) error:', error);
@@ -401,12 +409,24 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
 }
 
 /**
- * Apply parsed updates to databases and save
- * @param {Array} updates - Parsed fact updates
+ * Apply parsed updates to databases and save.
+ *
+ * For each update, determine whether it actually changed stored state (FIX #5):
+ *   - NEW     : no existing fact matched this key — a brand-new fact was added.
+ *   - UPDATED : an existing fact matched and its value or tags changed.
+ *   - SKIPPED : an existing fact matched and value + tags are identical (no-op).
+ * Each update is annotated with `.status` and `.changed`, and `.wasNew` is kept
+ * for backward compatibility. Returns the subset that actually changed state
+ * (status NEW or UPDATED) so the caller can feed "Last Inserted" the truly
+ * committed facts rather than the full proposed set.
+ *
+ * @param {Array} updates - Parsed fact updates (mutated in place: annotated)
  * @param {Object} existingDatabases - Current databases
+ * @returns {Promise<Array>} the changed (committed) subset of updates
  */
 async function applyUpdates(updates, existingDatabases) {
     const modified = new Set();
+    const applied = [];
 
     for (const update of updates) {
         const category = update.category;
@@ -418,14 +438,29 @@ async function applyUpdates(updates, existingDatabases) {
         }
 
         const db = existingDatabases[category];
-        const isNew = !db.facts.some(f => f.key === update.key);
-        // Surface NEW/UPDATED status to pipeline.js so the Last Inserted tab can show it
-        update.wasNew = isNew;
+
+        // Classify BEFORE writing, using the same match rule upsertFact uses.
+        const matched = findFactMatch(db, update.key);
+        const newValue = update.value || '';
+        const newTags = update.tags || [];
+        let status;
+        if (!matched) {
+            status = 'NEW';
+        } else if (sameValue(matched.value, newValue) && sameTags(matched.tags, newTags)) {
+            status = 'SKIPPED'; // no-op: value + tags identical to stored fact
+        } else {
+            status = 'UPDATED';
+        }
+
+        // Surface status to pipeline.js so the Last Inserted tab can show it.
+        update.status = status;
+        update.changed = status !== 'SKIPPED';
+        update.wasNew = status === 'NEW'; // kept for backward compatibility
 
         upsertFact(db, {
             key: update.key,
-            value: update.value || '',
-            tags: update.tags || [],
+            value: newValue,
+            tags: newTags,
             knownBy: update.knownBy || [],
             relationships: {
                 primary: Array.isArray(update.relationships) ? update.relationships : [],
@@ -435,9 +470,12 @@ async function applyUpdates(updates, existingDatabases) {
             source: update.source,
         });
         const relCount = update.relationships?.length || 0;
-        addDebugLog('info', `${isNew ? 'Added' : 'Updated'} fact: [${category}] ${update.key} = "${(update.value || '').substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
+        addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
 
-        modified.add(category);
+        if (update.changed) applied.push(update);
+        // Only re-save a category whose stored state actually changed — a run of
+        // pure SKIPPED no-ops needn't trigger an attachment re-upload.
+        if (update.changed) modified.add(category);
     }
 
     // Save all modified databases
@@ -450,6 +488,24 @@ async function applyUpdates(updates, existingDatabases) {
             addDebugLog('fail', `Failed to save database "${category}": ${error.message}`);
         }
     }
+
+    return applied;
+}
+
+/** Loose value equality for no-op detection (trim + case-insensitive). */
+function sameValue(a, b) {
+    return String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
+}
+
+/** Order-insensitive tag-set equality for no-op detection. */
+function sameTags(a, b) {
+    const norm = arr => (Array.isArray(arr) ? arr : [])
+        .map(t => String(t).trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+    const x = norm(a), y = norm(b);
+    if (x.length !== y.length) return false;
+    return x.every((v, i) => v === y[i]);
 }
 
 /**

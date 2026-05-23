@@ -414,12 +414,19 @@ async function runPipelineInline(data) {
                 // Mark all as SKIPPED for Last Inserted tab.
                 setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
             } else {
-                addDebugLog('info', `Agent 3: ${memoryResult.updates.length} updates. ${memoryResult.summary}`);
-                // Populate Last Inserted tab — use the wasNew flag set by agent-memory.js applyUpdates
-                setLastInserted((memoryResult.updates || []).map(u => ({
-                    ...u,
-                    status: u.wasNew ? 'NEW' : 'UPDATED',
-                })));
+                // Last Inserted = only the facts that ACTUALLY changed stored state
+                // (NEW or UPDATED), with the status applyUpdates computed. This is the
+                // committed subset — distinct from Last Generated (full proposed set),
+                // fixing the "both panels identical" bug (FIX #5). Fall back to deriving
+                // the changed subset from .updates if .applied is absent (older shape).
+                const committed = Array.isArray(memoryResult.applied)
+                    ? memoryResult.applied
+                    : (memoryResult.updates || []).filter(u => u.changed ?? u.wasNew).map(u => ({
+                        ...u,
+                        status: u.status || (u.wasNew ? 'NEW' : 'UPDATED'),
+                    }));
+                addDebugLog('info', `Agent 3: ${memoryResult.updates.length} proposed, ${committed.length} committed. ${memoryResult.summary}`);
+                setLastInserted(committed);
                 for (const update of memoryResult.updates) {
                     trackUpdate(update);
                 }

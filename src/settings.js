@@ -48,10 +48,13 @@ const DEFAULT_SETTINGS = {
     agent1Profile: '',
     agent3Profile: '',
     // Per-agent context message counts (replacing single contextMessages).
-    // Agent 3 default = 2 preserves the prior behavior of looking at the
-    // latest user + AI exchange.
+    // Agent 3 default raised from 2 -> 5 (FIX #2a): a 2-message window truncated
+    // long single-message backstory disclosures and the surrounding exchange that
+    // gave them context, so rich reveals were missed. The full target message is
+    // always sent untruncated regardless of this window (see buildMemoryPrompt /
+    // pipeline.js — only the debug-log preview is substring'd, never the prompt).
     agent1ContextMessages: 5,
-    agent3ContextMessages: 2,
+    agent3ContextMessages: 5,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -105,7 +108,7 @@ function clamp(value, lo, hi, fallback) {
 function validateSettings(s) {
     s.contextMessages = Math.floor(clamp(s.contextMessages, 1, 50, 5));
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
-    s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 2));
+    s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));

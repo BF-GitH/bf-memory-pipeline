@@ -2,7 +2,13 @@
 // Manages fact databases via SillyTavern Data Bank (character attachments)
 // Each database is a JSON file stored as a character attachment
 
+import { addDebugLog } from './settings.js';
+
 const DB_PREFIX = 'bf_memory_db_';
+// Deliberate per-category fact cap. This is a token-cost product decision: every
+// stored fact can end up in the retrieval/injection budget, so the owner caps it
+// to keep prompts cheap. Raise this only as a conscious cost tradeoff. Eviction
+// beyond this cap is now logged (FIX #4) instead of happening silently.
 const MAX_FACTS_PER_DB = 50;
 
 function getContext() {
@@ -64,17 +70,24 @@ export async function saveDatabase(db) {
     const avatar = getCharacterAvatar();
     if (!avatar) throw new Error('No character selected');
 
-    // Enforce max facts limit
+    // Enforce max facts limit.
     if (db.facts.length > MAX_FACTS_PER_DB) {
         const evictCount = db.facts.length - MAX_FACTS_PER_DB;
-        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length} facts, evicting ${evictCount} least-recently-updated`);
         // Sort by lastUpdated DESC (most-recently-updated first), keep top MAX_FACTS_PER_DB.
         // upsertFact bumps lastUpdated on every touch, so foundational facts (re-mentioned
         // by the user / model) survive while one-off tertiary facts get evicted.
-        db.facts = db.facts
+        const kept = db.facts
             .slice() // copy to avoid mutating in-place during sort
-            .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0))
-            .slice(0, MAX_FACTS_PER_DB);
+            .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0));
+        const evicted = kept.slice(MAX_FACTS_PER_DB);
+        db.facts = kept.slice(0, MAX_FACTS_PER_DB);
+        // NON-SILENT eviction (FIX #4): the old code dropped facts with only a
+        // console.warn, so late-session facts vanished from exports with no trace
+        // in the user-visible debug log. Surface it. (Cap value unchanged — see
+        // MAX_FACTS_PER_DB note; raising it is the owner's cost decision.)
+        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length + evictCount} facts, evicting ${evictCount} least-recently-updated`);
+        const evictedKeys = evicted.map(f => f.key).filter(Boolean).join(', ');
+        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, oldest-first): ${evictedKeys}`);
     }
 
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
@@ -169,17 +182,68 @@ export function createEmptyDatabase(category) {
  * @returns {DatabaseSchema} Updated database
  */
 export function upsertFact(db, fact) {
-    const existingIdx = db.facts.findIndex(f => f.key === fact.key);
+    // 1) Exact key match — always update in place.
+    let existingIdx = db.facts.findIndex(f => f.key === fact.key);
+    // 2) Reconcile-on-write (FIX #2c): if no exact match, look for a fact whose key
+    //    is a CLEAR variant of the incoming key (e.g. `demeanor` vs `demeanor_1`,
+    //    `hair_color` vs `haircolor`, `trait` vs `traits`). Without this, Agent 3
+    //    mints parallel keys and contradictory facts coexist (a "gentle" trait
+    //    lingering alongside a later "rough" one). We only merge clear normalized
+    //    matches — distinct properties (different normalized keys) stay separate.
+    if (existingIdx < 0) {
+        const normIncoming = normalizeFactKey(fact.key);
+        if (normIncoming) {
+            existingIdx = db.facts.findIndex(f => normalizeFactKey(f.key) === normIncoming);
+        }
+    }
     if (existingIdx >= 0) {
         const existing = db.facts[existingIdx];
         // Merge relationships (union) rather than replace, so prior tier links survive.
         const mergedRels = mergeRelationships(existing.relationships, fact.relationships);
-        db.facts[existingIdx] = { ...existing, ...fact, relationships: mergedRels, lastUpdated: Date.now() };
+        // Keep the existing canonical key so we update in place instead of renaming
+        // (renaming would orphan any relationship refs pointing at the old key).
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, lastUpdated: Date.now() };
     } else {
         db.facts.push({ ...fact, lastUpdated: Date.now() });
     }
     db.updatedAt = Date.now();
     return db;
+}
+
+/**
+ * Find the existing fact a given key would reconcile to (exact match first, then a
+ * conservative normalized-key match). Returns the matched fact or null. Used by
+ * applyUpdates to classify a write as NEW vs UPDATED vs SKIPPED with the SAME
+ * matching rule upsertFact uses, so the status reported to the UI is accurate.
+ * @param {DatabaseSchema} db
+ * @param {string} key
+ * @returns {FactSchema|null}
+ */
+export function findFactMatch(db, key) {
+    if (!db || !Array.isArray(db.facts)) return null;
+    const exact = db.facts.find(f => f.key === key);
+    if (exact) return exact;
+    const norm = normalizeFactKey(key);
+    if (!norm) return null;
+    return db.facts.find(f => normalizeFactKey(f.key) === norm) || null;
+}
+
+/**
+ * Normalize a fact key for conservative reconcile-on-write matching.
+ * Strips trailing numeric/ordinal suffixes, separators, and a trailing plural 's'
+ * so cosmetic variants of the SAME property collapse to one canonical form while
+ * genuinely different properties stay distinct. Returns '' for empty input.
+ *   demeanor / demeanor_1 / demeanor2 -> "demeanor"
+ *   hair_color / haircolor            -> "haircolor"
+ *   trait / traits                    -> "trait"
+ */
+function normalizeFactKey(key) {
+    let k = String(key || '').toLowerCase().trim();
+    if (!k) return '';
+    k = k.replace(/[_\-\s]*\d+$/, '');   // drop trailing numeric suffix (_1, 2, -3)
+    k = k.replace(/[_\-\s]+/g, '');      // drop all separators
+    if (k.length > 3 && k.endsWith('s')) k = k.slice(0, -1); // crude singularize
+    return k;
 }
 
 function mergeRelationships(existing, incoming) {
