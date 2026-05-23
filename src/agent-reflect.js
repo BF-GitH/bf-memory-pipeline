@@ -6,8 +6,12 @@
 //       to merge/supersede near-duplicate facts that accumulated over a long session, and
 //   (b) optionally writes 0-N high-value OBSERVATION facts (durable traits inferred across
 //       the session, e.g. "<CHARACTER> distrusts authority").
-// It still parses + stores a short "story so far" summary for the live UI panel only — it
-// is NEVER injected into the writer prompt.
+// FIX #12: the rolling "story so far" #STORY summary has been REMOVED. It was no longer
+// injected anywhere (refinement #1 dropped the writer injection), so generating it — and
+// re-sending the prior summary back into the prompt each pass — was pure wasted output +
+// input tokens. We no longer ask for #STORY and no longer feed the prior summary back in.
+// The live UI panel (#bf_mem_reflection_view) still renders the synthesized OBSERVATIONS
+// (stored via setReflection with an empty summary), so no UI binding is broken.
 //
 // COST-AWARE: this is the ONE place a NEW LLM call is acceptable. It runs INFREQUENTLY
 // (every N successful pipeline runs, default 12) and OFF the latency-critical path
@@ -34,18 +38,11 @@ const MAX_SUMMARY_CHARS = 1200;
 // Cap synthesized observations per pass (defensive — the prompt asks for 0-5).
 const MAX_OBSERVATIONS = 8;
 
-export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, plus a brief continuity note.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss.
 
-Produce TWO things:
-
-1. A short continuity note: 2-5 sentences of PROSE capturing the arc — who these characters are to each other, where things stand now, and the main unresolved threads. Past tense, neutral, no markup. This is internal continuity glue, not a transcript. Do NOT restate every fact; synthesize. (Output a single "." if there is genuinely nothing to summarize.)
-
-2. 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
+Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
 
 # OUTPUT FORMAT (exactly this, nothing else)
-
-#STORY
-<2-5 sentence prose summary, or a single "." if there is genuinely nothing to summarize>
 
 #OBS
 + <subject>_<short_pattern_key> = <atomic pattern clause>
@@ -58,17 +55,17 @@ If there are no observations, put a single "." under #OBS. Keep observation keys
  * Build the compact, bounded input bundle for the reflection pass.
  * @param {object} args
  * @param {object|null} args.scene - current scene card
- * @param {object|null} args.prevReflection - prior reflection {summary, observations}
+ * @param {object|null} [args.prevReflection] - DEPRECATED (FIX #12): retained in the signature
+ *   for back-compat but NO LONGER fed into the prompt. The rolling story summary was dropped
+ *   (it was never injected anywhere), so re-sending it each pass was wasted input tokens.
  * @param {Object} args.databases - all fact databases
  * @returns {string} the user-prompt data block
  */
-function buildReflectInput({ scene, prevReflection, databases }) {
+function buildReflectInput({ scene, databases }) {
     const parts = [];
 
-    // Prior story-so-far (so the model continues an arc rather than restarting it).
-    if (prevReflection?.summary) {
-        parts.push(`## Story so far (previous)\n${String(prevReflection.summary).slice(0, MAX_SUMMARY_CHARS)}`);
-    }
+    // FIX #12: the prior "story so far" summary is intentionally NOT prepended anymore — the
+    // pass now only synthesizes OBSERVATIONS, which reconcile against existing facts on write.
 
     // Current scene + recent beats.
     if (scene && typeof scene === 'object') {
@@ -110,7 +107,7 @@ function buildReflectInput({ scene, prevReflection, databases }) {
     }
     if (factSummary) parts.push(`## Stored facts (current)\n${factSummary}`);
 
-    parts.push('\nNow output ONLY the #STORY and #OBS sections.');
+    parts.push('\nNow output ONLY the #OBS section.');
     return parts.join('\n\n');
 }
 
@@ -216,7 +213,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, prevReflection, databases }));
+        dataParts.push(buildReflectInput({ scene, databases }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
@@ -228,8 +225,12 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
 
         const parsed = parseReflectResult(resultStr);
 
-        // Persist the rolling summary (per-chat) when we got one.
-        if (parsed.summary) {
+        // Persist reflection state (per-chat) for the live UI panel. FIX #12: the rolling
+        // #STORY summary is no longer requested, so parsed.summary is normally empty — we now
+        // store whenever there is EITHER a (legacy/custom-prompt) summary OR observations, so
+        // the panel keeps rendering the synthesized observation chips. normalizeReflection
+        // accepts an observations-only reflection (returns null only when BOTH are empty).
+        if (parsed.summary || parsed.observations.length > 0) {
             setReflection({ summary: parsed.summary, observations: parsed.observations.map(o => o.value) }, runId);
         }
 

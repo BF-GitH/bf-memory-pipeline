@@ -11,7 +11,7 @@ import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } fro
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, getReflection, reloadEntitiesUI } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
@@ -47,14 +47,61 @@ let memoryExtractionInFlight = false;
 // are unclassified candidates. Per-chat: reset on CHAT_CHANGED.
 let runsSinceEntityCheck = 0;
 let entityCheckInFlight = false;
-// FIX #8b: debounce timer for swipe-SETTLE extraction. Navigating LEFT/RIGHT onto an
-// ALREADY-GENERATED swipe fires MESSAGE_SWIPED but NOT MESSAGE_RECEIVED, so the
-// MESSAGE_RECEIVED extraction never sees that settled content. We schedule a debounced
-// extraction after each swipe; rapid navigation keeps resetting it so only the FINAL
-// settled swipe extracts. Generating a NEW swipe DOES fire MESSAGE_RECEIVED, which
-// extracts and marks bf_mem_processed first — making this debounced fire a guarded no-op
-// (no double-extract). Cleared on chat change.
+// FIX #8b / FIX #12: single debounce timer for SETTLE extraction. BOTH paths feed it now:
+//   - Generating a NEW swipe fires MESSAGE_RECEIVED (the AI reply landed), and
+//   - Navigating LEFT/RIGHT onto an ALREADY-GENERATED swipe fires MESSAGE_SWIPED (no
+//     MESSAGE_RECEIVED).
+// Previously MESSAGE_RECEIVED extracted EAGERLY (one ~7k-token Agent-3 call per generated
+// swipe), so spinning 4 swipes before settling cost up to 4× Agent 3. Now MESSAGE_RECEIVED
+// also SCHEDULES the debounced extraction instead of running it inline: rapid regeneration /
+// navigation keeps resetting the timer, so the expensive extraction runs ONCE on the SETTLED
+// (kept) swipe rather than once per mid-swipe roll. A normal single-reply turn (no swiping)
+// schedules once and, with nothing resetting it, extracts promptly after the short window —
+// still exactly one extraction per turn. The reflection + entity-check passes are chained to
+// run AFTER the (single) settled extraction completes. Cleared on chat change.
 let swipeSettleTimer = null;
+// Debounce window before a settled extraction fires. Short enough that a normal turn extracts
+// promptly, long enough that back-to-back swipe regenerations / navigation coalesce into one.
+const SETTLE_EXTRACTION_DELAY_MS = 1800;
+
+/**
+ * FIX #12: schedule the post-reply extraction on the shared settle-debounce instead of
+ * running it eagerly. Resets any pending timer so only the FINAL settled message extracts
+ * (a heavily-swiped turn extracts ~once, not once per swipe). After extraction completes we
+ * chain the armed reflection pass and the entity-check, which previously ran right after the
+ * eager MESSAGE_RECEIVED extraction — keeping their ordering relative to the kept content.
+ * Fully try/catch'd: a scheduling/extraction failure must never break the turn.
+ *
+ * @param {string} reason - short tag for the debug log (e.g. 'message-received', 'swipe').
+ * @param {boolean} [runPostPasses=false] - when true, chain maybeRunReflection +
+ *   maybeRunEntityCheck after the extraction (the MESSAGE_RECEIVED path owns those passes).
+ */
+function scheduleSettleExtraction(reason, runPostPasses = false) {
+    try {
+        if (swipeSettleTimer) {
+            clearTimeout(swipeSettleTimer);
+            addDebugLog('info', `Agent 3 extraction coalesced (${reason}) — resetting settle timer, deferring until settled`);
+        } else {
+            addDebugLog('info', `Agent 3 extraction deferred (${reason}) — will run after ${SETTLE_EXTRACTION_DELAY_MS}ms settle window`);
+        }
+        swipeSettleTimer = setTimeout(async () => {
+            swipeSettleTimer = null;
+            try {
+                await runMemoryExtraction();
+                if (runPostPasses) {
+                    // Reflection / consolidation + character-registry detection, off the
+                    // critical path. Self-guarded + try/catch'd internally.
+                    maybeRunReflection();
+                    maybeRunEntityCheck();
+                }
+            } catch (err) {
+                addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
+            }
+        }, SETTLE_EXTRACTION_DELAY_MS);
+    } catch (err) {
+        addDebugLog('fail', `Scheduling settle extraction failed (non-fatal): ${err.message || err}`);
+    }
+}
 
 /**
  * CHARACTER-TAG FILTER for the Stage-2 finder candidate gather (3-layer model). The branch
@@ -469,12 +516,17 @@ async function runPipelineInline(data) {
     // Stage-2 finder candidates, and the deterministic-retrieval fallback. (Agent 3's
     // existing-DB context now loads separately on the post-reply extraction path.)
     const databases = await getAllDatabases();
-    // Compact keys-only inventory (Category/key, no values) — kept for the #Needed_Facts
-    // fallback path so deterministic retrieval can resolve exact keys by identity.
-    const factInventory = summarizeKeys(databases);
+    // FIX #12 (dead-payload removal): the keys-only fact inventory (`Category/key`, no values)
+    // is consumed ONLY by the deterministic-retrieval fallback (buildDeterministicRetrieval),
+    // which runs only when the Stage-2 finder is OFF. When the finder is ON (default), Agent 1
+    // never uses that inventory, so building + sending it just burns input tokens every turn.
+    // So we build it ONLY when the finder is disabled and otherwise pass '' (buildDraftPrompt
+    // then omits the "Existing Fact Keys" block entirely). The Stage-1 MENU stays unconditional.
+    const wantFinder = settings.useFinderAgent !== false; // default true
+    const factInventory = wantFinder ? '' : summarizeKeys(databases);
     // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
     const factMenu = summarizeMenu(databases);
-    addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
+    addDebugLog('info', `Fact inventory for Agent 1: ${wantFinder ? 'skipped (finder on)' : (factInventory ? factInventory.split('\n').length + ' keys' : 'empty')}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
     try {
         isInternalCall = true;
@@ -606,7 +658,7 @@ async function runPipelineInline(data) {
     };
 
     let retrieval = null;
-    const wantFinder = settings.useFinderAgent !== false; // default true
+    // wantFinder was computed up front (gates whether the fact inventory was built for Agent 1).
     if (wantFinder) {
         // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
         // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
@@ -964,10 +1016,11 @@ async function maybeRunReflection() {
     isInternalCall = true; // ensure the reflection LLM call can't re-trigger the pipeline
     try {
         updateStatus('running', 'Reflecting (consolidating memory)...');
+        // FIX #12: no longer pass prevReflection — the rolling #STORY summary was dropped, so
+        // re-feeding the prior summary into the reflection prompt was wasted input tokens.
         await runReflection({
             runId: pending.runId,
             scene: getScene(),
-            prevReflection: getReflection(),
             characterInfo: pending.characterInfo || '',
             userPersona: pending.userPersona || '',
             profileId: pending.profileId || null,
@@ -1118,24 +1171,20 @@ export function initPipeline() {
         // One run = one input record = one output attribution. Disarm until the next run.
         runRecordedInput = false;
 
-        // Phase 3b: Agent 3 (memory extraction about the just-completed exchange) now runs
-        // HERE, off the latency-critical pre-generation path. The AI reply has landed (and
-        // any accepted swipe IS the message's current text), so we extract the real accepted
-        // content. Fully self-guarded + try/catch'd internally — a failure can't break the
-        // turn. Awaited before reflection so the two post-reply LLM passes don't race on the
-        // shared isInternalCall flag (both are off the critical path; serializing is safe).
-        await runMemoryExtraction();
-
-        // Reflection / consolidation: now that the reply has landed (and extraction has
-        // committed its facts), run an armed pass off the latency-critical path. Fully
-        // self-guarded + try/catch'd internally.
-        maybeRunReflection();
-
-        // Character registry detection: deterministic scan for newly-seen NAMED entities,
-        // gated to fire at most every characterCheckInterval runs. Off the critical path,
-        // fully self-guarded + try/catch'd. Opens a deferred batched popup when there are
-        // unclassified candidates; never blocks the reply.
-        maybeRunEntityCheck();
+        // Phase 3b + FIX #12: Agent 3 (memory extraction about the just-completed exchange)
+        // runs off the latency-critical pre-generation path. The AI reply has landed (and any
+        // accepted swipe IS the message's current text). PER-SWIPE GATING: rather than
+        // extract EAGERLY here — which on a heavily-swiped turn fired the ~7k-token Agent-3
+        // call once per generated swipe — we SCHEDULE the extraction on the shared settle
+        // debounce. Each new swipe (MESSAGE_RECEIVED) or navigation (MESSAGE_SWIPED) resets
+        // the timer, so the expensive extraction runs ONCE on the settled/kept swipe. A normal
+        // single-reply turn schedules once and, with nothing resetting it, still extracts
+        // exactly once promptly. The reflection + entity-check passes are chained to run AFTER
+        // the (single) settled extraction (runPostPasses=true), preserving their prior ordering
+        // relative to the kept content. All guards (bf_mem_processed, pipelineCancelled, etc.)
+        // remain inside runMemoryExtraction and are evaluated at fire time (settle), so a Stop
+        // or a swipe that lands new content is still honored.
+        scheduleSettleExtraction('message-received', true);
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -1201,17 +1250,14 @@ export function initPipeline() {
         }
         addDebugLog('info', `Message swiped (idx ${swipedIdx}) — reset trigger indices, cleared bf_mem_processed`);
 
-        // FIX #8b: schedule a debounced settle-extraction. If a generation follows (a NEW
-        // swipe), MESSAGE_RECEIVED extracts + marks bf_mem_processed before this fires, so
-        // runMemoryExtraction's own gate makes this a no-op. If the user instead navigated
-        // onto an existing swipe and stopped, this fires after the quiet window and extracts
-        // the settled content. Rapid navigation keeps resetting the timer (only the last
-        // settled swipe extracts). Fully guarded inside runMemoryExtraction (try/catch).
-        if (swipeSettleTimer) clearTimeout(swipeSettleTimer);
-        swipeSettleTimer = setTimeout(() => {
-            swipeSettleTimer = null;
-            runMemoryExtraction();
-        }, 1800);
+        // FIX #8b / FIX #12: (re)schedule the shared settle-extraction. Both a NEW-swipe
+        // generation (via MESSAGE_RECEIVED) and a navigation onto an existing swipe (here)
+        // feed the SAME debounce, so the expensive Agent-3 extraction runs ONCE on the final
+        // settled swipe — never once per swipe. We do NOT run the reflection/entity-check
+        // passes from the swipe path (runPostPasses=false): those are owned by the
+        // MESSAGE_RECEIVED path so navigation alone can't re-arm a consolidation. Fully guarded
+        // inside runMemoryExtraction (bf_mem_processed / cancelled / try/catch).
+        scheduleSettleExtraction('swipe', false);
     });
 
     // Reset on chat change
