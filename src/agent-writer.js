@@ -23,13 +23,49 @@ export const DEFAULT_WRITER_FORMAT = `[Memory Context - established truth for th
 - A character only knows facts whose [bracketed] names include that character. Do not let a character act on facts they don't know.]`;
 
 /**
+ * Build the compact always-on scene block (MemGPT-style core working memory).
+ * One line: [Scene] Location: <loc> | Present: <a, b> | Goal: <g> | Recently: <b1>; <b2>
+ * Hard-capped (~maxTokens) with defensive char-budget truncation so a runaway scene
+ * can never blow up the prompt. Returns '' when no usable scene exists.
+ * @param {object|null} scene - { location, present[], goals[], beats[] }
+ * @param {number} [maxTokens=150] - approximate hard cap (1 token ≈ 4 chars heuristic)
+ * @returns {string}
+ */
+export function buildSceneBlock(scene, maxTokens = 150) {
+    if (!scene || typeof scene !== 'object') return '';
+    const arr = (v) => Array.isArray(v) ? v.filter(x => typeof x === 'string' && x.trim()) : [];
+    const loc = typeof scene.location === 'string' ? scene.location.trim() : '';
+    const present = arr(scene.present);
+    const goals = arr(scene.goals);
+    const beats = arr(scene.beats);
+    if (!loc && present.length === 0 && goals.length === 0 && beats.length === 0) return '';
+
+    const parts = [];
+    if (loc) parts.push(`Location: ${loc}`);
+    if (present.length) parts.push(`Present: ${present.join(', ')}`);
+    if (goals.length) parts.push(`Goal: ${goals.join('; ')}`);
+    if (beats.length) parts.push(`Recently: ${beats.join('; ')}`);
+
+    let block = `[Scene] ${parts.join(' | ')}`;
+
+    // Hard cap: approximate tokens at 4 chars/token. Truncate the body defensively,
+    // never letting the scene block exceed the budget (clip mid-string + ellipsis).
+    const charBudget = Math.max(40, Math.floor((Number(maxTokens) || 150) * 4));
+    if (block.length > charBudget) {
+        block = block.slice(0, charBudget - 1).trimEnd() + '…';
+    }
+    return block;
+}
+
+/**
  * Build the fact injection block that gets inserted into the prompt
  * This doesn't call an LLM - it prepares context for the main generation
  * @param {string} draft - Draft from Agent 1
  * @param {string} factsFormatted - Formatted facts from retrieval
+ * @param {string} [sceneBlock] - Optional compact scene block to prepend ABOVE facts
  * @returns {string} Injection text to add to the prompt
  */
-export function buildWriterInjection(draft, factsFormatted) {
+export function buildWriterInjection(draft, factsFormatted, sceneBlock = '') {
     const settings = getSettingsSafe();
 
     const template = settings?.writerFormat || DEFAULT_WRITER_FORMAT;
@@ -47,6 +83,12 @@ export function buildWriterInjection(draft, factsFormatted) {
     if (!template.includes('{draft}')) missing.push(`#Scene Direction:\n${draftText}`);
     if (missing.length > 0) {
         rendered = `${rendered}\n\n${missing.join('\n\n')}`;
+    }
+
+    // Scene card goes ABOVE the fact list: it's the present-moment core context the
+    // writer should anchor on before reading individual facts. One combined message.
+    if (sceneBlock && sceneBlock.trim()) {
+        rendered = `${sceneBlock.trim()}\n\n${rendered}`;
     }
 
     return rendered;

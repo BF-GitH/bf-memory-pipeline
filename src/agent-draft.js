@@ -23,13 +23,20 @@ OUTPUT FORMAT (follow exactly):
 [Semicolon-separated list of facts to look up. Be specific.]
 [PREFER exact keys from the Existing Facts inventory below, written as Category/key (e.g. <CATEGORY>/<KEY>). You may also add free-text keywords (e.g. <NAME> appearance) for anything the inventory doesn't cover.]
 
+#Scene:
+Location: [where the scene is happening right now, a few words]
+Present: [comma-separated characters/entities currently in the scene]
+Goals: [comma-separated active goals or open threads, short]
+Beat: [ONE short line describing the single most recent thing that just happened]
+
 RULES:
 - Keep the draft SHORT - just the idea, not the full response
 - List ALL facts that would help write a consistent reply
 - When a needed fact already EXISTS in the inventory, request it by its exact Category/key — do not invent a new keyword for it
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
-- Consider the emotional state and setting`;
+- Consider the emotional state and setting
+- The #Scene block describes the PRESENT MOMENT (current location, who is here, active goals, the latest beat). Keep each line terse. Omit a line only if truly unknown.`;
 
 /**
  * Run Agent 1: Generate a draft and needed facts list
@@ -56,7 +63,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
-        return { draft: '', neededFacts: [], raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
+        return { draft: '', neededFacts: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
     }
 }
 
@@ -83,7 +90,7 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
         dataParts.push(`## Existing Facts (request these by exact Category/key)\n${factInventory.trim()}`);
     }
     dataParts.push(`## Recent Chat\n${recentChat}`);
-    dataParts.push('\nNow output ONLY #Draft: and #Needed_Facts: sections.');
+    dataParts.push('\nNow output ONLY the #Draft:, #Needed_Facts:, and #Scene: sections.');
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
@@ -97,6 +104,7 @@ function parseDraftResult(response) {
     const result = {
         draft: '',
         neededFacts: [],
+        scene: null, // optional #SCENE parse: { location, present[], goals[], newBeats[] }
         raw: response,
         error: null,
     };
@@ -107,13 +115,13 @@ function parseDraftResult(response) {
     }
 
     // Extract draft section
-    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Needed_Facts|#Needed Facts|$)/i);
+    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Needed_Facts|#Needed Facts|#Scene|$)/i);
     if (draftMatch) {
         result.draft = draftMatch[1].trim();
     }
 
-    // Extract needed facts section
-    const factsMatch = response.match(/#Needed[_ ]Facts:?\s*([\s\S]*?)$/i);
+    // Extract needed facts section (bounded before #Scene so it doesn't swallow it)
+    const factsMatch = response.match(/#Needed[_ ]Facts:?\s*([\s\S]*?)(?=#Scene|$)/i);
     if (factsMatch) {
         const factsRaw = factsMatch[1].trim();
         // Split by semicolons, newlines, or commas
@@ -122,6 +130,10 @@ function parseDraftResult(response) {
             .map(f => f.trim())
             .filter(f => f.length > 0);
     }
+
+    // Extract optional #Scene block (always-on scene card). Missing block → scene stays
+    // null (back-compatible: pipeline simply doesn't update the scene this turn).
+    result.scene = parseSceneBlock(response);
 
     // If parsing failed, try to extract any useful keywords
     if (result.neededFacts.length === 0 && result.draft) {
@@ -137,9 +149,45 @@ function parseDraftResult(response) {
 }
 
 /**
+ * Parse the optional #Scene block from Agent 1's output into a scene patch.
+ * Tolerant: any field may be absent. Returns null if no usable scene fields found.
+ * @param {string} response
+ * @returns {{location:string, present:string[], goals:string[], newBeats:string[]}|null}
+ */
+function parseSceneBlock(response) {
+    // Grab everything from #Scene to the next #Section or end-of-text.
+    const block = response.match(/#Scene:?\s*([\s\S]*?)(?=\n#[A-Za-z]|$)/i);
+    if (!block) return null;
+    const body = block[1];
+
+    const line = (label) => {
+        const m = body.match(new RegExp(`^\\s*${label}\\s*:?\\s*(.+)$`, 'im'));
+        return m ? m[1].trim() : '';
+    };
+    const list = (s) => s
+        .split(/[;,]+/)
+        .map(x => x.trim())
+        // Drop bracketed placeholders the model may have echoed verbatim.
+        .filter(x => x.length > 0 && !/^\[.*\]$/.test(x) && !/^(none|n\/a|unknown|tbd)$/i.test(x));
+
+    const location = line('Location');
+    const present = list(line('Present'));
+    const goals = list(line('Goals'));
+    // Accept "Beat" (single) or "Beats" (plural list) — newest beat(s) for the rolling window.
+    const beatLine = line('Beat') || line('Beats') || line('Recently');
+    const newBeats = beatLine ? list(beatLine).filter(Boolean) : [];
+
+    const cleanLoc = (/^\[.*\]$/.test(location) || /^(none|n\/a|unknown|tbd)$/i.test(location)) ? '' : location;
+
+    if (!cleanLoc && present.length === 0 && goals.length === 0 && newBeats.length === 0) return null;
+    return { location: cleanLoc, present, goals, newBeats };
+}
+
+/**
  * @typedef {Object} DraftResult
  * @property {string} draft - The draft reply idea
  * @property {string[]} neededFacts - List of fact categories/keywords to look up
+ * @property {{location:string, present:string[], goals:string[], newBeats:string[]}|null} scene - Optional parsed #Scene block (null if absent)
  * @property {string} raw - Raw LLM response
  * @property {string|null} error - Error message if failed
  */

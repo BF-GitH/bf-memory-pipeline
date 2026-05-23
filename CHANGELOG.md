@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.13.0] - 2026-05-23
+
+### Added — always-on scene card (live core working memory)
+A tiny, always-injected block telling the writer WHAT IS TRUE RIGHT NOW (MemGPT core-context idea) — so Agent 2 always has the present moment, not just a bag of facts. Backward-compatible: absent scene state behaves as no scene card.
+
+**State model.** A single small per-chat object in `chat_metadata.bf_mem_scene`: `{ location, present[], goals[], beats[], updatedAt, runId }`. Shape-checked reload helpers `getScene` / `setScene` / `reloadSceneFromChat` ([src/settings.js](src/settings.js)) mirror the existing `bf_mem_*` pattern (tokens/log/facts) and reload on CHAT_CHANGED so it survives reload and is per-chat scoped. Beats are a rolling window of the last 3 (append newest, drop oldest, de-dupe immediate repeat).
+
+**Update path — NO new LLM call.** Folded into Agent 1 (the draft planner, which already runs every pipeline turn and reasons about the current scene). Agent 1's output grammar gains an optional `#Scene` block (Location / Present / Goals / Beat); `parseSceneBlock` extracts it without breaking the existing `#Draft` / `#Needed_Facts` outputs (the Needed_Facts capture is now bounded before `#Scene`). pipeline.js persists it via `setScene` each run, guarded by the same not-cancelled + character-didn't-change checks as Agent 3 writes. ([src/agent-draft.js](src/agent-draft.js), [src/pipeline.js](src/pipeline.js))
+
+**Injection — always, hard-capped.** `buildSceneBlock` ([src/agent-writer.js](src/agent-writer.js)) renders one compact line `[Scene] Location: … | Present: … | Goal: … | Recently: …`, hard-capped (~150 tokens, defensive char-budget truncation with ellipsis). `buildWriterInjection` prepends it ABOVE the fact list in the single combined injected system message. Injected EVERY turn the pipeline runs (and re-injected on swipe/regen via the cached injection) whenever enabled and a scene exists — regardless of whether facts were retrieved. Not injected when the pipeline is disabled/skipped/cancelled.
+
+**Settings + UI.** New `sceneCardEnabled` (default true) + `sceneCardMaxTokens` (default 150, clamped 30–400) in DEFAULT_SETTINGS + `validateSettings`. Toggle `bf_mem_scene_enabled` and a read-only live scene view (`bf_mem_scene_view`) added to the Agent 1 tab. ([src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
 ## [0.12.0] - 2026-05-23
 
 ### Added — smarter retrieval, fact context, and an ordered "diary"

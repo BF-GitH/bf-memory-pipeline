@@ -3,13 +3,13 @@
 // ST's EventEmitter awaits async handlers, so generation waits for us.
 
 import { runDraftAgent } from './agent-draft.js';
-import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
+import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, setScene, getScene } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -544,11 +544,27 @@ async function runPipelineInline(data) {
     // the retrieved facts with no draft. Memory > nothing.
     if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
-        draftResult = { draft: '', neededFacts: [], raw: '' };
+        draftResult = { draft: '', neededFacts: [], scene: null, raw: '' };
     }
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Needed facts: ${draftResult.neededFacts.join('; ')}`);
+
+    // --- Scene card: persist Agent 1's #SCENE parse (no extra LLM call) ---
+    // Only when enabled, the run wasn't cancelled, and the character didn't change
+    // mid-run (same guard class as Agent 3 writes — scene is per-chat/character state).
+    if (settings.sceneCardEnabled && !pipelineCancelled && draftResult.scene) {
+        const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
+        if (currentCharAvatar === capturedCharAvatar) {
+            setScene(draftResult.scene, runId);
+            const sc = getScene();
+            if (sc) {
+                addDebugLog('info', `Scene updated: loc="${sc.location}" present=[${(sc.present || []).join(', ')}] goals=${(sc.goals || []).length} beats=${(sc.beats || []).length}`);
+            }
+        } else {
+            addDebugLog('info', 'Scene update skipped (character changed mid-pipeline)');
+        }
+    }
 
     // --- Fact Retrieval: merge speculative + Agent 1's specific requests ---
     updateStatus('running', 'Merging facts...');
@@ -611,8 +627,16 @@ async function runPipelineInline(data) {
         updateStatus('idle');
         return;
     }
-    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted);
-    lastInjection = injection; // Cache for swipes/regens
+    // Always-on scene block: injected EVERY turn (above the facts) whenever enabled
+    // and a scene exists — independent of whether any facts were retrieved.
+    let sceneBlock = '';
+    if (settings.sceneCardEnabled) {
+        const scene = getScene();
+        sceneBlock = buildSceneBlock(scene, settings.sceneCardMaxTokens || 150);
+        if (sceneBlock) addDebugLog('info', `Scene block injected (${sceneBlock.length} chars): ${sceneBlock}`);
+    }
+    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, sceneBlock);
+    lastInjection = injection; // Cache for swipes/regens (scene block included)
 
     // Optional: trim main-model chat history to last N messages — relies on facts to
     // replace older context. Default 0 = don't trim (main model sees full chat as usual).

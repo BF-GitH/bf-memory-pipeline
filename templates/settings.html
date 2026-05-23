@@ -55,6 +55,22 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-clapperboard"></i> Scene Card</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_scene_enabled" />
+                            <span>Inject live scene card</span>
+                        </label>
+                        <small class="bf-mem-hint">Always-on one-line block telling the writer what is true RIGHT NOW (location, who's present, active goals, recent beats). Agent 1 emits it each turn via a #Scene block — no extra LLM call. Injected above the facts every turn a scene exists.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Current Scene (live)</label>
+                            <div id="bf_mem_scene_view" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No scene yet. It updates each turn once the pipeline runs.</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-pen"></i> Draft Planner Prompt
                         <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
