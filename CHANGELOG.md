@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.12.0] - 2026-05-23
+
+### Added — smarter retrieval, fact context, and an ordered "diary"
+Four workflow upgrades, each independently shippable and backward-compatible (older facts/settings load unchanged; absent new fields behave as before).
+
+**Agent 1 stops guessing — fact key inventory.** Agent 1 previously got only the chat + character cards and free-associated keywords, so retrieval was blind to what facts actually existed. New `summarizeKeys()` ([src/database.js](src/database.js)) builds a compact `Category/key` inventory (keys only, no values) that is injected into Agent 1's prompt; Agent 1 now requests EXACT existing keys, and retrieval resolves `Category/key` requests by identity (`resolveExactKeys` in [src/fact-retrieval.js](src/fact-retrieval.js)) in addition to the existing fuzzy/keyword path. ([src/agent-draft.js](src/agent-draft.js), [src/pipeline.js](src/pipeline.js))
+
+**Deterministic retrieval — no more random fact-dropping.** Removed the `Math.random()` gate that probabilistically dropped correctly-retrieved secondary/tertiary facts before injection (the real cause of "the writer skips facts"). Inclusion is now deterministic: all primary, then secondary up to `MAX_SECONDARY` (12), then tertiary up to `MAX_TERTIARY` (6) — token budget still bounded, behavior predictable. The legacy `secondaryChance`/`tertiaryChance` settings are retained for compatibility but no longer gate anything (sliders inert, marked deprecated; UI removal later). ([src/fact-retrieval.js](src/fact-retrieval.js))
+
+**Writer sees the key + a stronger instruction.** `formatFactsForWriter` now emits `[knownBy] Category/key = value` (the key was previously dropped, so the writer couldn't tell similar facts apart). `DEFAULT_WRITER_FORMAT` rewritten to instruct the writer to actively USE facts as established truth and weave them in, not merely "don't contradict." ([src/agent-writer.js](src/agent-writer.js), [src/pipeline.js](src/pipeline.js))
+
+**Optional CONTEXT note on facts.** New optional `context` field stores the prose around a fact (e.g. a strategic admission: the bare value plus the note that another character baited it). Agent 3 emits it via a `>`-prefixed segment and attaches it only when the surrounding situation changes the fact's meaning. Context is EXCLUDED from keyword matching and injected for PRIMARY-tier facts only (`Category/key = value — <context>`) to bound tokens. ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js), [src/fact-retrieval.js](src/fact-retrieval.js))
+
+**Linked "diary" (ordered event log) + depth-dice retrieval.** Sequences (e.g. a character's location over time) are now first-class instead of being overwritten:
+- Facts gain optional `track` (timeline name) + `ord` (monotonic step). Each step is its OWN fact, **exempt from the reconcile-on-write collapse** that previously overwrote the chain. `ord` is auto-assigned at write time (`nextOrdForTrack`), so the model doesn't have to count. A separate single overwriting current-state fact keeps "where are they now" atomic. ([src/database.js](src/database.js): `isSequenceFact`, `getTrackSteps`, `nextOrdForTrack`)
+- Eviction keeps the latest N steps PER track (round-robin trim of lowest `ord`, never below 1/track) so the 50-fact cap can't punch holes mid-chain or wipe a track. Non-sequence facts evict first.
+- Retrieval (`expandSequenceTracks` in [src/fact-retrieval.js](src/fact-retrieval.js)): when a track is relevant, ALWAYS include the current step, then roll each depth tier; the reach = furthest successful roll; include every step from current back to that reach CONTIGUOUSLY (continuity guaranteed by a contiguous slice — no gaps). Default probabilities depth1–4 = 70/50/25/10%, exposed as **sliders** in the Agent 2 retrieval tab (`bf_mem_depth1..4`). ([src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
 ## [0.11.0] - 2026-05-23
 
 ### Fixed — 10 issues surfaced by a long real-session bug report
