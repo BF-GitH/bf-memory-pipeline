@@ -76,6 +76,16 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         }
     }
 
+    // LAYER B — local fuzzy fallback (deterministic, zero API). For each needed-info entry
+    // that yielded ZERO primary hits via the exact+keyword path above, run a character-
+    // trigram similarity match against every ACTIVE fact's `key value tags aliases` text and
+    // admit anything at/above FUZZY_THRESHOLD as SECONDARY (so the existing MAX_SECONDARY cap
+    // bounds it). This catches typos/morphology the lexical layers miss
+    // ("apartments"->"apartment", "felixs"->"felix"). Deterministic — no Math.random. Skips
+    // `Category/key` requests (Layer C already resolved those exactly). Never duplicates a
+    // fact already found by exact/keyword.
+    fuzzyFallback(databases, neededInfo, directResults, exactIds);
+
     // Smart fallback: check related categories
     const fallbackKeywords = new Set();
     for (const keyword of allKeywords) {
@@ -184,12 +194,117 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 }
 
 /**
+ * LAYER B threshold: minimum character-trigram Jaccard similarity for a fuzzy fallback
+ * match to be admitted. ~0.4 catches typos/morphology ("apartments"->"apartment",
+ * "felixs"->"felix") without flooding in unrelated facts. Named const so it's tunable.
+ */
+const FUZZY_THRESHOLD = 0.4;
+
+/**
+ * Character-trigram Jaccard similarity between two strings (Layer B, deterministic, zero
+ * dependencies). Lowercases, pads with spaces so word edges form trigrams, builds the set
+ * of 3-char shingles for each side, and returns |A∩B| / |A∪B| in [0,1]. Robust to typos
+ * and morphological variants (shared stems share most trigrams) while staying cheap enough
+ * to run over a few hundred facts in well under 1ms. No randomness.
+ * @param {string} a
+ * @param {string} b
+ * @returns {number} similarity in [0,1]
+ */
+export function trigramSimilarity(a, b) {
+    const grams = (s) => {
+        const t = `  ${String(s || '').toLowerCase().trim()}  `;
+        const set = new Set();
+        for (let i = 0; i < t.length - 2; i++) set.add(t.slice(i, i + 3));
+        return set;
+    };
+    const A = grams(a);
+    const B = grams(b);
+    if (A.size === 0 || B.size === 0) return 0;
+    let inter = 0;
+    for (const g of A) if (B.has(g)) inter++;
+    const union = A.size + B.size - inter;
+    return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * LAYER B fuzzy fallback (mutates `results` in place). For each needed-info entry that the
+ * exact+keyword path failed to surface as a PRIMARY hit, fuzzy-match it (character-trigram
+ * Jaccard) against every active fact's `key value tags aliases` text and push matches at/
+ * above FUZZY_THRESHOLD as SECONDARY. Skips `Category/key` requests (Layer C handles those)
+ * and any fact already present (deduped via `seenIds`). Deterministic.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string[]} neededInfo - Agent 1's needed-info entries (NOT the context keywords)
+ * @param {Array<{fact: Object, category: string, tier: string}>} results - mutated in place
+ * @param {Set<string>} seenIds - `category:key` ids already in results (mutated)
+ */
+function fuzzyFallback(databases, neededInfo, results, seenIds) {
+    // Which entries already have a primary hit? An entry "covered" if any primary result's
+    // match text contains an entry word (cheap re-check against the existing primaries) — if
+    // not, it's a candidate for fuzzy rescue. We only fuzzy entries with NO primary coverage.
+    const primaries = results.filter(r => r.tier === 'primary');
+    const primaryText = primaries
+        .map(r => `${r.fact.key} ${r.fact.value} ${(r.fact.tags || []).join(' ')} ${(r.fact.aliases || []).join(' ')}`.toLowerCase())
+        .join('  ');
+
+    let admitted = 0;
+    for (const raw of (neededInfo || [])) {
+        const entry = String(raw || '').trim();
+        if (!entry) continue;
+        if (entry.indexOf('/') >= 0) continue; // Category/key request — Layer C's job
+        const entryLower = entry.toLowerCase();
+        // Skip entries that the exact/keyword path already covered as primary (any
+        // meaningful word of the entry already present in a primary fact's text).
+        const words = entryLower.split(/\s+/).filter(w => w.length > 3);
+        const covered = words.length > 0 && words.some(w => primaryText.includes(w));
+        if (covered) continue;
+
+        // Compare each WORD of the entry against each TOKEN of the fact and take the best
+        // pair similarity. Token-level matching is the right granularity for typo/morphology
+        // rescue ("apartments"~"apartment"); a whole-string Jaccard would be diluted by a
+        // long value's unrelated trigrams and never clear the threshold.
+        const entryWords = words.length > 0 ? words : [entryLower];
+        for (const [category, db] of Object.entries(databases)) {
+            for (const fact of (db.facts || [])) {
+                if (!isActiveFact(fact)) continue; // never fuzzy-surface superseded history
+                const id = `${category}:${fact.key}`;
+                if (seenIds.has(id)) continue; // already found by exact/keyword path
+                const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
+                const tokens = factText.split(/[^a-z0-9]+/).filter(t => t.length > 2);
+                let best = 0;
+                for (const ew of entryWords) {
+                    for (const tok of tokens) {
+                        const sim = trigramSimilarity(ew, tok);
+                        if (sim > best) best = sim;
+                        if (best >= FUZZY_THRESHOLD) break;
+                    }
+                    if (best >= FUZZY_THRESHOLD) break;
+                }
+                if (best >= FUZZY_THRESHOLD) {
+                    results.push({ fact, category, tier: 'secondary' });
+                    seenIds.add(id);
+                    admitted++;
+                }
+            }
+        }
+    }
+    if (admitted > 0) {
+        addDebugLog('info', `Fuzzy fallback (Layer B): admitted ${admitted} secondary fact(s) at threshold ${FUZZY_THRESHOLD}`);
+    }
+}
+
+/**
  * Resolve Agent 1's requested facts by EXACT identity (Feature #1).
  * Agent 1 is given a `Category/key` inventory and asked to request facts by their
  * exact key. Any requested item of the form `Category/key` is matched here against
  * the stored fact whose category + key match (case-insensitive). Exact hits are
  * returned as `primary` so they're always included. Items without a slash are left
  * for the existing fuzzy keyword path. Coexists with — does not replace — fuzzy match.
+ *
+ * LAYER C hardening: the match is case-insensitive AND tolerant of surrounding
+ * whitespace/punctuation Agent 1 may wrap a pick in (bullets, trailing periods, brackets,
+ * quotes). Crucially it is VALIDATED against the actual inventory — a request only yields a
+ * result when a stored fact's category+key genuinely match, so a HALLUCINATED key simply
+ * matches nothing and is silently dropped (never injected as an empty/placeholder fact).
  * @param {Object<string, DatabaseSchema>} databases
  * @param {string[]} requests - Agent 1's neededInfo entries
  * @returns {Array<{fact: Object, category: string, tier: string}>}
@@ -197,11 +312,19 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 function resolveExactKeys(databases, requests) {
     const results = [];
     const seen = new Set();
+    // Strip surrounding whitespace and stray punctuation (bullets, quotes, brackets,
+    // trailing/leading separators) Agent 1 might wrap an identifier in, then lowercase.
+    const norm = (s) => String(s)
+        .trim()
+        .replace(/^[\s\-*•"'`(\[\{]+/, '')
+        .replace(/[\s.,;:"'`)\]\}]+$/, '')
+        .trim()
+        .toLowerCase();
     for (const raw of (requests || [])) {
         const slashIdx = String(raw).indexOf('/');
         if (slashIdx < 0) continue; // not a Category/key request — leave to fuzzy path
-        const reqCat = raw.slice(0, slashIdx).trim().toLowerCase();
-        const reqKey = raw.slice(slashIdx + 1).trim().toLowerCase();
+        const reqCat = norm(raw.slice(0, slashIdx));
+        const reqKey = norm(raw.slice(slashIdx + 1));
         if (!reqCat || !reqKey) continue;
         for (const [category, db] of Object.entries(databases)) {
             if (category.toLowerCase() !== reqCat) continue;

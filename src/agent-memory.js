@@ -45,7 +45,7 @@ CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | >context note
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | aka:nickname,role | >context note
 .
 #WHY <one sentence>
 
@@ -54,6 +54,8 @@ If nothing: just \`.\` immediately.
 SOURCE TAG (optional but preferred): append \`| @src:user\` if the fact was disclosed in the [USER] message, or \`| @src:char\` if it came from the [CHAR] message. This attributes each fact to the correct message. If you cannot tell, omit it.
 
 CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY when the fact's meaning depends on the surrounding situation and would be misread without it — e.g. a strategic admission that only makes sense once you know another party baited it. Do NOT add a context note to ordinary facts; most facts have none. The note is stored separately and never affects keyword search.
+
+ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
 IMPORTANCE + KIND (optional but preferred): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 3 = ordinary, 1 = trivial/passing) and \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Omit if unsure (defaults: !3, kind:trait).
 
@@ -103,10 +105,10 @@ Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I lov
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
 
 #MEM
-+ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char
++ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char | aka:the scar,old scar
 + Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory | @src:char
 .
-#WHY Lasting reveal in asterisks → atomic split: existence + origin.
+#WHY Lasting reveal in asterisks → atomic split: existence + origin. \`aka:\` on the scar so a later "that mark on your arm" still retrieves it.
 
 ---
 Input: [USER:{{user}}] *grins and shrugs.*
@@ -379,6 +381,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let importance = null; // Salience feature: optional 1-5 (`!N` marker)
         let kind = '';         // Salience feature: optional trait|state|event (`kind:` marker)
         let supersedes = false; // Supersession feature: optional `~` marker (replaces prior value)
+        let aliases = [];      // Layer A (alias retrieval): optional alt names/nicknames (`aka:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -406,6 +409,17 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             const kindMatch = seg.match(/^kind\s*:\s*(trait|state|event)\b/i);
             if (kindMatch) {
                 kind = kindMatch[1].toLowerCase();
+                continue;
+            }
+
+            // aka:<a, b, c> — OPTIONAL aliases (Layer A retrieval). Short alternative
+            // names/nicknames/descriptors a future message might use for the fact's subject.
+            // `aka:` was chosen because it does NOT collide with the existing
+            // |/@/#/rel:/@src:/>/track:/!N/kind:/~ grammar (no marker starts with `a`).
+            // MATCH-ONLY: folded into search text, never shown to the writer.
+            const akaMatch = seg.match(/^aka\s*:\s*(.+)$/i);
+            if (akaMatch) {
+                aliases = akaMatch[1].split(',').map(s => s.trim()).filter(Boolean);
                 continue;
             }
 
@@ -501,6 +515,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         if (kind) update.kind = kind;
         // Supersession feature: only attach the explicit signal when present (lean / back-compat).
         if (supersedes) update.supersedes = true;
+        // Layer A: only attach aliases when the writer provided some (keep object lean / back-compat).
+        if (aliases.length) update.aliases = aliases;
         result.updates.push(update);
     }
 
@@ -588,6 +604,8 @@ async function applyUpdates(updates, existingDatabases) {
         // Supersession feature: forward the explicit signal so upsertFact marks the prior
         // value of a changeable-state fact as superseded history (transient flag, not persisted).
         if (update.supersedes) factToWrite.supersedes = true;
+        // Layer A: forward aliases so upsertFact can UNION them (dedupe) across re-mentions.
+        if (Array.isArray(update.aliases) && update.aliases.length) factToWrite.aliases = update.aliases;
         upsertFact(db, factToWrite);
         const relCount = update.relationships?.length || 0;
         addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);

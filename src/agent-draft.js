@@ -21,7 +21,7 @@ OUTPUT FORMAT (follow exactly):
 
 #Needed_Facts:
 [Semicolon-separated list of facts to look up. Be specific.]
-[PREFER exact keys from the Existing Facts inventory below, written as Category/key (e.g. <CATEGORY>/<KEY>). You may also add free-text keywords (e.g. <NAME> appearance) for anything the inventory doesn't cover.]
+[PICK FROM THE MENU FIRST: scan the Existing Facts inventory below and choose the exact Category/key entries relevant to the CURRENT moment — INCLUDING ones the chat refers to only by PARAPHRASE or description. If the scene mentions "the man by the window" or "the mark" and the inventory has <CATEGORY>/<KEY> for that subject, request that exact Category/key (the lexical search cannot bridge the wording — you must). Only AFTER picking the relevant inventory keys, you MAY add a few free-text keywords (e.g. <NAME> appearance) for things NOT yet in the inventory.]
 
 #Scene:
 Location: [where the scene is happening right now, a few words]
@@ -32,7 +32,7 @@ Beat: [ONE short line describing the single most recent thing that just happened
 RULES:
 - Keep the draft SHORT - just the idea, not the full response
 - List ALL facts that would help write a consistent reply
-- When a needed fact already EXISTS in the inventory, request it by its exact Category/key — do not invent a new keyword for it
+- When a needed fact already EXISTS in the inventory, request it by its exact Category/key — do not invent a new keyword for it. This is the ONLY way to retrieve a fact the chat refers to by a different wording than its stored value, so it is your most important job: match paraphrases in the scene to the right inventory key.
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting

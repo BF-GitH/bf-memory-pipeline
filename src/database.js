@@ -388,8 +388,9 @@ export function upsertFact(db, fact) {
             const existing = db.facts[exactKeyIdx];
             const mergedRels = mergeRelationships(existing.relationships, seqFact.relationships);
             const mergedContext = mergeContext(existing.context, seqFact.context);
+            const mergedAliases = mergeAliases(existing.aliases, seqFact.aliases);
             const sal = mergeSalience(existing, seqFact);
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, ...sal, lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, ...sal, lastUpdated: Date.now() };
         } else {
             db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
         }
@@ -421,6 +422,9 @@ export function upsertFact(db, fact) {
         // it provides its own (Feature #3) — so re-mentioning a fact without context
         // doesn't wipe a previously-attached note.
         const mergedContext = mergeContext(existing.context, fact.context);
+        // Layer A: union aliases (dedupe) so re-mentions accumulate nicknames/descriptors
+        // rather than overwrite. Match-only — never shown to the writer.
+        const mergedAliases = mergeAliases(existing.aliases, fact.aliases);
         // Merge salience: keep the HIGHER importance (a fact only grows more foundational
         // as it's re-mentioned, never wiped by a bare re-mention); prefer the incoming
         // kind if the writer provided one, else keep existing.
@@ -456,7 +460,7 @@ export function upsertFact(db, fact) {
             // supersession markers (it's the current truth again).
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, ...sal, active: true,
+                context: mergedContext, aliases: mergedAliases, ...sal, active: true,
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
             };
             db.updatedAt = now;
@@ -465,7 +469,7 @@ export function upsertFact(db, fact) {
 
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, ...sal, lastUpdated: Date.now() };
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, ...sal, lastUpdated: Date.now() };
     } else {
         db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
     }
@@ -569,6 +573,32 @@ function mergeSalience(existing, incoming) {
     if (incKind) out.kind = normalizeKind(incoming.kind);
     else if (existing && existing.kind) out.kind = normalizeKind(existing.kind);
     return out;
+}
+
+/**
+ * Union aliases across a re-mention (Layer A): accumulate nicknames/descriptors rather than
+ * overwrite, so each re-mention can add a new way to refer to the subject. Dedupes
+ * case-insensitively (keeping first-seen casing), preserves order. Returns undefined when
+ * the union is empty so a fact without aliases stays lean (back-compat).
+ * @param {string[]|undefined} existing
+ * @param {string[]|undefined} incoming
+ * @returns {string[]|undefined}
+ */
+function mergeAliases(existing, incoming) {
+    const seen = new Set();
+    const out = [];
+    for (const list of [existing, incoming]) {
+        if (!Array.isArray(list)) continue;
+        for (const a of list) {
+            const s = String(a ?? '').trim();
+            if (!s) continue;
+            const k = s.toLowerCase();
+            if (seen.has(k)) continue;
+            seen.add(k);
+            out.push(s);
+        }
+    }
+    return out.length ? out : undefined;
 }
 
 /** Prefer an incoming context note; fall back to the existing one. Empty → undefined. */
@@ -681,7 +711,11 @@ export function searchFacts(databases, keywords) {
             // injection surfaces only what is CURRENTLY true. History snapshots are
             // retained on disk (and visible via the track/diary) but never injected here.
             if (!isActiveFact(fact)) continue;
-            const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')}`.toLowerCase();
+            // Layer A (aliases): fold the fact's aliases into the keyword-match text alongside
+            // key/value/tags so an alternative name/nickname can satisfy a hit. Aliases are
+            // MATCH-ONLY — they affect search here but are NEVER shown to the writer (see
+            // formatFactsForWriter, which excludes them exactly like `context`).
+            const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
 
             // Direct keyword match: require phrase-level relevance
             // Single-word keywords: that word must match
@@ -845,6 +879,12 @@ async function deleteAttachmentFile(url) {
  * @property {string} [context] - OPTIONAL prose note giving the situation around a fact
  *   (Feature #3). Injection-only and EXCLUDED from searchFacts() match text. Absent on
  *   facts written by older versions (backward-compatible).
+ * @property {string[]} [aliases] - OPTIONAL alternative names/nicknames/descriptors the
+ *   fact's subject might be referred to by in a future message (Layer A of the retrieval
+ *   cascade). MATCH-ONLY: folded into searchFacts() match text so a paraphrase can satisfy
+ *   a keyword hit, but NEVER shown to the writer (excluded from formatFactsForWriter,
+ *   exactly like `context`). Unioned (deduped) across re-mentions in upsertFact. Absent on
+ *   facts from older versions (backward-compatible — behaves exactly like no aliases).
  * @property {string} [track] - OPTIONAL timeline name (Feature #4). Presence marks this
  *   fact as one ordered step in a sequence (e.g. a location track). Sequence facts are
  *   exempt from reconcile-on-write collapse.
