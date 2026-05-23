@@ -20,12 +20,13 @@ OUTPUT FORMAT (follow exactly):
 [Write 1-3 sentences describing what the character would do/say. Include the emotional tone and any actions.]
 
 #Needed_Facts:
-[Semicolon-separated list of fact categories/keywords to look up. Be specific.]
-[Format: CharacterName FactType; CharacterName FactType; LocationName Details; etc.]
+[Semicolon-separated list of facts to look up. Be specific.]
+[PREFER exact keys from the Existing Facts inventory below, written as Category/key (e.g. <CATEGORY>/<KEY>). You may also add free-text keywords (e.g. <NAME> appearance) for anything the inventory doesn't cover.]
 
 RULES:
 - Keep the draft SHORT - just the idea, not the full response
 - List ALL facts that would help write a consistent reply
+- When a needed fact already EXISTS in the inventory, request it by its exact Category/key — do not invent a new keyword for it
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting`;
@@ -35,10 +36,14 @@ RULES:
  * @param {string} recentChat - Formatted recent chat messages
  * @param {string} characterInfo - Character card/description
  * @param {string} userPersona - User's persona description
+ * @param {string|null} profileId
+ * @param {string} factInventory - Compact `Category/key` inventory of existing facts
+ *   (keys only, no values). Lets Agent 1 request EXACT keys that exist instead of
+ *   free-associating keyword strings. Optional — empty when no facts stored yet.
  * @returns {Promise<DraftResult>}
  */
-export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null) {
-    const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona);
+export async function runDraftAgent(recentChat, characterInfo, userPersona, profileId = null, factInventory = '') {
+    const { systemPrompt, userPrompt } = buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory);
     addDebugLog('info', `Agent 1 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -58,7 +63,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
 /**
  * Build the prompt for Agent 1
  */
-function buildDraftPrompt(recentChat, characterInfo, userPersona) {
+function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory = '') {
     const sysPrompt = getSettingsSafe()?.draftPrompt || DEFAULT_DRAFT_PROMPT;
 
     // System message: pure instruction, no RP content
@@ -71,6 +76,11 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona) {
     }
     if (userPersona) {
         dataParts.push(`## User Persona\n${userPersona}`);
+    }
+    // Existing-fact inventory (Category/key only). Gives Agent 1 a menu of exact keys
+    // to request so retrieval can resolve them by identity rather than fuzzy guessing.
+    if (factInventory && factInventory.trim()) {
+        dataParts.push(`## Existing Facts (request these by exact Category/key)\n${factInventory.trim()}`);
     }
     dataParts.push(`## Recent Chat\n${recentChat}`);
     dataParts.push('\nNow output ONLY #Draft: and #Needed_Facts: sections.');

@@ -405,6 +405,25 @@ export function getCategoryNames(databases) {
     return Object.keys(databases);
 }
 
+/**
+ * Produce a COMPACT keys-only inventory of all stored facts as `Category/key`
+ * (one per line, no values) so it can be cheaply injected into Agent 1's prompt as
+ * a menu of EXACT keys it can request. Values are intentionally omitted to keep the
+ * inventory token cost low; Agent 1 only needs to know what exists, not its content.
+ * @param {Object<string, DatabaseSchema>} databases - All databases
+ * @returns {string} Newline-separated `Category/key` list (empty string if none)
+ */
+export function summarizeKeys(databases) {
+    if (!databases || Object.keys(databases).length === 0) return '';
+    const lines = [];
+    for (const [category, db] of Object.entries(databases)) {
+        for (const fact of (db.facts || [])) {
+            if (fact.key) lines.push(`${category}/${fact.key}`);
+        }
+    }
+    return lines.join('\n');
+}
+
 // Internal helpers
 
 async function fetchAttachmentContent(url) {

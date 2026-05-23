@@ -62,6 +62,10 @@ const DEFAULT_SETTINGS = {
     // change the slider back to 0.
     agent2ContextMessages: 0,
     reviewInterval: 10,
+    // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
+    // no random dice). These keys are kept for settings persistence/back-compat and the
+    // existing sliders, but no longer gate which facts get injected. Safe to remove the
+    // UI later; the values are inert.
     secondaryChance: 50,
     tertiaryChance: 15,
     showToast: true,

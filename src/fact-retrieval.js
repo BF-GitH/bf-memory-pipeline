@@ -3,7 +3,7 @@
 // No LLM calls - pure database lookup with smart fallback matching
 
 import { getAllDatabases, searchFacts } from './database.js';
-import { getSettings, addDebugLog } from './settings.js';
+import { addDebugLog } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
@@ -59,8 +59,22 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const allKeywords = [...new Set([...neededInfo, ...contextKeywords])];
     addDebugLog('info', `Retrieval keywords: ${allKeywords.join(', ')}`);
 
-    // Search databases for direct matches
-    const directResults = searchFacts(databases, allKeywords);
+    // EXACT-KEY RESOLUTION (Feature #1): Agent 1 now requests facts by their exact
+    // `Category/key` from the inventory it was given. Resolve those by identity so a
+    // requested key reliably appears as primary, independent of the fuzzy path below.
+    // The fuzzy keyword search still runs on the SAME list afterwards — exact and
+    // fuzzy coexist; identity hits just guarantee the requested key is included.
+    const directResults = resolveExactKeys(databases, neededInfo);
+    const exactIds = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
+
+    // Search databases for direct (fuzzy) matches, skipping anything already resolved exactly.
+    for (const r of searchFacts(databases, allKeywords)) {
+        const id = `${r.category}:${r.fact.key}`;
+        if (!exactIds.has(id)) {
+            directResults.push(r);
+            exactIds.add(id);
+        }
+    }
 
     // Smart fallback: check related categories
     const fallbackKeywords = new Set();
@@ -98,15 +112,21 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         }
     }
 
-    // Apply probability filter for secondary/tertiary (read from settings)
-    const settings = getSettings() || {};
-    const secondaryChance = (settings.secondaryChance ?? 50) / 100;
-    const tertiaryChance = (settings.tertiaryChance ?? 15) / 100;
-
+    // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
+    // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
+    // facts — the real cause of "the writer skips facts." We now include facts by tier
+    // up to fixed CAPS so inclusion is predictable while the token budget stays bounded.
+    // Always keep all primary; then fill secondary up to MAX_SECONDARY, then tertiary up
+    // to MAX_TERTIARY. The legacy secondaryChance/tertiaryChance settings are no longer
+    // used for gating (kept in settings for persistence; see settings.js note).
+    const MAX_SECONDARY = 12;
+    const MAX_TERTIARY = 6;
+    let secondaryKept = 0;
+    let tertiaryKept = 0;
     const filteredResults = directResults.filter(result => {
         if (result.tier === 'primary') return true;
-        if (result.tier === 'secondary') return Math.random() < secondaryChance;
-        if (result.tier === 'tertiary') return Math.random() < tertiaryChance;
+        if (result.tier === 'secondary') return secondaryKept++ < MAX_SECONDARY;
+        if (result.tier === 'tertiary') return tertiaryKept++ < MAX_TERTIARY;
         return false;
     });
 
@@ -146,6 +166,43 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 }
 
 /**
+ * Resolve Agent 1's requested facts by EXACT identity (Feature #1).
+ * Agent 1 is given a `Category/key` inventory and asked to request facts by their
+ * exact key. Any requested item of the form `Category/key` is matched here against
+ * the stored fact whose category + key match (case-insensitive). Exact hits are
+ * returned as `primary` so they're always included. Items without a slash are left
+ * for the existing fuzzy keyword path. Coexists with — does not replace — fuzzy match.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string[]} requests - Agent 1's neededInfo entries
+ * @returns {Array<{fact: Object, category: string, tier: string}>}
+ */
+function resolveExactKeys(databases, requests) {
+    const results = [];
+    const seen = new Set();
+    for (const raw of (requests || [])) {
+        const slashIdx = String(raw).indexOf('/');
+        if (slashIdx < 0) continue; // not a Category/key request — leave to fuzzy path
+        const reqCat = raw.slice(0, slashIdx).trim().toLowerCase();
+        const reqKey = raw.slice(slashIdx + 1).trim().toLowerCase();
+        if (!reqCat || !reqKey) continue;
+        for (const [category, db] of Object.entries(databases)) {
+            if (category.toLowerCase() !== reqCat) continue;
+            for (const fact of (db.facts || [])) {
+                if (String(fact.key).toLowerCase() !== reqKey) continue;
+                const id = `${category}:${fact.key}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                results.push({ fact, category, tier: 'primary' });
+            }
+        }
+    }
+    if (results.length > 0) {
+        addDebugLog('info', `Exact-key resolution: ${results.length} fact(s) matched by identity`);
+    }
+    return results;
+}
+
+/**
  * Format retrieved facts into a string for Agent 2 (Writer)
  * Format: [who_knows] fact_content
  * @param {Array} results - Filtered retrieval results
@@ -159,7 +216,9 @@ function formatFactsForWriter(results) {
     for (const { fact, category } of results) {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-        lines.push(`${prefix} ${category}: ${fact.value}`);
+        // Keep the KEY (Feature #2b) so the writer sees `Category/key = value` and can
+        // tell similar facts apart and use them precisely.
+        lines.push(`${prefix} ${category}/${fact.key} = ${fact.value}`);
     }
 
     return lines.join('\n');

@@ -6,7 +6,7 @@ import { runDraftAgent } from './agent-draft.js';
 import { buildWriterInjection, injectMemoryContext } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { retrieveFacts, extractContextKeywords } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens } from './settings.js';
@@ -374,13 +374,21 @@ async function runPipelineInline(data) {
     const contextKeywords = extractContextKeywords(recentMessages);
     addDebugLog('info', `Speculative retrieval keywords: ${contextKeywords.join(', ')}`);
 
+    // Load databases once up front — reused for both Agent 1's fact inventory and
+    // Agent 3's existing-DB context, avoiding a duplicate fetch.
+    const databases = await getAllDatabases();
+    // Compact keys-only inventory (Category/key, no values) so Agent 1 can request
+    // EXACT keys that exist instead of free-associating keyword strings.
+    const factInventory = summarizeKeys(databases);
+    addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}`);
+
     try {
         isInternalCall = true;
         const promises = [];
 
         // Agent 1: Draft
         promises.push(
-            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId)
+            runDraftAgent(formattedChat, characterInfo, userPersona, agent1ProfileId, factInventory)
                 .catch(err => ({ draft: '', neededFacts: [], raw: '', error: err.message })),
         );
 
@@ -412,7 +420,7 @@ async function runPipelineInline(data) {
             }
             addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
 
-            const databases = await getAllDatabases();
+            // Reuse the databases loaded above for Agent 1's inventory.
             promises.push(
                 runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId, !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex)
                     .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
@@ -575,7 +583,8 @@ async function runPipelineInline(data) {
             ? retrieval.facts.map(({ fact, category }) => {
                 const knownBy = (fact.knownBy || []).join(', ');
                 const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-                return `${prefix} ${category}: ${fact.value}`;
+                // Keep the KEY (Feature #2b): `Category/key = value`, matching formatFactsForWriter.
+                return `${prefix} ${category}/${fact.key} = ${fact.value}`;
             }).join('\n')
             : '(No stored facts available)';
     } else {

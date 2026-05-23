@@ -8,15 +8,19 @@ function getSettingsSafe() {
     try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
 }
 
-export const DEFAULT_WRITER_FORMAT = `[Memory Context - Use these established facts for consistency]
+export const DEFAULT_WRITER_FORMAT = `[Memory Context - established truth for this scene]
 
-#Established Facts:
+#Established Facts (Category/key = value):
 {facts}
 
 #Scene Direction:
 {draft}
 
-[Follow the established facts above. Do not contradict them. Characters only know facts tagged with their name.]`;
+[How to use the facts above:
+- Treat every fact as ESTABLISHED TRUTH. Weave the relevant ones into the scene naturally — through action, dialogue, and detail — rather than listing them.
+- PREFER these stored facts over inventing new details. When a fact covers something, use it instead of making something up.
+- Never contradict a fact. If the scene needs a detail a fact already defines, match the fact exactly.
+- A character only knows facts whose [bracketed] names include that character. Do not let a character act on facts they don't know.]`;
 
 /**
  * Build the fact injection block that gets inserted into the prompt
