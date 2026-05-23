@@ -135,6 +135,26 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null) {
 }
 
 async function callAgentLLMOnce(systemPrompt, userPrompt, profileId) {
+    // ── Prompt-caching note (Claude / OpenRouter / Electron Hub etc.) ─────────────
+    // We CANNOT attach `cache_control: {type:'ephemeral'}` markers from an extension.
+    // SillyTavern's chat-completions backend rebuilds every message into a fresh
+    // {role, content} object (convertClaudeMessages in prompt-converters.js), so any
+    // client-supplied cache_control field on these message objects is dropped before
+    // the request reaches the provider. Caching is applied SERVER-SIDE only, driven
+    // by config.yaml: `claude.enableSystemPromptCache` (caches the whole system block)
+    // and `claude.cachingAtDepth` (caches message-array prefixes at role boundaries),
+    // with `claude.extendedTTL` choosing 1h vs 5m. There is no per-request/per-message
+    // API to toggle these from CMRS/sendRequest.
+    //
+    // What we CAN guarantee — and the only thing that makes those server-side knobs
+    // pay off — is a cache-STABLE prefix: the big STATIC agent rulebook lives entirely
+    // in the system message (byte-stable within a session; changes only when the user
+    // edits the prompt setting), and ALL per-turn variable data (character card,
+    // persona, DB summary, the message being analyzed) lives in the user message AFTER
+    // it. Do NOT interleave variable data into the system message or the static prefix
+    // stops matching and `enableSystemPromptCache` can no longer reuse it. Agent 3
+    // (note-taker) sends the full uncapped DB summary in the user message; the cacheable
+    // part is its system rulebook, which this ordering preserves.
     const messages = [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
