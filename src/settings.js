@@ -7,6 +7,10 @@ import { DEFAULT_FINDER_PROMPT } from './agent-finder.js';
 import { DEFAULT_MEMORY_PROMPT } from './agent-memory.js';
 import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
+import {
+    getEntities, setEntityStatus, reloadEntitiesFromChat,
+    scanForNamedCandidates, showEntityPopup, promoteEntity,
+} from './agent-entities.js';
 
 let Popup, POPUP_TYPE;
 async function ensurePopup() {
@@ -120,6 +124,14 @@ const DEFAULT_SETTINGS = {
     reflectionInject: false,
     reflectionMaxTokens: 200,
     reflectionPrompt: '',
+    // Character registry + NPC-promotion flow. Periodically (every characterCheckInterval
+    // successful pipeline runs) scans the fact store for NEWLY-SEEN NAMED entities (proper
+    // names in facts' involved/subject and the NPC drawer's `about`) that aren't yet
+    // classified, and offers ONE batched popup to mark each Recurring / NPC / Later.
+    // Deterministic scan (NO LLM call). Runs OFF the critical path on MESSAGE_RECEIVED, like
+    // reflection. Absent (older settings) → defaults apply (back-compatible).
+    characterRegistryEnabled: true,
+    characterCheckInterval: 10,
     // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
     // Agent 1 picks #Branches from the menu, Agent 4 reads the full facts under those
     // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
@@ -195,6 +207,10 @@ function validateSettings(s) {
     if (typeof s.reflectionEnabled !== 'boolean') s.reflectionEnabled = true;
     if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = false; // inert (refinement #1)
     if (typeof s.reflectionPrompt !== 'string')   s.reflectionPrompt = '';
+    // Character registry: enable toggle + check interval (clamped 2..50 so it can't fire every
+    // turn nor be set absurdly high). Defaults: enabled true, interval 10.
+    if (typeof s.characterRegistryEnabled !== 'boolean') s.characterRegistryEnabled = true;
+    s.characterCheckInterval = Math.floor(clamp(s.characterCheckInterval, 2, 50, 10));
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
@@ -754,6 +770,77 @@ function renderReflection() {
             '</div>';
     }
     el.innerHTML = html || '<div class="bf-mem-summary-empty">No reflection yet.</div>';
+}
+
+// --- Character Registry (live list in the Agent 3 tab) ---
+// Read-only-ish list of known entities + their status, with a way to re-decide each
+// (toggle status / re-scan). Storage + detection live in agent-entities.js; this is
+// just the settings-panel surface. Persistence is per-chat (bf_mem_entities), reloaded
+// on CHAT_CHANGED via reloadEntitiesFromChat() (wired in initSettings).
+
+const ENTITY_STATUS_LABEL = { named: 'Recurring', npc: 'NPC', later: 'Later', pending: 'Pending' };
+
+/** Render the Characters list (if the panel is present). */
+function renderEntities() {
+    const el = document.getElementById('bf_mem_charreg_list');
+    if (!el) return;
+    let reg = {};
+    try { reg = getEntities() || {}; } catch { reg = {}; }
+    const items = Object.values(reg)
+        .filter(e => e && e.name)
+        .sort((a, b) => (b.count || 0) - (a.count || 0) || String(a.name).localeCompare(String(b.name)));
+
+    if (items.length === 0) {
+        el.innerHTML = '<div class="bf-mem-summary-empty">No characters tracked yet. They are discovered automatically as facts accumulate.</div>';
+        return;
+    }
+
+    el.innerHTML = items.map(e => {
+        const nm = escapeHtml(e.name);
+        const status = ENTITY_STATUS_LABEL[e.status] || e.status || 'Pending';
+        const sclass = `bf-mem-fact-status bf-mem-fact-status-${escapeHtml(String(e.status || 'pending').toLowerCase())}`;
+        const count = Number(e.count) || 0;
+        return `
+            <div class="bf-mem-charreg-item bf-mem-fact-row" data-name="${nm}">
+                <div class="bf-mem-fact-line">
+                    <span class="bf-mem-fact-key">${nm}</span>
+                    <span class="${sclass}" style="margin-left:6px;">${escapeHtml(status)}</span>
+                    <span class="bf-mem-fact-source" style="margin-left:6px;">${count}×</span>
+                </div>
+                <div class="bf-mem-fact-meta">
+                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="named" title="Mark recurring (promotes facts out of the NPC drawer)">Recurring</button>
+                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="npc" title="Mark as one-off NPC">NPC</button>
+                    <button class="bf-mem-charreg-set menu_button" data-name="${nm}" data-status="later" title="Defer">Later</button>
+                </div>
+            </div>`;
+    }).join('');
+
+    // Bind re-decide buttons (delegated rebind each render — list is small).
+    el.querySelectorAll('.bf-mem-charreg-set').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const name = btn.dataset.name;
+            const status = btn.dataset.status;
+            if (!name || !status) return;
+            try {
+                setEntityStatus(name, status);
+                if (status === 'named') {
+                    const res = await promoteEntity(name);
+                    if (typeof toastr !== 'undefined') {
+                        toastr.success(`"${name}" promoted (${res.moved} fact(s) moved)`, 'BF Memory');
+                    }
+                }
+            } catch (err) {
+                addDebugLog('fail', `Character re-decide for "${name}" failed: ${err.message || err}`);
+            }
+            renderEntities();
+        });
+    });
+}
+
+/** Re-load registry from chat + re-render. Called on CHAT_CHANGED. */
+export function reloadEntitiesUI() {
+    try { reloadEntitiesFromChat(); } catch { /* ignore */ }
+    renderEntities();
 }
 
 function fmt(n) { return (typeof n === 'number' && Number.isFinite(n)) ? n.toLocaleString() : '—'; }
@@ -1782,6 +1869,40 @@ export async function initSettings() {
     // Render the current live reflection summary (read-only)
     renderReflection();
 
+    // --- Character Registry (Agent 3 tab) ---
+    $('#bf_mem_charreg_enabled').prop('checked', extensionSettings.characterRegistryEnabled !== false).on('change', function () {
+        extensionSettings.characterRegistryEnabled = $(this).prop('checked');
+        saveSettings();
+    });
+    $('#bf_mem_charcheck_interval').val(extensionSettings.characterCheckInterval);
+    $('#bf_mem_charcheck_interval_val').text(extensionSettings.characterCheckInterval);
+    $('#bf_mem_charcheck_interval').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.characterCheckInterval = val;
+        $('#bf_mem_charcheck_interval_val').text(val);
+        saveSettings();
+    });
+    // Manual "scan now": run the deterministic scan and, if there are unclassified named
+    // candidates, open the batched popup immediately (off the normal interval gate).
+    $('#bf_mem_charreg_scan').on('click', async () => {
+        try {
+            const { getAllDatabases } = await import('./database.js');
+            const databases = await getAllDatabases();
+            const candidates = scanForNamedCandidates(databases);
+            if (candidates.length === 0) {
+                toastr.info('No new named characters found.', 'BF Memory');
+                renderEntities();
+                return;
+            }
+            await showEntityPopup(candidates);
+            renderEntities();
+        } catch (err) {
+            addDebugLog('fail', `Manual character scan failed: ${err.message || err}`);
+        }
+    });
+    // Render the current live registry list.
+    renderEntities();
+
     // --- Prompts Tab ---
     $('#bf_mem_draft_prompt').val(extensionSettings.draftPrompt || DEFAULT_DRAFT_PROMPT).off('input').on('input', function () {
         const val = $(this).val();
@@ -2031,6 +2152,7 @@ export async function initSettings() {
         reloadTokensFromChat();
         reloadSceneFromChat();
         reloadReflectionFromChat();
+        reloadEntitiesUI();
     });
 
     // Initial load: pull any previously-persisted log entries + facts for the current chat
@@ -2039,6 +2161,7 @@ export async function initSettings() {
     reloadTokensFromChat();
     reloadSceneFromChat();
     reloadReflectionFromChat();
+    reloadEntitiesUI();
 
     // Save to active profile on page close/refresh
     window.addEventListener('beforeunload', () => {

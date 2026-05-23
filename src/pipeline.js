@@ -11,7 +11,8 @@ import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } fro
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, getReflection } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, getReflection, reloadEntitiesUI } from './settings.js';
+import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -39,6 +40,13 @@ let reflectionInFlight = false; // guard so overlapping turns can't double-fire 
 // path. This guard prevents two MESSAGE_RECEIVED events (e.g. a fast follow-up turn) from
 // launching overlapping extractions that race on the same DB save.
 let memoryExtractionInFlight = false;
+// Character registry: count successful memory-extraction runs and, every
+// characterCheckInterval, run a deterministic scan for newly-seen NAMED entities off the
+// critical path (after the post-reply extraction has committed its facts). Mirrors the
+// reflection cadence but is far cheaper (no LLM call) and only opens a popup when there
+// are unclassified candidates. Per-chat: reset on CHAT_CHANGED.
+let runsSinceEntityCheck = 0;
+let entityCheckInFlight = false;
 // FIX #8b: debounce timer for swipe-SETTLE extraction. Navigating LEFT/RIGHT onto an
 // ALREADY-GENERATED swipe fires MESSAGE_SWIPED but NOT MESSAGE_RECEIVED, so the
 // MESSAGE_RECEIVED extraction never sees that settled content. We schedule a debounced
@@ -923,6 +931,63 @@ async function maybeRunReflection() {
     }
 }
 
+/**
+ * Character registry detection — runs on MESSAGE_RECEIVED, OFF the critical path, gated to
+ * fire at most once every `characterCheckInterval` successful extraction runs. Performs a
+ * DETERMINISTIC scan of the fact store (no LLM call) for newly-seen NAMED entities not yet
+ * classified; when there are candidates, opens ONE batched popup (deferred, never blocking)
+ * for the user to mark each Recurring / NPC / Later. Marking Recurring migrates that name's
+ * facts out of the shared NPC drawer. Fully self-guarded + try/catch'd — a failure here can
+ * never break generation or the next turn.
+ */
+async function maybeRunEntityCheck() {
+    if (entityCheckInFlight) return;
+    const settings = getSettings();
+    if (!settings || !settings.enabled || settings.characterRegistryEnabled === false) return;
+    if (pipelineCancelled) return;
+    const ctx = SillyTavern.getContext();
+    if (ctx.groupId || ctx.selected_group) return; // group chats unsupported (same as the gate)
+
+    runsSinceEntityCheck++;
+    const interval = Math.max(2, settings.characterCheckInterval || 10);
+    if (runsSinceEntityCheck < interval) return;
+    runsSinceEntityCheck = 0; // reset cadence regardless of outcome
+
+    entityCheckInFlight = true;
+    try {
+        const { getAllDatabases } = await import('./database.js');
+        const databases = await getAllDatabases();
+        const candidates = detectAndRecord(databases);
+        // Refresh the settings-panel list so newly-detected names show even before the popup.
+        try { reloadEntitiesUI(); } catch { /* ignore */ }
+        if (!candidates || candidates.length === 0) {
+            addDebugLog('info', 'Character check: no new named candidates');
+            return;
+        }
+        addDebugLog('info', `Character check: ${candidates.length} new named candidate(s) — opening popup`);
+        // Defer the popup so it never lands mid-generation: capture the chat id and only
+        // show if we're still in the same chat after a short settle window (mirrors the
+        // review-popup deferral pattern).
+        const targetChatId = ctx.chatId;
+        setTimeout(async () => {
+            try {
+                if (SillyTavern.getContext().chatId !== targetChatId) {
+                    addDebugLog('info', 'Character popup skipped: chat changed since detection');
+                    return;
+                }
+                await showEntityPopup(candidates);
+                try { reloadEntitiesUI(); } catch { /* ignore */ }
+            } catch (err) {
+                addDebugLog('fail', `Character popup failed (non-fatal): ${err.message || err}`);
+            }
+        }, 2200);
+    } catch (err) {
+        addDebugLog('fail', `Character check failed (non-fatal): ${err.message || err}`);
+    } finally {
+        entityCheckInFlight = false;
+    }
+}
+
 // --- Main Pipeline Init ---
 
 export function initPipeline() {
@@ -1013,6 +1078,12 @@ export function initPipeline() {
         // committed its facts), run an armed pass off the latency-critical path. Fully
         // self-guarded + try/catch'd internally.
         maybeRunReflection();
+
+        // Character registry detection: deterministic scan for newly-seen NAMED entities,
+        // gated to fire at most every characterCheckInterval runs. Off the critical path,
+        // fully self-guarded + try/catch'd. Opens a deferred batched popup when there are
+        // unclassified candidates; never blocks the reply.
+        maybeRunEntityCheck();
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -1106,6 +1177,9 @@ export function initPipeline() {
         // chat switch can't fire a consolidation against the new chat using old context.
         successfulRunsSinceReflection = 0;
         reflectionPending = null;
+        // Character-registry cadence is per-chat too: reset so a chat switch can't fire a
+        // detection against the new chat using the old chat's accumulated run count.
+        runsSinceEntityCheck = 0;
         hideWorkingIndicator();
         updateStatus('idle');
 

@@ -247,6 +247,32 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-users"></i> Character Registry</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_charreg_enabled" />
+                            <span>Detect new named characters</span>
+                        </label>
+                        <small class="bf-mem-hint">Periodically scans stored facts for newly-seen proper names (no extra LLM call) and asks once — in a single batched popup — whether each is a <b>Recurring</b> character (gets its own memory subject, with its facts moved out of the shared one-off drawer), a one-off <b>NPC</b> (kept in the drawer), or <b>Later</b> (deferred to the next check).</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Check Interval <span class="bf-mem-val" id="bf_mem_charcheck_interval_val">10</span></label>
+                            <input type="range" id="bf_mem_charcheck_interval" min="2" max="50" step="1" value="10" />
+                            <small class="bf-mem-hint">Successful pipeline runs between detection checks. Higher = less frequent prompting.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Known Characters (live)</label>
+                            <div id="bf_mem_charreg_list" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No characters tracked yet. They are discovered automatically as facts accumulate.</div>
+                            </div>
+                            <div class="bf-mem-db-actions" style="margin-top:6px;">
+                                <button id="bf_mem_charreg_scan" class="menu_button" title="Scan the fact store now and prompt for any new names">
+                                    <i class="fa-solid fa-magnifying-glass"></i> Scan now
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-pen"></i> Memory Updater Prompt
                         <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
