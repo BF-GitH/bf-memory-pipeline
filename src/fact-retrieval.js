@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, clampImportance, normalizeKind } from './database.js';
+import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -168,6 +168,12 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // the REACH is the FURTHEST depth whose roll succeeds; then include EVERY step from
     // current back to that reach CONTIGUOUSLY (continuity is mandatory — no gaps).
     expandSequenceTracks(databases, directResults, alreadyFound);
+
+    // LINK-FOLLOWING + SCOPE-AWARE EXPANSION (Phase 4b). Traverse the scope graph one hop:
+    // place->events, person->events, event->place+people. Runs AFTER all candidate
+    // generation and BEFORE the salience cap, so the existing MAX_SECONDARY/TERTIARY caps
+    // bound the total. Deterministic (no Math.random, no LLM); one hop only; deduped by id.
+    expandLinks(databases, directResults, alreadyFound);
 
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
@@ -455,6 +461,176 @@ function expandSequenceTracks(databases, results, alreadyFound) {
             alreadyFound.add(id);
         }
         addDebugLog('info', `Depth-dice track "${track}": reach ${reach} → included ${includeCount}/${steps.length} step(s)`);
+    }
+}
+
+/**
+ * Lowercase + trim a link token (a subject/place/person name) for case-insensitive
+ * comparison across `subject`, `location`, and `involved` fields. Returns '' for empty.
+ * @param {*} s
+ * @returns {string}
+ */
+function linkToken(s) {
+    return String(s ?? '').trim().toLowerCase();
+}
+
+/**
+ * LINK-FOLLOWING + SCOPE-AWARE EXPANSION (Phase 4b). After candidate generation, traverse
+ * the scope graph ONE hop so a fact arrives with its linked context. Mutates `results` in
+ * place; newly pulled facts enter as SECONDARY (so the existing MAX_SECONDARY cap bounds
+ * them) and respect isFactVisible. Deterministic — no Math.random, no LLM. Deduped by
+ * `category:key` via `alreadyFound`; a single hop (newly added facts are NOT re-expanded)
+ * so it can never loop.
+ *
+ * Four link directions (each keyed off scope/subject, NOT the owning character, so a place
+ * fact is recalled when the PLACE is the topic even if its owner is absent):
+ *   1. PLACE -> EVENTS:  any place fact (scope:place) or place SUBJECT among the candidates
+ *      pulls EVENT facts whose `location` link points at that place subject/key (sub-places
+ *      included via key prefix match).
+ *   2. PERSON -> EVENTS: any character SUBJECT among the candidates pulls EVENT facts whose
+ *      `involved` list includes that person.
+ *   3. EVENT -> PLACE:   any retrieved EVENT pulls the place fact named by its `location`.
+ *   4. EVENT -> PEOPLE:  any retrieved EVENT pulls the key character facts of each `involved`
+ *      participant (their facts whose subject matches the participant).
+ *
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier: string}>} results - mutated in place
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results (mutated)
+ */
+export function expandLinks(databases, results, alreadyFound) {
+    // SNAPSHOT the seed set up front so we expand exactly one hop: facts we add below are
+    // appended to `results` but are NOT themselves traversed (the loops read `seeds`).
+    const seeds = results.slice();
+
+    // Build the relevance sets from the SEED candidates (deterministic, scope-aware).
+    const relevantPlaces = new Set();   // place subjects/keys we should surface events for
+    const relevantPeople = new Set();   // character subjects we should surface events for
+    const seedEvents = [];              // event facts whose context (place+people) we pull
+    for (const r of seeds) {
+        const fact = r.fact;
+        if (!fact) continue;
+        const scope = deriveScope(fact);
+        const subject = linkToken(deriveSubject(fact));
+        const key = linkToken(fact.key);
+        if (scope === 'place') {
+            // A place is in scope: remember its subject AND its key so events can match
+            // either the place subject (`<PLACE>`) or a sub-place key prefix.
+            if (subject) relevantPlaces.add(subject);
+            if (key) relevantPlaces.add(key);
+        } else if (scope === 'event') {
+            seedEvents.push(fact);
+        } else {
+            // character (or default) scope: the subject is a person of interest.
+            if (subject) relevantPeople.add(subject);
+        }
+    }
+
+    // Track which event facts are already pulled in as event-seeds for direction 3/4, so a
+    // freshly pulled event (from direction 1/2) ALSO gets its context expanded — but only
+    // within this single pass over a fixed candidate list (no recursion).
+    const eventQueue = seedEvents.slice();
+
+    const admit = (category, fact) => {
+        if (!fact) return false;
+        if (!isActiveFact(fact)) return false;          // never surface superseded history
+        if (!isFactVisible(fact)) return false;          // respect knownBy
+        const id = `${category}:${fact.key}`;
+        if (alreadyFound.has(id)) return false;
+        results.push({ fact, category, tier: 'secondary' });
+        alreadyFound.add(id);
+        return true;
+    };
+
+    let pulled = 0;
+
+    // DIRECTIONS 1 & 2 — PLACE/PERSON -> EVENTS. Scan every event fact once; admit it when
+    // its `location` link names a relevant place (exact subject/key OR sub-place key prefix)
+    // or its `involved` list includes a relevant person. Newly admitted events are queued so
+    // their own place+people context expands below (still one hop from the seed set).
+    if (relevantPlaces.size > 0 || relevantPeople.size > 0) {
+        for (const [category, db] of Object.entries(databases)) {
+            for (const fact of (db.facts || [])) {
+                if (deriveScope(fact) !== 'event') continue;
+                if (!isActiveFact(fact)) continue;
+                const id = `${category}:${fact.key}`;
+                if (alreadyFound.has(id)) continue;
+                let hit = false;
+                // Direction 1: event located at a relevant place (or a sub-place of it).
+                const loc = linkToken(fact.location);
+                if (loc && relevantPlaces.size > 0) {
+                    for (const place of relevantPlaces) {
+                        // Match the place subject/key exactly, or treat the event location as
+                        // a sub-place when one key/subject is a prefix of the other.
+                        if (loc === place || loc.startsWith(place + '_') || place.startsWith(loc + '_')) {
+                            hit = true;
+                            break;
+                        }
+                    }
+                }
+                // Direction 2: event whose participants include a relevant person.
+                if (!hit && relevantPeople.size > 0 && Array.isArray(fact.involved)) {
+                    for (const p of fact.involved) {
+                        if (relevantPeople.has(linkToken(p))) { hit = true; break; }
+                    }
+                }
+                if (hit && admit(category, fact)) {
+                    pulled++;
+                    eventQueue.push(fact); // expand this event's own context below
+                }
+            }
+        }
+    }
+
+    // DIRECTIONS 3 & 4 — EVENT -> PLACE + PEOPLE. For every event in scope (seed events plus
+    // events freshly pulled above), pull the place fact named by its `location` and the key
+    // facts of each `involved` participant. Resolve targets by SUBJECT (scope-aware), so a
+    // place fact filed under the place subject is found even if its owning character isn't
+    // in scene.
+    if (eventQueue.length > 0) {
+        // Index active facts by scope+subject ONCE so the per-event lookups stay cheap.
+        const placesBySubject = new Map();  // subject -> [{category, fact}]
+        const peopleBySubject = new Map();  // subject -> [{category, fact}]
+        for (const [category, db] of Object.entries(databases)) {
+            for (const fact of (db.facts || [])) {
+                if (!isActiveFact(fact)) continue;
+                const subj = linkToken(deriveSubject(fact));
+                if (!subj) continue;
+                const scope = deriveScope(fact);
+                const map = scope === 'place' ? placesBySubject : (scope === 'character' ? peopleBySubject : null);
+                if (!map) continue; // events aren't pulled as event-context targets
+                if (!map.has(subj)) map.set(subj, []);
+                map.get(subj).push({ category, fact });
+            }
+        }
+        // Dedupe the queue of events to traverse (an event may appear as both seed and pull).
+        const seenEventIds = new Set();
+        for (const ev of eventQueue) {
+            const evId = `${ev.key}`;
+            if (seenEventIds.has(evId)) continue;
+            seenEventIds.add(evId);
+            // Direction 3: the event's linked place.
+            const loc = linkToken(ev.location);
+            if (loc && placesBySubject.has(loc)) {
+                for (const { category, fact } of placesBySubject.get(loc)) {
+                    if (admit(category, fact)) pulled++;
+                }
+            }
+            // Direction 4: the event's participants' character facts.
+            if (Array.isArray(ev.involved)) {
+                for (const p of ev.involved) {
+                    const subj = linkToken(p);
+                    if (subj && peopleBySubject.has(subj)) {
+                        for (const { category, fact } of peopleBySubject.get(subj)) {
+                            if (admit(category, fact)) pulled++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pulled > 0) {
+        addDebugLog('info', `Link expansion (Phase 4b): pulled ${pulled} linked fact(s) as secondary (places:${relevantPlaces.size} people:${relevantPeople.size} events:${eventQueue.length})`);
     }
 }
 

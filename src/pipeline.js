@@ -7,7 +7,7 @@ import { runFinderAgent, formatChosenFacts } from './agent-finder.js';
 import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
-import { retrieveFacts, extractContextKeywords, isFactVisible } from './fact-retrieval.js';
+import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
@@ -558,8 +558,14 @@ async function runPipelineInline(data) {
         // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
         // Visibility-filter defensively (the finder must never see a hidden fact).
         const candidatesAll = collectBranchFacts(databases, draftResult.branches);
+        // LINK-FOLLOWING (Phase 4b): when Agent 1 picks a PLACE/person branch, surface the
+        // linked events (and an event's place+people) to the finder too, so the same
+        // scope-graph traversal that helps deterministic retrieval also benefits the finder.
+        // One bounded hop, deduped by id; newly pulled facts enter as secondary candidates.
+        const branchSeen = new Set(candidatesAll.map(({ fact, category }) => `${category}:${fact.key}`));
+        expandLinks(databases, candidatesAll, branchSeen);
         const candidates = candidatesAll.filter(({ fact }) => isFactVisible(fact));
-        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted`);
+        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted (incl. link expansion)`);
         try {
             const finder = await runFinderAgent({
                 candidates,
