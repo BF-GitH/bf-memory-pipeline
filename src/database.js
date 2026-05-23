@@ -962,6 +962,128 @@ export function summarizeKeys(databases) {
     return lines.join('\n');
 }
 
+// Canonical category order for the MENU (two-stage retrieval). Unsorted always last —
+// it's the catch-all and is ALWAYS sent to the finder regardless of picks, so listing it
+// last keeps the menu readable. Categories not in this list (custom buckets) are appended
+// after, in insertion order, so the menu never silently drops a real category.
+export const MENU_CATEGORY_ORDER = ['Identity', 'Relationships', 'World', 'History', 'Status', 'Behavior', 'Unsorted'];
+
+/** Case-insensitive lookup of a database by category name. Returns [name, db] or null. */
+function findDbByCategory(databases, category) {
+    const want = String(category || '').trim().toLowerCase();
+    if (!want) return null;
+    for (const [name, db] of Object.entries(databases)) {
+        if (String(name).toLowerCase() === want) return [name, db];
+    }
+    return null;
+}
+
+/**
+ * STAGE 1 — build the compact MENU (the picker's map of the store). Lists each KIND
+ * (category) and, under it, the SUBJECTS present (from deriveSubject) with active-fact
+ * counts. NO values — it's the structure, not the contents — so it stays small even when
+ * the DB is large. Example line: `World: felix(11), club(4)`. Subjects with an empty
+ * derived subject are grouped under `(N)`. Only ACTIVE facts are counted/shown (superseded
+ * history is omitted — it's never a retrieval target). Categories with zero active facts
+ * are skipped. Deterministic ordering: MENU_CATEGORY_ORDER first, then any extras; subjects
+ * sorted by descending count then name.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @returns {string} Multi-line menu (one category per line), or '' when nothing stored.
+ */
+export function summarizeMenu(databases) {
+    if (!databases || Object.keys(databases).length === 0) return '';
+    // Ordered list of category names: canonical order first, then any custom extras.
+    const present = Object.keys(databases);
+    const presentLower = new Set(present.map(c => c.toLowerCase()));
+    const ordered = [];
+    for (const c of MENU_CATEGORY_ORDER) {
+        if (presentLower.has(c.toLowerCase())) ordered.push(c);
+    }
+    for (const c of present) {
+        if (!MENU_CATEGORY_ORDER.some(m => m.toLowerCase() === c.toLowerCase())) ordered.push(c);
+    }
+
+    const lines = [];
+    for (const cat of ordered) {
+        const found = findDbByCategory(databases, cat);
+        if (!found) continue;
+        const [name, db] = found;
+        // Count active facts per subject.
+        const counts = new Map();
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact)) continue;
+            const subj = deriveSubject(fact); // may be '' for subject-less facts
+            counts.set(subj, (counts.get(subj) || 0) + 1);
+        }
+        if (counts.size === 0) continue; // skip empty categories
+        const entries = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || String(a[0]).localeCompare(String(b[0])));
+        const parts = entries.map(([subj, n]) => subj ? `${subj}(${n})` : `(${n})`);
+        lines.push(`${name}: ${parts.join(', ')}`);
+    }
+    return lines.join('\n');
+}
+
+/**
+ * STAGE 2 input — collect the FULL active facts living under the branches Agent 1 picked,
+ * PLUS (always, unconditionally) every active fact in the Unsorted catch-all. A branch is a
+ * `Category` (all subjects in it) or `Category/subject` (just that subject, matched via
+ * deriveSubject). Matching is case-insensitive and tolerant of surrounding punctuation
+ * Agent 1 may wrap a pick in. Superseded history is excluded. Returns results in the same
+ * `{ fact, category }` shape retrieveFacts/formatFactsForWriter use, deduped by
+ * `category:key`. Unknown/hallucinated branches simply match nothing.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string[]} branches - Agent 1's branch picks (`Category` or `Category/subject`)
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+export function collectBranchFacts(databases, branches) {
+    const out = [];
+    const seen = new Set();
+    const norm = (s) => String(s ?? '')
+        .trim()
+        .replace(/^[\s\-*•"'`(\[\{]+/, '')
+        .replace(/[\s.,;:"'`)\]\}]+$/, '')
+        .trim()
+        .toLowerCase();
+
+    const push = (category, fact) => {
+        if (!isActiveFact(fact)) return;
+        const id = `${category}:${fact.key}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        out.push({ fact, category });
+    };
+
+    // Parse picks into a set of wanted categories and category/subject pairs.
+    const wantWholeCat = new Set();       // lowercased category names (all subjects)
+    const wantCatSubject = new Set();     // `category||subject` lowercased pairs
+    for (const raw of (branches || [])) {
+        const s = String(raw ?? '');
+        const slashIdx = s.indexOf('/');
+        if (slashIdx < 0) {
+            const cat = norm(s);
+            if (cat) wantWholeCat.add(cat);
+        } else {
+            const cat = norm(s.slice(0, slashIdx));
+            const subj = norm(s.slice(slashIdx + 1));
+            if (cat && subj) wantCatSubject.add(`${cat}||${subj}`);
+            else if (cat) wantWholeCat.add(cat); // `Category/` with empty subject -> whole category
+        }
+    }
+
+    for (const [category, db] of Object.entries(databases)) {
+        const catLower = category.toLowerCase();
+        const wholeCat = wantWholeCat.has(catLower);
+        const isUnsorted = catLower === 'unsorted'; // ALWAYS included
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact)) continue;
+            if (wholeCat || isUnsorted) { push(category, fact); continue; }
+            const subj = deriveSubject(fact);
+            if (subj && wantCatSubject.has(`${catLower}||${subj}`)) push(category, fact);
+        }
+    }
+    return out;
+}
+
 // Internal helpers
 
 async function fetchAttachmentContent(url) {

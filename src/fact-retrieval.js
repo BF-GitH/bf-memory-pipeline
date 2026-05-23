@@ -39,6 +39,45 @@ const FALLBACK_MAPPINGS = {
 };
 
 /**
+ * RENAME-TOLERANT knownBy visibility check. A fact is visible when its `knownBy` is empty
+ * (everyone knows) OR when any stored name matches the current persona/character.
+ *
+ * Matching is tolerant so a RENAME (persona/character renamed mid-chat) never hides facts
+ * stored under the old name:
+ *   - case-insensitive + trimmed comparison (was exact-string before),
+ *   - the literal templates `{{char}}`/`{{user}}` and the words `everyone`/`all` always match
+ *     (so a fact tagged with the placeholder rather than the resolved name stays visible),
+ *   - the current resolved persona name and character name both match.
+ * This widens the prior exact-string compare; it does not change which third-party names
+ * fail to match — only that the active user/char are matched robustly across whitespace and
+ * case differences a rename can introduce.
+ * @param {Object} fact
+ * @param {{charName?:string, userName?:string}} [names] - precomputed current names (optional)
+ * @returns {boolean}
+ */
+export function isFactVisible(fact, names = null) {
+    const kb = (fact && fact.knownBy) || [];
+    if (kb.length === 0) return true; // everyone knows
+    let charName = names?.charName;
+    let userName = names?.userName;
+    if (charName === undefined || userName === undefined) {
+        const ctx = SillyTavern.getContext();
+        charName = ctx.characters?.[ctx.characterId]?.name || '';
+        userName = ctx.name1 || '';
+    }
+    const cn = String(charName).trim().toLowerCase();
+    const un = String(userName).trim().toLowerCase();
+    return kb.some(name => {
+        const n = String(name).trim().toLowerCase();
+        if (!n) return false;
+        if (n === '{{char}}' || n === '{{user}}' || n === 'everyone' || n === 'all') return true;
+        if (cn && n === cn) return true;
+        if (un && n === un) return true;
+        return false;
+    });
+}
+
+/**
  * Retrieve relevant facts based on Agent 1's needed info list
  * @param {string[]} neededInfo - Array of fact categories/keywords from Agent 1
  * @param {string[]} [contextKeywords=[]] - Additional keywords extracted from recent messages
@@ -160,20 +199,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
 
     // Filter by knownBy: only include facts the current character knows.
     // Empty knownBy means "everyone knows" (no filter).
-    const ctx = SillyTavern.getContext();
-    const currentCharName = ctx.characters?.[ctx.characterId]?.name || '';
-    const currentUserName = ctx.name1 || '';
-    const visibleResults = filteredResults.filter(({ fact }) => {
-        const kb = fact.knownBy || [];
-        if (kb.length === 0) return true; // everyone knows
-        return kb.some(name => {
-            const n = String(name).toLowerCase();
-            return n === currentCharName.toLowerCase()
-                || n === currentUserName.toLowerCase()
-                || n === '{{char}}' || n === '{{user}}'
-                || n === 'everyone' || n === 'all';
-        });
-    });
+    const visibleResults = filteredResults.filter(({ fact }) => isFactVisible(fact));
 
     // Format for Agent 2
     const formatted = formatFactsForWriter(visibleResults);
