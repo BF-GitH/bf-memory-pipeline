@@ -44,11 +44,13 @@ CATEGORIES: Identity, Relationships, World, History, Status, Behavior
 # OUTPUT FORMAT
 
 #MEM
-+ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys
++ Category/key_snake_case = atomic value | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user
 .
 #WHY <one sentence>
 
 If nothing: just \`.\` immediately.
+
+SOURCE TAG (optional but preferred): append \`| @src:user\` if the fact was disclosed in the [USER] message, or \`| @src:char\` if it came from the [CHAR] message. This attributes each fact to the correct message. If you cannot tell, omit it.
 
 # WRONG → RIGHT (atomic splitting)
 
@@ -78,12 +80,12 @@ ATOMIC FORMAT — always write this instead:
 Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD> and I'm allergic to <ALLERGEN>."
 
 #MEM
-+ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity
-+ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job
-+ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role
-+ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location
-+ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food
-+ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy
++ Identity/user_name      = <NAME>     | @{{user}},{{char}} | #identity | @src:user
++ Identity/user_employer  = <ORG>      | @{{user}},{{char}} | #identity,job | @src:user
++ Identity/user_role      = <ROLE>     | @{{user}},{{char}} | #role | @src:user
++ Identity/user_location  = <CITY>     | @{{user}},{{char}} | #location | @src:user
++ Status/user_likes_food  = <FOOD>     | @{{user}},{{char}} | #preference,food | @src:user
++ Status/user_allergy     = <ALLERGEN> | @{{user}},{{char}} | #health,allergy | @src:user
 .
 #WHY Rich self-disclosure → split each property into its own atomic fact.
 
@@ -91,8 +93,8 @@ Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I lov
 Input: [CHAR:{{char}}] *Pushes hair back, revealing a scar.* "Got it as a kid. Bad fall."
 
 #MEM
-+ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance
-+ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory
++ Identity/char_scar         = true           | @{{char}},{{user}} | #appearance | @src:char
++ Identity/char_scar_origin  = childhood fall | @{{char}},{{user}} | #backstory | @src:char
 .
 #WHY Lasting reveal in asterisks → atomic split: existence + origin.
 
@@ -134,12 +136,20 @@ When uncertain whether something is a persistent fact, SKIP. A missing atomic fa
 /**
  * Run Agent 3: Analyze message and update databases
  * @param {string} messageText - The message to analyze
- * @param {number} messageIndex - Message index (for source tracking)
+ * @param {number} messageIndex - The CHAR (AI) message index — default source attribution
  * @param {string} characterInfo - Character card info
  * @param {Object} existingDatabases - Current state of all databases
+ * @param {string|null} profileId
+ * @param {boolean} isUserMessage
+ * @param {string} userPersona
+ * @param {Array} priorMessages
+ * @param {number|null} userMsgIndex - The USER message index. Facts the model tags
+ *   `@src:user` are attributed here instead of messageIndex (FIX #3 off-by-one).
+ *   When null, falls back to messageIndex so single-message (icon/backfill) runs
+ *   index identically to the live pipeline.
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = []) {
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null) {
     const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages);
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
@@ -150,7 +160,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
         const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
         const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
 
-        const parsed = parseMemoryUpdateResult(resultStr, messageIndex);
+        const parsed = parseMemoryUpdateResult(resultStr, messageIndex, userMsgIndex);
 
         // Apply updates to databases
         if (parsed.updates.length > 0) {
@@ -232,9 +242,12 @@ function summarizeDatabases(databases) {
 
 /**
  * Parse Agent 3's compact #MEM format response
- * Format: + Category/key = value | @KnownBy | #tags
+ * Format: + Category/key = value | @KnownBy | #tags | rel:keys | @src:user|char
+ * @param {string} response
+ * @param {number} messageIndex - CHAR message index (default attribution)
+ * @param {number|null} userMsgIndex - USER message index; facts tagged @src:user map here
  */
-function parseMemoryUpdateResult(response, messageIndex) {
+function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
     const result = {
         updates: [],
         summary: '',
@@ -314,15 +327,24 @@ function parseMemoryUpdateResult(response, messageIndex) {
         key = key.replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
         if (!key) continue;
 
-        // Split rest on | to get value, @knownBy, #tags
+        // Split rest on | to get value, @knownBy, #tags, rel:, @src:
         const segments = rest.split('|').map(s => s.trim());
         const value = segments[0] || '';
         let knownBy = [];
         let tags = [];
         let relationships = [];
+        let srcRole = null; // 'user' | 'char' | null (unknown → default attribution)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
+
+            // @src:user / @src:char — per-fact source attribution (FIX #3).
+            // Checked BEFORE the generic @KnownBy branch since both start with '@'.
+            const srcMatch = seg.match(/^@src\s*:\s*(user|char)/i);
+            if (srcMatch) {
+                srcRole = srcMatch[1].toLowerCase();
+                continue;
+            }
 
             // @KnownBy
             if (seg.startsWith('@')) {
@@ -354,6 +376,14 @@ function parseMemoryUpdateResult(response, messageIndex) {
             }
         }
 
+        // Attribute the fact to the correct message. A user-disclosed fact tagged
+        // @src:user maps to the USER message index (when available); everything else
+        // (char-sourced or untagged) keeps the existing messageIndex behavior so this
+        // stays backward-compatible and matches the per-message-icon path.
+        const sourceIndex = (srcRole === 'user' && Number.isInteger(userMsgIndex))
+            ? userMsgIndex
+            : messageIndex;
+
         result.updates.push({
             action: 'add',
             category,
@@ -362,7 +392,7 @@ function parseMemoryUpdateResult(response, messageIndex) {
             tags,
             knownBy,
             relationships,
-            source: `msg_${messageIndex}`,
+            source: `msg_${sourceIndex}`,
         });
     }
 

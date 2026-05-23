@@ -20,6 +20,7 @@ let lastInjection = null; // cached injection text for swipes/regens
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
 let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
 let groupSkipToastShown = false; // show-once toast when skipping group chats
+let runRecordedInput = false; // true once setRunTokens fired this generation cycle; gates main-output attribution so swipes don't desync the counters
 
 /**
  * Count tokens for a chat-completion message array (role wrappers included).
@@ -35,6 +36,29 @@ async function countChatTokens(arr) {
         for (const m of arr) total += await (ctx.getTokenCountAsync?.(m.content || m.mes || '') ?? 0);
         return total;
     } catch { return 0; }
+}
+
+/**
+ * Record this run's token metrics for the Tokens tab. Wrapped in try/catch so a
+ * tokenizer failure can never abort the pipeline run. Sets runRecordedInput so the
+ * MESSAGE_RECEIVED handler only attributes main-model output to a run that actually
+ * recorded input this generation cycle (prevents swipe-driven counter desync).
+ */
+function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult }) {
+    try {
+        setRunTokens({
+            baselineInput: baselineInput || 0,
+            actualInput: actualInput || 0,
+            agent1Input: draftResult?.tokensIn || 0,
+            agent1Output: draftResult?.tokensOut || 0,
+            agent3Input: memoryResult?.tokensIn || 0,
+            agent3Output: memoryResult?.tokensOut || 0,
+            mainOutput: 0,
+        });
+        runRecordedInput = true;
+    } catch (err) {
+        addDebugLog('info', `Token recording failed (non-fatal): ${err.message || err}`);
+    }
 }
 
 /**
@@ -172,20 +196,60 @@ function shouldRunPipeline(data) {
 
     if (lastUserMsgIndex < 0) return false;
 
+    // Determine what Agent 3 *would* target this turn (last genuine AI message),
+    // mirroring the loop in runPipelineInline. We gate on the per-message
+    // bf_mem_processed flag rather than relying solely on the monotonic
+    // lastTriggeredUserMsgIndex — that index only advances on a successful run and
+    // never rewinds on swipe/regenerate, so once it raced ahead of reality every
+    // later turn was silently skipped forever.
+    const memoryTargetIndex = findMemoryTargetIndex(freshChat);
+
+    // "Unprocessed work exists" = either the new user message or the AI target
+    // still lacks bf_mem_processed. This is the source of truth for whether
+    // Agent 3 has anything to do.
+    const userUnprocessed = !freshChat[lastUserMsgIndex]?.extra?.bf_mem_processed;
+    const targetUnprocessed = memoryTargetIndex >= 0 && !freshChat[memoryTargetIndex]?.extra?.bf_mem_processed;
+    const hasUnprocessedWork = userUnprocessed || targetUnprocessed;
+
     // If a genuine NEW user message exists, fire regardless of cooldown.
     // The cooldown only protects against spurious chat-load events (no new user msg).
     const isNewUserMsg = lastUserMsgIndex > lastTriggeredUserMsgIndex;
 
-    if (!isNewUserMsg) {
+    if (!isNewUserMsg && !hasUnprocessedWork) {
         if (Date.now() - chatChangedAt < 5000) {
             addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown, no new user msg)');
         } else {
-            addDebugLog('info', `Skipping pipeline (already triggered for user msg index ${lastUserMsgIndex})`);
+            addDebugLog('info', `Skipping pipeline (already processed for user msg index ${lastUserMsgIndex})`);
         }
         return false;
     }
 
+    // Cooldown only suppresses spurious chat-load events. If there's genuinely
+    // unprocessed work but it's NOT a new user message (e.g. after a swipe reset
+    // the index), still respect the load cooldown to avoid firing on chat open.
+    if (!isNewUserMsg && hasUnprocessedWork && Date.now() - chatChangedAt < 5000) {
+        addDebugLog('info', 'Skipping pipeline (chat just loaded, cooldown — deferring unprocessed work)');
+        return false;
+    }
+
     return true;
+}
+
+/**
+ * Find the index of the last genuine AI message Agent 3 would target.
+ * Mirrors the scan in runPipelineInline so shouldRunPipeline and the run agree.
+ * Returns -1 if none.
+ */
+function findMemoryTargetIndex(chat) {
+    if (!Array.isArray(chat)) return -1;
+    for (let i = chat.length - 2; i >= 0; i--) {
+        const msg = chat[i];
+        if (!msg || msg.is_user || !msg.mes) continue;
+        if (msg.is_system) continue;
+        if (msg.extra?.type) continue;
+        return i;
+    }
+    return -1;
 }
 
 // --- Core Pipeline Logic (runs inline, blocks generation) ---
@@ -234,21 +298,13 @@ async function runPipelineInline(data) {
     showWorkingIndicator();
     updateStatus('running', 'Preparing facts...');
 
-    // Find memory target (last AI message before the new user message)
-    // TODO: consider running Agent 3 on the previous USER message as well, not only the AI message,
-    // so explicit user disclosures (e.g. "I work at Google") get extracted from the user side directly.
-    let memoryTargetIndex = -1;
-    for (let i = chat.length - 2; i >= 0; i--) {
-        const msg = chat[i];
-        if (!msg || msg.is_user || !msg.mes) continue;
-        // Skip system messages and extension-injected synthetic messages
-        // (Auto-Summarize, Tracker, etc.) — these aren't genuine character utterances
-        // and extracting "facts" from them pollutes the DB with second-order data.
-        if (msg.is_system) continue;
-        if (msg.extra?.type) continue; // 'narrator', 'comment', 'summary', etc.
-        memoryTargetIndex = i;
-        break;
-    }
+    // Find memory target (last AI message before the new user message).
+    // Uses the same scan as shouldRunPipeline (findMemoryTargetIndex) so the
+    // gate and the run never disagree about which message is the target.
+    // Skips system messages and extension-injected synthetic messages
+    // (Auto-Summarize, Tracker, etc.) — these aren't genuine character utterances
+    // and extracting "facts" from them pollutes the DB with second-order data.
+    const memoryTargetIndex = findMemoryTargetIndex(chat);
 
     const formattedChat = formatMessagesForDraft(recentMessages);
 
@@ -289,7 +345,12 @@ async function runPipelineInline(data) {
         // (just-sent, safe to extract from) AND the N-1 AI message (already committed).
         // This captures user disclosures ("I'm Bernd, I work at Google") that the prior
         // AI-only target missed entirely.
-        if (memoryTargetIndex >= 0 && memoryTargetIndex > lastProcessedMessageIndex) {
+        // Gate on the per-message bf_mem_processed flag (source of truth) rather than
+        // the monotonic lastProcessedMessageIndex, which never rewound on swipe/regen
+        // and could permanently wall off later turns once it raced ahead.
+        const targetAlreadyProcessed = memoryTargetIndex >= 0
+            && !!chat[memoryTargetIndex]?.extra?.bf_mem_processed;
+        if (memoryTargetIndex >= 0 && !targetAlreadyProcessed) {
             const targetMessage = chat[memoryTargetIndex];
             const role = targetMessage.is_user ? 'USER' : 'AI';
             // Gather up to agent3ContextMessages prior messages for richer Agent 3 context.
@@ -310,11 +371,11 @@ async function runPipelineInline(data) {
 
             const databases = await getAllDatabases();
             promises.push(
-                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId, !!targetMessage.is_user, userPersona, agent3PriorMessages)
+                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId, !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex)
                     .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
             );
         } else {
-            addDebugLog('info', `Agent 3: no new AI message to process (target=${memoryTargetIndex}, last=${lastProcessedMessageIndex})`);
+            addDebugLog('info', `Agent 3: target already processed or none (target=${memoryTargetIndex}, processed=${targetAlreadyProcessed})`);
             promises.push(Promise.resolve(null));
         }
 
@@ -474,8 +535,18 @@ async function runPipelineInline(data) {
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);
 
     // --- Build & Inject ---
+    // We compute the baseline input (pre-injection) up front so token metrics can be
+    // recorded even when the run is cancelled before injection — the agent LLM calls
+    // already happened and incurred real cost, so they must still be attributed.
+    const baselineArr = data.chat || data.messages;
+    let baselineInput = 0;
+    try { baselineInput = await countChatTokens(baselineArr); } catch { baselineInput = 0; }
+
     if (pipelineCancelled) {
         addDebugLog('info', 'Pipeline cancelled — skipping injection');
+        // Still record the agent token cost (input == baseline since we didn't inject)
+        // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
+        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult });
         hideWorkingIndicator();
         updateStatus('idle');
         return;
@@ -489,25 +560,15 @@ async function runPipelineInline(data) {
     const agent2Limit = Math.max(0, settings.agent2ContextMessages || 0);
     addDebugLog('info', `Injection ready (${injection.length} chars${agent2Limit ? `, trimming chat to last ${agent2Limit}` : ''}) in ${Date.now() - startTime}ms`);
 
-    // Token comparison: count main-model input BEFORE and AFTER trim+inject.
-    const baselineArr = data.chat || data.messages;
-    const baselineInput = await countChatTokens(baselineArr);
-
     const success = injectMemoryContext(data, injection, { trimToLast: agent2Limit });
 
+    // Token comparison: count main-model input AFTER trim+inject.
     const actualArr = data.chat || data.messages;
-    const actualInput = await countChatTokens(actualArr);
+    let actualInput = baselineInput;
+    try { actualInput = await countChatTokens(actualArr); } catch { actualInput = baselineInput; }
 
     // Record token metrics for the Tokens tab (agent counts come from result objects)
-    setRunTokens({
-        baselineInput,
-        actualInput,
-        agent1Input: draftResult?.tokensIn || 0,
-        agent1Output: draftResult?.tokensOut || 0,
-        agent3Input: memoryResult?.tokensIn || 0,
-        agent3Output: memoryResult?.tokensOut || 0,
-        mainOutput: 0,
-    });
+    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult });
 
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
@@ -569,17 +630,29 @@ export function initPipeline() {
     // After generation complete: reset status and double-fire guard
     eventSource.on(eventTypes.MESSAGE_RECEIVED, async () => {
         pipelineJustInjected = false;
+        // Clear the cancellation flag now that this generation cycle finished.
+        // Without this, a Stop on one turn left pipelineCancelled=true and poisoned
+        // every later turn whose pipeline run was skipped (so it never reset at the
+        // top of runPipelineInline).
+        pipelineCancelled = false;
         updateStatus('idle');
 
-        // Count the main model's reply tokens for the Tokens tab
+        // Count the main model's reply tokens for the Tokens tab — BUT only attribute
+        // it to a run that actually recorded input this cycle. Swipes/regens fire
+        // MESSAGE_RECEIVED without a fresh pipeline run, so unconditionally adding
+        // output desynced input vs output counts over a long session.
         try {
-            const ctx = SillyTavern.getContext();
-            const lastMsg = ctx.chat?.[ctx.chat.length - 1];
-            if (lastMsg && !lastMsg.is_user && lastMsg.mes) {
-                const n = await (ctx.getTokenCountAsync?.(lastMsg.mes) ?? 0);
-                setMainOutputTokens(n);
+            if (runRecordedInput) {
+                const ctx = SillyTavern.getContext();
+                const lastMsg = ctx.chat?.[ctx.chat.length - 1];
+                if (lastMsg && !lastMsg.is_user && lastMsg.mes) {
+                    const n = await (ctx.getTokenCountAsync?.(lastMsg.mes) ?? 0);
+                    setMainOutputTokens(n);
+                }
             }
         } catch { /* ignore */ }
+        // One run = one input record = one output attribution. Disarm until the next run.
+        runRecordedInput = false;
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -589,6 +662,8 @@ export function initPipeline() {
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
         pipelineCancelled = true;
         pipelineJustInjected = false;
+        // Disarm output attribution: no main reply will land for this stopped cycle.
+        runRecordedInput = false;
         hideWorkingIndicator();
         updateStatus('idle');
         addDebugLog('info', 'Generation stopped — in-flight agent writes will be discarded');
@@ -615,6 +690,33 @@ export function initPipeline() {
         // indices ≤ the stale lastProcessedMessageIndex.
         lastProcessedMessageIndex = -1;
         addDebugLog('info', `Message deleted — reset lastUserMsg=${lastTriggeredUserMsgIndex}, lastProcessedMessageIndex=-1`);
+    });
+
+    // Reset on swipe/regenerate. The monotonic lastTriggeredUserMsgIndex /
+    // lastProcessedMessageIndex never rewound on swipe, so once they raced ahead of
+    // the chat's true state every later turn was silently skipped forever (FIX #1).
+    // Rewind both indices to the current chat and clear the swiped AI message's
+    // bf_mem_processed flag — its content just changed, so any prior extraction is
+    // stale and the next genuine turn must be allowed to re-process it.
+    eventSource.on(eventTypes.MESSAGE_SWIPED, (mesId) => {
+        const currentChat = SillyTavern.getContext().chat;
+        lastTriggeredUserMsgIndex = -1;
+        if (currentChat && currentChat.length > 0) {
+            for (let i = currentChat.length - 1; i >= 0; i--) {
+                if (currentChat[i] && currentChat[i].is_user) {
+                    lastTriggeredUserMsgIndex = i;
+                    break;
+                }
+            }
+        }
+        lastProcessedMessageIndex = -1;
+        // Invalidate extraction on the swiped message (content replaced).
+        const swipedIdx = Number.isInteger(mesId) ? mesId : (currentChat ? currentChat.length - 1 : -1);
+        if (currentChat && currentChat[swipedIdx]?.extra?.bf_mem_processed) {
+            currentChat[swipedIdx].extra.bf_mem_processed = false;
+            SillyTavern.getContext().saveChatDebounced?.();
+        }
+        addDebugLog('info', `Message swiped (idx ${swipedIdx}) — reset trigger indices, cleared bf_mem_processed`);
     });
 
     // Reset on chat change

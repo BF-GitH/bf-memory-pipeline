@@ -382,21 +382,34 @@ function saveTokensToMeta() {
 
 // Called by pipeline.js after a run's input metrics are known.
 export function setRunTokens(run) {
+    // Coerce every field to a finite number so a tokenizer returning undefined/NaN
+    // can't poison the running session totals (they'd become NaN and stop adding up).
+    const baselineInput = Number(run?.baselineInput) || 0;
+    const actualInput   = Number(run?.actualInput) || 0;
+    const agentInput    = (Number(run?.agent1Input) || 0) + (Number(run?.agent3Input) || 0);
+    const agentOutput   = (Number(run?.agent1Output) || 0) + (Number(run?.agent3Output) || 0);
+
     lastRunTokens = { ...run, ts: Date.now(), approx: true };
     // accumulate session
-    sessionTokens.baselineInput += run.baselineInput || 0;
-    sessionTokens.actualInput   += run.actualInput || 0;
-    sessionTokens.agentInput    += (run.agent1Input || 0) + (run.agent3Input || 0);
-    sessionTokens.agentOutput   += (run.agent1Output || 0) + (run.agent3Output || 0);
-    sessionTokens.runs          += 1;
+    sessionTokens.baselineInput += baselineInput;
+    sessionTokens.actualInput   += actualInput;
+    sessionTokens.agentInput    += agentInput;
+    sessionTokens.agentOutput   += agentOutput;
+    // Only count this as a run if it produced at least one usable token figure.
+    // A no-op run (all zero — e.g. tokenizer unavailable) would otherwise inflate
+    // the run count and skew per-run averages.
+    if (baselineInput || actualInput || agentInput || agentOutput) {
+        sessionTokens.runs += 1;
+    }
     saveTokensToMeta();
     renderTokens();
 }
 
 // Called by pipeline.js MESSAGE_RECEIVED handler when the main reply lands.
 export function setMainOutputTokens(n) {
-    if (lastRunTokens) lastRunTokens.mainOutput = n || 0;
-    sessionTokens.mainOutput += n || 0;
+    const out = Number(n) || 0;
+    if (lastRunTokens) lastRunTokens.mainOutput = out;
+    sessionTokens.mainOutput += out;
     saveTokensToMeta();
     renderTokens();
 }
