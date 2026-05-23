@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0] - 2026-05-23
+
+### Changed — granular ~82-label Layer-2 taxonomy + two-tier menu
+The broad Layer-2 labels (identity/appearance/body/status/…) were too coarse — a planner LLM picked almost all of them every turn, so the menu didn't filter. Replaced with a granular, scene-trigger vocabulary so opening a label is a real signal. ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js), [src/agent-draft.js](src/agent-draft.js))
+- **~82 granular Layer-2 labels** across the 7 categories. People gets the big set (childhood, finances, fears, wardrobe, injuries, secrets, vices, daily_routine, current_location, …) — specific drawers that stay shut in an ordinary scene.
+- **Two-tier menu:** the planner (Agent 1) now sees ONLY non-empty labels with counts (small + discriminating even with 82 defined); the note-taker (Agent 3) and the Database tab see the FULL fixed vocab for consistent filing.
+- **Relationships stay character-AGNOSTIC** (history/friendship/romance/tension/trust/…), discriminated by the existing `subj:@<A>` + `with:@<B>` pair-tag rather than a per-character label (avoids menu-cardinality blowup). 
+- Back-compat: legacy aspects (body→appearance, background→childhood, role→career, goals→current_goal, behavior→habits, …) remap on read; unknowns snap to the category default.
+
+### Fixed — ESM-breaking unescaped backtick (extension-load bug)
+`DEFAULT_MEMORY_PROMPT` had one bare `` `~` `` (line 168) instead of an escaped `` \`~\` ``, which closed the prompt's template literal early. `node --check` (script mode) tolerated it, but SillyTavern loads extensions as ES modules, where it threw `SyntaxError: Unexpected token '~'` and broke `agent-memory.js` from loading. Now escaped; verified by a module-mode parse of every source file. (Latent since the supersession example was added.) ([src/agent-memory.js](src/agent-memory.js))
+
 ## [0.18.0] - 2026-05-23
 
 ### Changed — 3-layer fact model (rough → aspect → character-tag) + default skeleton
