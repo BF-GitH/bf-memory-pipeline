@@ -130,11 +130,16 @@ function getRecentMessages(count) {
 
 /**
  * Format messages for Agent 1
+ * Per-message char limit is configurable (draftMsgCharLimit, default 2000) — the old
+ * hard 500-char clip truncated Agent 1's view of recent messages, hiding the back half
+ * of longer turns. 2000 matches the character-card limit bumped elsewhere. Clamped in
+ * validateSettings so a bad value can't blank or explode the prompt.
  */
 function formatMessagesForDraft(messages) {
+    const limit = Math.max(200, getSettings()?.draftMsgCharLimit || 2000);
     return messages.map((msg, idx) => {
         const role = msg.is_user ? 'USER' : 'AI';
-        return `Message ${idx + 1}: ${role}: ${msg.mes.substring(0, 500)}`;
+        return `Message ${idx + 1}: ${role}: ${msg.mes.substring(0, limit)}`;
     }).join('\n');
 }
 
@@ -556,9 +561,10 @@ async function runPipelineInline(data) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
         draftResult = { draft: '', branches: [], neededFacts: [], scene: null, raw: '' };
     }
-    // Older Agent 1 result shapes (or partial parses) may lack branches/neededFacts.
+    // Older Agent 1 result shapes (or partial parses) may lack branches/neededFacts/nextHint.
     if (!Array.isArray(draftResult.branches)) draftResult.branches = [];
     if (!Array.isArray(draftResult.neededFacts)) draftResult.neededFacts = [];
+    if (!Array.isArray(draftResult.nextHint)) draftResult.nextHint = [];
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Branches picked: ${draftResult.branches.join('; ') || '(none)'}`);
@@ -577,6 +583,21 @@ async function runPipelineInline(data) {
             }
         } else {
             addDebugLog('info', 'Scene update skipped (character changed mid-pipeline)');
+        }
+    }
+
+    // --- Next-scene fact hint (refinement #11): backstage breadcrumb only ---
+    // Agent 1 optionally emits #NextHint (topics likely relevant NEXT scene). We stash it
+    // on the triggering USER message's extra (bf_mem_next_hint) — NOT in any visible reply
+    // text, NOT injected into the writer. It's a future-use breadcrumb. Same guards as the
+    // scene write: only when not cancelled and the character didn't change mid-run.
+    if (!pipelineCancelled && draftResult.nextHint.length > 0 && lastUserMsgIndex >= 0 && chat[lastUserMsgIndex]) {
+        const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
+        if (currentCharAvatar === capturedCharAvatar) {
+            const hint = draftResult.nextHint.slice(0, 5);
+            chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_next_hint: hint };
+            SillyTavern.getContext().saveChatDebounced?.();
+            addDebugLog('info', `Next-scene hint stored on msg ${lastUserMsgIndex} (backstage): ${hint.join('; ')}`);
         }
     }
 
@@ -699,20 +720,11 @@ async function runPipelineInline(data) {
         if (sceneBlock) addDebugLog('info', `Scene block injected (${sceneBlock.length} chars): ${sceneBlock}`);
     }
 
-    // Reflection "story so far": injected BELOW the scene card, ABOVE the facts, behind its
-    // own enable + small token cap. Optional — when off (or no summary yet) nothing changes.
-    if (settings.reflectionEnabled && settings.reflectionInject) {
-        const refl = getReflection();
-        if (refl?.summary) {
-            const charBudget = Math.max(40, Math.floor((Number(settings.reflectionMaxTokens) || 200) * 4));
-            let story = refl.summary;
-            if (story.length > charBudget) story = story.slice(0, charBudget - 1).trimEnd() + '…';
-            const storyBlock = `[Story so far] ${story}`;
-            // Append below the scene block (both sit above the facts in buildWriterInjection).
-            sceneBlock = sceneBlock ? `${sceneBlock}\n\n${storyBlock}` : storyBlock;
-            addDebugLog('info', `Reflection summary injected (${storyBlock.length} chars)`);
-        }
-    }
+    // NOTE: the reflection "story so far" summary is intentionally NO LONGER injected into
+    // the writer (refinement #1). The writer now receives only the scene sheet + chosen
+    // facts + Agent 1's draft (+ the last messages it already sees). Reflection still runs
+    // (refinement #4) as a silent dedupe-janitor / observation writer, but never injects.
+    // reflectionInject is retained as an inert setting for back-compat (default now false).
 
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, sceneBlock);
     lastInjection = injection; // Cache for swipes/regens (scene block included)

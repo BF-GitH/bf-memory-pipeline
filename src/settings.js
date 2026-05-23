@@ -70,6 +70,11 @@ const DEFAULT_SETTINGS = {
     // pipeline.js — only the debug-log preview is substring'd, never the prompt).
     agent1ContextMessages: 5,
     agent3ContextMessages: 5,
+    // Per-message char limit applied when formatting recent messages for Agent 1 (the
+    // draft planner). Raised from a hard 500 to 2000 (matching the bumped character-card
+    // limit) so Agent 1 sees the full back half of longer turns instead of a truncated
+    // view. Clamped 200..8000 in validateSettings.
+    draftMsgCharLimit: 2000,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -108,9 +113,11 @@ const DEFAULT_SETTINGS = {
     // ON but with a conservative interval. Absent (older settings) → defaults apply.
     reflectionEnabled: true,
     reflectionInterval: 12,
-    // Optionally inject the "story so far" summary into the writer prompt (BELOW the scene
-    // card, ABOVE facts), hard-capped to its own small token budget. Default ON but small.
-    reflectionInject: true,
+    // DEPRECATED (refinement #1): the reflection "story so far" summary is NO LONGER
+    // injected into the writer prompt under any circumstance. This key is retained inert
+    // for back-compat (default now FALSE) so old saved settings don't error. Reflection
+    // still runs as a silent dedupe-janitor / observation writer (refinement #4).
+    reflectionInject: false,
     reflectionMaxTokens: 200,
     reflectionPrompt: '',
     // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
@@ -164,6 +171,7 @@ function validateSettings(s) {
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
+    s.draftMsgCharLimit = Math.floor(clamp(s.draftMsgCharLimit, 200, 8000, 2000));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
@@ -185,7 +193,7 @@ function validateSettings(s) {
     s.reflectionInterval = Math.floor(clamp(s.reflectionInterval, 4, 100, 12));
     s.reflectionMaxTokens = Math.floor(clamp(s.reflectionMaxTokens, 50, 500, 200));
     if (typeof s.reflectionEnabled !== 'boolean') s.reflectionEnabled = true;
-    if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = true;
+    if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = false; // inert (refinement #1)
     if (typeof s.reflectionPrompt !== 'string')   s.reflectionPrompt = '';
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
@@ -804,7 +812,8 @@ function exportLogs() {
 function reloadProfiles() {
     const agent1Select = document.getElementById('bf_mem_agent1_profile');
     const agent3Select = document.getElementById('bf_mem_agent3_profile');
-    if (!agent1Select && !agent3Select) return;
+    const agent4Select = document.getElementById('bf_mem_agent4_profile');
+    if (!agent1Select && !agent3Select && !agent4Select) return;
 
     const profiles = getConnectionProfiles();
     const activeProfile = getCurrentProfileId();
@@ -828,6 +837,7 @@ function reloadProfiles() {
 
     populate(agent1Select, extensionSettings?.agent1Profile);
     populate(agent3Select, extensionSettings?.agent3Profile);
+    populate(agent4Select, extensionSettings?.agent4Profile);
 }
 
 // --- Tabs ---
@@ -1610,6 +1620,17 @@ export async function initSettings() {
         toastr.info('Profiles refreshed', 'BF Memory');
     });
 
+    // Agent 4 (Fact Finder) — toggle + profile selector (Agent 2 tab / Fact Finder section).
+    // reloadProfiles() above already populated the dropdown; just bind value + change.
+    $('#bf_mem_finder_enabled').prop('checked', extensionSettings.useFinderAgent !== false).on('change', function () {
+        extensionSettings.useFinderAgent = $(this).prop('checked');
+        saveSettings();
+    });
+    $('#bf_mem_agent4_profile').val(extensionSettings.agent4Profile || '').on('change', function () {
+        extensionSettings.agent4Profile = $(this).val() || '';
+        saveSettings();
+    });
+
     // Agent 1 context slider
     $('#bf_mem_agent1_context').val(extensionSettings.agent1ContextMessages);
     $('#bf_mem_agent1_context_val').text(extensionSettings.agent1ContextMessages);
@@ -1617,6 +1638,16 @@ export async function initSettings() {
         const val = parseInt($(this).val());
         extensionSettings.agent1ContextMessages = val;
         $('#bf_mem_agent1_context_val').text(val);
+        saveSettings();
+    });
+
+    // Agent 1 per-message char limit slider (refinement #5)
+    $('#bf_mem_draft_charlimit').val(extensionSettings.draftMsgCharLimit);
+    $('#bf_mem_draft_charlimit_val').text(extensionSettings.draftMsgCharLimit);
+    $('#bf_mem_draft_charlimit').on('input', function () {
+        const val = parseInt($(this).val());
+        extensionSettings.draftMsgCharLimit = val;
+        $('#bf_mem_draft_charlimit_val').text(val);
         saveSettings();
     });
 
@@ -1769,6 +1800,19 @@ export async function initSettings() {
         $('#bf_mem_writer_format').val(DEFAULT_WRITER_FORMAT);
         saveSettings();
         toastr.info('Writer format reset', 'BF Memory');
+    });
+
+    // Fact Finder (Agent 4) prompt editor + reset (Agent 2 tab).
+    $('#bf_mem_finder_prompt').val(extensionSettings.finderPrompt || DEFAULT_FINDER_PROMPT).off('input').on('input', function () {
+        const val = $(this).val();
+        extensionSettings.finderPrompt = (val === DEFAULT_FINDER_PROMPT) ? '' : val;
+        saveSettings();
+    });
+    $('#bf_mem_reset_finder_prompt').on('click', () => {
+        extensionSettings.finderPrompt = '';
+        $('#bf_mem_finder_prompt').val(DEFAULT_FINDER_PROMPT);
+        saveSettings();
+        toastr.info('Fact finder prompt reset', 'BF Memory');
     });
 
     // --- Database Tab: Profiles ---

@@ -52,6 +52,11 @@
                             <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
                             <small class="bf-mem-hint">How many recent messages Agent 1 sees when planning the reply.</small>
                         </div>
+                        <div class="bf-mem-field">
+                            <label>Per-message char limit <span class="bf-mem-val" id="bf_mem_draft_charlimit_val">2000</span></label>
+                            <input type="range" id="bf_mem_draft_charlimit" min="200" max="8000" step="100" value="2000" />
+                            <small class="bf-mem-hint">Max characters of each recent message shown to Agent 1. Higher = Agent 1 sees the full back half of long turns (default 2000, was a hard 500).</small>
+                        </div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -116,6 +121,35 @@
                             <input type="range" id="bf_mem_tertiary" min="0" max="100" step="5" value="15" />
                             <small class="bf-mem-hint">Distant thematic connections (e.g. topic mentioned -> old memory)</small>
                         </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Fact Finder (Agent 4)</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_finder_enabled" />
+                            <span>Use the Fact Finder agent (STAGE 2 retrieval)</span>
+                        </label>
+                        <small class="bf-mem-hint">After Agent 1 picks branches from the memory menu, Agent 4 reads the full facts under those branches and chooses the relevant subset to inject. Off (or on any error) falls back to deterministic keyword retrieval.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Agent 4 (Fact Finder) Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent4_profile" class="text_pole"></select>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to reuse Agent 1's profile. A cheap/fast model works well here.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Fact Finder Prompt
+                        <button id="bf_mem_reset_finder_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Fact finder system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells Agent 4 how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -193,17 +227,17 @@
                             <input type="checkbox" id="bf_mem_reflection_enabled" />
                             <span>Enable periodic reflection pass</span>
                         </label>
-                        <small class="bf-mem-hint">Every N turns, makes ONE extra LLM call (reusing Agent 3's profile) to compress the session into a rolling "story so far" summary plus higher-order observation facts. Conservative + cost-aware — it runs infrequently and never blocks the reply.</small>
+                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing Agent 3's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Reflection Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
                             <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
-                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent consolidation.</small>
+                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
                         </div>
                         <label class="checkbox_label" style="margin-top:8px;">
                             <input type="checkbox" id="bf_mem_reflection_inject" />
-                            <span>Inject "story so far" into the writer prompt</span>
+                            <span>Inject "story so far" into the writer prompt (deprecated — no effect)</span>
                         </label>
-                        <small class="bf-mem-hint">Prepends the rolling summary (below the scene card, above facts), hard-capped to a small token budget. Off = the summary is still stored and observations still written, just not injected.</small>
+                        <small class="bf-mem-hint">DEPRECATED: the rolling summary is no longer injected into the writer under any setting. The summary is still kept for the live panel below and observations are still written. This toggle is inert and kept only for back-compat.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Reflection (live)</label>
                             <div id="bf_mem_reflection_view" class="bf-mem-fact-list">

@@ -1084,6 +1084,46 @@ export function collectBranchFacts(databases, branches) {
     return out;
 }
 
+/**
+ * Silent dedupe-janitor pass over a single database (refinement #12). Rebuilds the
+ * fact list by re-feeding every ACTIVE non-sequence fact through upsertFact into a fresh
+ * copy, so the existing reconcile-on-write machinery (normalized-key variants + parallel
+ * changeable-state collapse + supersession) merges near-duplicates that accumulated over
+ * a long session. Sequence/track facts and superseded history snapshots are preserved
+ * verbatim and never collapsed (they form ordered/historical chains). Pure in-memory; the
+ * CALLER persists via saveDatabase. Returns { db, before, after, merged }.
+ *
+ * Idempotent: a DB with no duplicates round-trips to itself (merged === 0).
+ * @param {DatabaseSchema} db
+ * @returns {{db: DatabaseSchema, before: number, after: number, merged: number}}
+ */
+export function dedupeDatabase(db) {
+    if (!db || !Array.isArray(db.facts)) return { db, before: 0, after: 0, merged: 0 };
+    const before = db.facts.length;
+    // Partition: sequence steps + inactive history snapshots are preserved as-is; only the
+    // active non-sequence facts are re-reconciled against each other.
+    const preserved = [];
+    const reconcilable = [];
+    for (const f of db.facts) {
+        if (!f || typeof f !== 'object') continue;
+        if (isSequenceFact(f) || f.active === false) preserved.push(f);
+        else reconcilable.push(f);
+    }
+    const rebuilt = createEmptyDatabase(db.category);
+    rebuilt.facts = [...preserved]; // keep history/sequence so parallel-state collapse still sees context
+    for (const f of reconcilable) {
+        // Re-feed a shallow copy so upsertFact's spreads can't mutate the original objects.
+        upsertFact(rebuilt, { ...f });
+    }
+    const after = rebuilt.facts.length;
+    return {
+        db: { ...db, facts: rebuilt.facts, updatedAt: Date.now() },
+        before,
+        after,
+        merged: Math.max(0, before - after),
+    };
+}
+
 // Internal helpers
 
 async function fetchAttachmentContent(url) {

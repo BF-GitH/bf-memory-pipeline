@@ -1,20 +1,26 @@
-// BF Memory Pipeline - Reflection / Consolidation Pass (memory-research Phase 3)
-// Periodically compresses accumulated detail into higher-level memory:
-//   (a) a rolling "story so far" summary string, and
-//   (b) 0-N synthesized higher-order OBSERVATION facts (durable traits inferred
-//       across the session, e.g. "<CHARACTER> distrusts authority").
+// BF Memory Pipeline - Reflection Pass = SILENT DEDUPE-JANITOR (refinement #12)
+// Repurposed from the old "story so far" consolidator. Its summary is NO LONGER injected
+// into the writer (refinement #1), so this pass now exists primarily to keep the fact DB
+// clean off the critical path. Each run it:
+//   (a) DEDUPES the DB — re-runs reconcile-on-write over every active fact (dedupeDatabase)
+//       to merge/supersede near-duplicate facts that accumulated over a long session, and
+//   (b) optionally writes 0-N high-value OBSERVATION facts (durable traits inferred across
+//       the session, e.g. "<CHARACTER> distrusts authority").
+// It still parses + stores a short "story so far" summary for the live UI panel only — it
+// is NEVER injected into the writer prompt.
 //
 // COST-AWARE: this is the ONE place a NEW LLM call is acceptable. It runs INFREQUENTLY
 // (every N successful pipeline runs, default 12) and OFF the latency-critical path
-// (scheduled after MESSAGE_RECEIVED, never blocking the main generation). One LLM call
-// via the existing callAgentLLM/CMRS path, reusing Agent 3's connection profile.
+// (scheduled after MESSAGE_RECEIVED, never blocking the main generation). The dedupe step
+// itself needs NO LLM call. One LLM call via the existing callAgentLLM/CMRS path, reusing
+// Agent 3's connection profile, drives the optional observations.
 //
 // Input is a COMPACT bounded bundle (scene + beats + a few History/track steps + a
 // keys+values fact summary, all length-clamped) so the call stays cheap regardless of
 // how large the DB has grown. A failure degrades gracefully — it never breaks the
 // pipeline (mirrors the existing agent fallbacks).
 
-import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps } from './database.js';
+import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase } from './database.js';
 import { addDebugLog, setReflection } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -28,13 +34,13 @@ const MAX_SUMMARY_CHARS = 1200;
 // Cap synthesized observations per pass (defensive — the prompt asks for 0-5).
 const MAX_OBSERVATIONS = 8;
 
-export const DEFAULT_REFLECT_PROMPT = `You are a memory-consolidation pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Your job is to compress what has happened into higher-level memory so a long session keeps narrative continuity without unbounded growth.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, plus a brief continuity note.
 
 Produce TWO things:
 
-1. A short "story so far" summary: 2-5 sentences of PROSE capturing the arc — who these characters are to each other, where things stand now, and the main unresolved threads. Past tense, neutral, no markup. This is continuity glue, not a transcript. Do NOT restate every fact; synthesize.
+1. A short continuity note: 2-5 sentences of PROSE capturing the arc — who these characters are to each other, where things stand now, and the main unresolved threads. Past tense, neutral, no markup. This is internal continuity glue, not a transcript. Do NOT restate every fact; synthesize. (Output a single "." if there is genuinely nothing to summarize.)
 
-2. 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<CHARACTER> manipulates others for resources", "<CHARACTER> distrusts authority", "<CHARACTER> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports. If nothing rises above the existing facts, emit none.
+2. 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
 
 # OUTPUT FORMAT (exactly this, nothing else)
 
@@ -179,8 +185,27 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const totalFacts = Object.values(databases).reduce((n, db) => n + (db.facts?.length || 0), 0);
         if (totalFacts === 0 && !scene) {
             addDebugLog('info', `[${runId}] Reflection skipped (nothing to consolidate)`);
-            return { summary: '', observations: [], tokensIn: 0, tokensOut: 0 };
+            return { summary: '', observations: [], merged: 0, tokensIn: 0, tokensOut: 0 };
         }
+
+        // (a) SILENT DEDUPE-JANITOR (refinement #12): merge near-duplicate facts that piled
+        // up over the session by re-running reconcile-on-write over each DB. NO LLM call.
+        // Best-effort + isolated per category so one bad DB can't abort the whole pass.
+        let totalMerged = 0;
+        for (const [category, db] of Object.entries(databases)) {
+            try {
+                const { db: cleaned, merged } = dedupeDatabase(db);
+                if (merged > 0) {
+                    databases[category] = cleaned;
+                    await saveDatabase(cleaned);
+                    totalMerged += merged;
+                    addDebugLog('info', `[${runId}] Dedupe-janitor: merged ${merged} duplicate fact(s) in ${category}`);
+                }
+            } catch (err) {
+                addDebugLog('fail', `[${runId}] Dedupe-janitor failed for ${category} (non-fatal): ${err.message || err}`);
+            }
+        }
+        if (totalMerged > 0) addDebugLog('pass', `[${runId}] Dedupe-janitor merged ${totalMerged} duplicate fact(s) total`);
 
         const settings = (() => { try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; } })();
         const ctx = SillyTavern.getContext();
@@ -237,8 +262,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             }
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}`);
-        return { summary: parsed.summary, observations: parsed.observations, written, tokensIn, tokensOut };
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}`);
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
         return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };
