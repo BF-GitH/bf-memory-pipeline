@@ -38,8 +38,31 @@ const EXTENSION_NAME = (() => {
 })();
 
 let extensionSettings = null;
+// debugLog is the RAM RING BUFFER: holds ALL kept entries (incl. debug/verbose when
+// enabled), newest-first, capped at MAX_DEBUG_ENTRIES_MEM. The chat_metadata copy is a
+// verbose-stripped, byte-budgeted SLICE (MAX_DEBUG_ENTRIES_PERSIST). See addDebugLog /
+// saveDebugLogToMeta below. Kept named `debugLog` so existing readers are unaffected.
 let debugLog = [];
+// Persisted slice cap — unchanged contract for the chat_metadata.bf_mem_log copy.
 const MAX_DEBUG_ENTRIES = 500; // FIX #10: raised from 200 so a long session isn't truncated (still bounded)
+// Two-cap scheme (debug-log redesign): the RAM ring buffer holds far more (the firehose,
+// incl. debug/verbose) while only a non-verbose slice of MAX_DEBUG_ENTRIES_PERSIST reaches
+// chat_metadata so the chat .jsonl stays small.
+const MAX_DEBUG_ENTRIES_MEM = 2000;       // RAM ring buffer (drop-oldest)
+const MAX_DEBUG_ENTRIES_PERSIST = MAX_DEBUG_ENTRIES; // persisted, verbose-stripped slice
+// Byte budget for the JSON-serialized persisted slice (protects the chat .jsonl round-trip).
+const LOG_PERSIST_BYTE_BUDGET = 256 * 1024; // ~256 KB
+// Monotonic per-entry sequence — stable ordering within an identical timestamp.
+let logSeq = 0;
+// Ambient run id (set by beginRun/endRun). addDebugLog calls with no explicit opts.runId
+// inherit this so leaf logs (db/retrieval) auto-tag without signature churn.
+let currentRunId = null;
+// Valid level/subsystem vocabularies (anything else falls back to a safe default).
+const LOG_LEVELS = new Set(['fail', 'pass', 'info', 'debug', 'verbose']);
+const LOG_SUBSYSTEMS = new Set([
+    'pipeline', 'agent1', 'agent3', 'finder', 'retrieval', 'db',
+    'entity', 'reflection', 'settings', 'import', 'cache',
+]);
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
 let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
@@ -102,6 +125,9 @@ const DEFAULT_SETTINGS = {
     depthDice4: 0.10,
     showToast: true,
     debugMode: false,
+    // Verbose logging tier (opt-in firehose). When false, level:'verbose' entries are
+    // DROPPED at ingestion (never enter the ring buffer or storage). RAM-only even when on.
+    debugVerbose: false,
     // Scene card (always-on core working-memory block). When enabled, Agent 1 emits an
     // optional #SCENE block each turn (location / present / goals / last beat); we inject
     // a compact one-line [Scene] block ABOVE the fact list every turn a scene exists.
@@ -214,6 +240,7 @@ function validateSettings(s) {
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
+    if (typeof s.debugVerbose !== 'boolean')     s.debugVerbose = false;
     if (typeof s.sceneCardEnabled !== 'boolean') s.sceneCardEnabled = true;
     if (typeof s.memoryProfile !== 'string')     s.memoryProfile = '';
     if (typeof s.agent1Profile !== 'string')     s.agent1Profile = '';
@@ -309,19 +336,83 @@ const LOG_META_KEY = 'bf_mem_log';
 const LOG_FLUSH_THROTTLE_MS = 5000;
 let lastLogFlushAt = 0;
 
+// --- runId threading (debug-log redesign §2) ---
+// Ambient current run id. Any addDebugLog with no explicit opts.runId inherits this, so
+// leaf logs (db/retrieval/eviction) auto-group without taking a runId parameter. An explicit
+// opts.runId always wins. pendingRun generalizes the old reflectionPending pattern: it carries
+// the inline run's id across the MESSAGE_RECEIVED boundary so a turn's pre-reply and post-reply
+// events (extraction, reflection) share ONE id. Stored here (not in pipeline.js) so endRun/the
+// summary can read it; pipeline owns arming/consuming it via the helpers below.
+let pendingRun = null;
+
+/** Set the ambient run id for the current turn. Explicit opts.runId on a log still overrides. */
+export function beginRun(runId) {
+    currentRunId = runId || null;
+    return currentRunId;
+}
+
+/** Clear the ambient run id. Call at the end of a turn's logging window. */
+export function endRun() {
+    currentRunId = null;
+}
+
+/** Current ambient run id (null when no run active). */
+export function getCurrentRunId() {
+    return currentRunId;
+}
+
+/**
+ * Arm post-reply work to share the inline run's id across the MESSAGE_RECEIVED boundary.
+ * Generalizes reflectionPending — the post-reply extraction path calls consumePendingRun()
+ * (or beginRun(getPendingRun().runId)) so Agent 3 extraction + reflection tag the SAME run
+ * the user saw start, instead of minting a fresh `M…` id.
+ * @param {{runId:string, startTime?:number}} info
+ */
+export function setPendingRun(info) {
+    pendingRun = info && info.runId ? { ...info } : null;
+}
+
+/** Peek the armed pendingRun without clearing it. */
+export function getPendingRun() {
+    return pendingRun;
+}
+
+/** Read AND clear the armed pendingRun (one-shot consume across the reply boundary). */
+export function consumePendingRun() {
+    const p = pendingRun;
+    pendingRun = null;
+    return p;
+}
+
 /** Best-effort immediate (non-debounced) persist of the debug log to chat .jsonl. */
 function flushDebugLogNow() {
     try {
         const ctx = getContext();
         const md = ctx.chatMetadata || ctx.chat_metadata;
         if (!md) return;
-        md[LOG_META_KEY] = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+        md[LOG_META_KEY] = buildPersistSlice();
         ctx.saveMetadata?.();
         // Immediate, non-debounced chat write so the metadata reaches disk.
         if (typeof ctx.saveChat === 'function') ctx.saveChat();
         else if (typeof ctx.saveChatConditional === 'function') ctx.saveChatConditional();
         lastLogFlushAt = Date.now();
     } catch { /* best-effort */ }
+}
+
+/**
+ * Build the persisted slice: verbose-STRIPPED (the firehose stays RAM-only) and capped at
+ * MAX_DEBUG_ENTRIES_PERSIST, then byte-budgeted so the chat .jsonl round-trip can't bloat.
+ */
+function buildPersistSlice() {
+    // Drop verbose entries entirely — they never reach disk. Old entries (no `level`) are kept.
+    let slice = debugLog.filter(e => e.level !== 'verbose').slice(0, MAX_DEBUG_ENTRIES_PERSIST);
+    // Byte guard: if the serialized slice exceeds the budget, trim oldest (tail) until under.
+    try {
+        while (slice.length > 1 && JSON.stringify(slice).length > LOG_PERSIST_BYTE_BUDGET) {
+            slice = slice.slice(0, slice.length - 1);
+        }
+    } catch { /* serialization guard is best-effort */ }
+    return slice;
 }
 
 function loadDebugLogFromMeta() {
@@ -331,8 +422,33 @@ function loadDebugLogFromMeta() {
         const stored = md[LOG_META_KEY];
         // Shape-check: must be array of {type, message, timestamp}
         if (!Array.isArray(stored)) return [];
-        return stored.filter(e => e && typeof e === 'object' && typeof e.message === 'string');
+        return stored
+            .filter(e => e && typeof e === 'object' && typeof e.message === 'string')
+            .map(backfillEntry);
     } catch { return []; }
+}
+
+/**
+ * Back-fill a persisted entry that may pre-date the structured schema (just {type,message,
+ * timestamp}). Additive: derives level/subsystem/ts/seq if absent and parses a leading
+ * [Rxxxx]/[Mxxxx] runId prefix from the message so OLD logs still group. Never overwrites
+ * fields that are already present.
+ */
+function backfillEntry(e) {
+    if (e.v == null) e.v = 1;
+    if (typeof e.type !== 'string') e.type = 'info';
+    if (typeof e.level !== 'string') e.level = e.type; // legacy type is a valid 3-value level
+    if (typeof e.subsystem !== 'string') e.subsystem = 'settings';
+    if (e.runId == null) {
+        const m = /^\[([RM][0-9a-z]+)\]/.exec(e.message || '');
+        e.runId = m ? m[1] : null;
+    }
+    if (typeof e.seq !== 'number') e.seq = ++logSeq;
+    if (typeof e.ts !== 'number') {
+        const parsed = e.iso ? Date.parse(e.iso) : NaN;
+        e.ts = Number.isFinite(parsed) ? parsed : Date.now();
+    }
+    return e;
 }
 
 function saveDebugLogToMeta() {
@@ -340,7 +456,7 @@ function saveDebugLogToMeta() {
         const ctx = getContext();
         const md = ctx.chatMetadata || ctx.chat_metadata;
         if (!md) return; // no chat loaded — log lives in-memory only until a chat opens
-        md[LOG_META_KEY] = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+        md[LOG_META_KEY] = buildPersistSlice();
         ctx.saveMetadata?.();
         // FIX #8: throttled immediate flush so a burst of entries doesn't all get
         // lost to the debounce on reload. Bounded to once per LOG_FLUSH_THROTTLE_MS
@@ -359,17 +475,84 @@ export function reloadDebugLogFromChat() {
     renderDebugLog();
 }
 
-export function addDebugLog(type, message) {
-    const timestamp = new Date().toLocaleTimeString();
-    debugLog.unshift({ type, message, timestamp });
-    if (debugLog.length > MAX_DEBUG_ENTRIES) debugLog = debugLog.slice(0, MAX_DEBUG_ENTRIES);
+/** Map a legacy `type` to a 5-value level (for existing 2-arg call sites). */
+function typeToLevel(type) {
+    return LOG_LEVELS.has(type) ? type : 'info';
+}
 
-    saveDebugLogToMeta(); // persist to chat_metadata so logs survive page reload
+/** Derive the 3-value legacy `type` from a 5-value level (so old readers never break). */
+function levelToType(level) {
+    return (level === 'fail' || level === 'pass') ? level : 'info';
+}
+
+/**
+ * Append a debug-log entry. BACKWARD-COMPATIBLE:
+ *   addDebugLog('info', 'message')                       // legacy 2-arg — unchanged behavior
+ *   addDebugLog('info', 'message', { runId, subsystem,   // new structured form
+ *     event, level, data, reason, actor, before, after })
+ *
+ * The stored entry ALWAYS keeps the legacy keys {type, message, timestamp} verbatim, so old
+ * readers (renderDebugLog, exportLogs, the shape-check on load) keep working. New optional
+ * fields are additive. `level` (5-value) is the superset of `type` (3-value); whichever is
+ * supplied derives the other. Verbose entries are gated by the debugVerbose setting and are
+ * NEVER persisted (RAM-only).
+ *
+ * @param {string} type  legacy type OR (when opts.level absent) the level shorthand
+ * @param {string} message human-readable string (unchanged contract)
+ * @param {object} [opts] { runId, level, subsystem, event, data, reason, actor, before, after }
+ */
+export function addDebugLog(type, message, opts = {}) {
+    if (!opts || typeof opts !== 'object') opts = {};
+
+    // Level/type derivation: opts.level (5-value) wins; else derive from the legacy `type`.
+    const level = LOG_LEVELS.has(opts.level) ? opts.level : typeToLevel(type);
+    const legacyType = levelToType(level);
+
+    // Verbose gating: drop at INGESTION when the firehose toggle is off, so verbose never
+    // costs ring-buffer space, render time, or storage.
+    if (level === 'verbose' && !extensionSettings?.debugVerbose) return;
+
+    const subsystem = LOG_SUBSYSTEMS.has(opts.subsystem) ? opts.subsystem : 'settings';
+    // runId: explicit opts.runId overrides the ambient currentRunId set by beginRun().
+    const runId = (opts.runId != null && opts.runId !== '') ? opts.runId : currentRunId;
+
+    const now = new Date();
+    const entry = {
+        // --- legacy keys (kept EXACTLY for back-compat readers / text export) ---
+        type: legacyType,
+        message,
+        timestamp: now.toLocaleTimeString(),
+        // --- structured fields (additive, all optional to downstream readers) ---
+        v: 1,
+        ts: now.getTime(),
+        iso: now.toISOString(),
+        seq: ++logSeq,
+        level,
+        subsystem,
+        runId: runId ?? null,
+    };
+    // Only attach optional structured fields when provided (keeps small entries small).
+    if (opts.event != null) entry.event = opts.event;
+    if (opts.data != null) entry.data = opts.data;
+    if (opts.reason != null) entry.reason = opts.reason;
+    if (opts.actor != null) entry.actor = opts.actor;
+    if (opts.before !== undefined) entry.before = opts.before;
+    if (opts.after !== undefined) entry.after = opts.after;
+
+    // RAM ring buffer: newest-first, drop-oldest beyond MAX_DEBUG_ENTRIES_MEM.
+    debugLog.unshift(entry);
+    if (debugLog.length > MAX_DEBUG_ENTRIES_MEM) debugLog.length = MAX_DEBUG_ENTRIES_MEM;
+
+    // Persist a verbose-stripped, byte-budgeted slice to chat_metadata (survives reload).
+    // (Verbose entries are already excluded by buildPersistSlice; the firehose stays in RAM.)
+    saveDebugLogToMeta();
     renderDebugLog();
 
     if (extensionSettings?.debugMode) {
-        const prefix = type === 'pass' ? '[PASS]' : type === 'fail' ? '[FAIL]' : '[INFO]';
-        console.log(`[BFMemory] ${prefix} ${message}`);
+        const tag = level.toUpperCase();
+        const sub = subsystem !== 'settings' ? ` ${subsystem}` : '';
+        const rid = runId ? ` [${runId}]` : '';
+        console.log(`[BFMemory] [${tag}]${rid}${sub} ${message}`);
     }
 }
 
@@ -377,8 +560,11 @@ function renderDebugLog() {
     const container = document.getElementById('bf_mem_debug_log');
     if (!container) return;
 
+    // Use the 5-value `level` for the CSS class when present (debug/verbose tinting), falling
+    // back to the legacy 3-value `type` for old persisted entries. The flat render is preserved
+    // (group/filter UI is a later phase); both classes keep the existing .info/.pass/.fail CSS.
     container.innerHTML = debugLog.map(entry => `
-        <div class="bf-mem-debug-entry ${entry.type}">
+        <div class="bf-mem-debug-entry ${entry.level || entry.type}">
             <span class="bf-mem-log-time">[${entry.timestamp}]</span> ${escapeHtml(entry.message).replace(/\n/g, '<br>')}
         </div>
     `).join('');
@@ -912,6 +1098,22 @@ function exportLogs() {
     const header = `=== BF Memory Pipeline Debug Logs ===\nExported: ${new Date().toISOString()}\nEntries: ${debugLog.length}\n${'='.repeat(40)}\n\n`;
     const logText = debugLog.map(entry => `[${entry.timestamp}] [${entry.type.toUpperCase().padEnd(5)}] ${entry.message}`).join('\n');
     return header + logText;
+}
+
+/**
+ * Machine-readable export of the FULL RAM ring buffer (incl. debug/verbose when present) as
+ * pretty JSON — the artifact for "investigate what changed why". Full `data` blobs included.
+ * Returns the JSON string; callers handle download/clipboard.
+ */
+export function exportLogsJSON() {
+    let chatId = null;
+    try { chatId = getContext().chatId ?? null; } catch { /* no chat */ }
+    return JSON.stringify({
+        exportedAt: new Date().toISOString(),
+        schemaVersion: 1,
+        chatId,
+        entries: debugLog,
+    }, null, 2);
 }
 
 // --- Profile Dropdown ---
@@ -2111,6 +2313,14 @@ export async function initSettings() {
     // --- Debug Tab ---
     $('#bf_mem_debug').prop('checked', extensionSettings.debugMode).on('change', function () {
         extensionSettings.debugMode = $(this).prop('checked');
+        saveSettings();
+    });
+
+    // Verbose tier toggle (opt-in firehose). The control markup lands in a later UI phase;
+    // wiring it now is a no-op when the element is absent. When OFF, addDebugLog drops
+    // level:'verbose' at ingestion (see addDebugLog) — this is the volume control.
+    $('#bf_mem_debug_verbose').prop('checked', extensionSettings.debugVerbose).on('change', function () {
+        extensionSettings.debugVerbose = $(this).prop('checked');
         saveSettings();
     });
 

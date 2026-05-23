@@ -11,7 +11,7 @@ import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } fro
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
@@ -90,12 +90,17 @@ function scheduleSettleExtraction(reason, runPostPasses = false) {
                 await runMemoryExtraction();
                 if (runPostPasses) {
                     // Reflection / consolidation + character-registry detection, off the
-                    // critical path. Self-guarded + try/catch'd internally.
+                    // critical path. Self-guarded + try/catch'd internally. Reflection carries
+                    // its own runId via reflectionPending, so it stays grouped with the turn.
                     maybeRunReflection();
                     maybeRunEntityCheck();
                 }
             } catch (err) {
                 addDebugLog('fail', `Settle extraction failed (non-fatal): ${err.message || err}`);
+            } finally {
+                // The turn's post-reply work has now been dispatched — disarm the pendingRun so a
+                // later swipe/turn mints/reuses its own id and can't inherit this run's id.
+                if (runPostPasses) consumePendingRun();
             }
         }, SETTLE_EXTRACTION_DELAY_MS);
     } catch (err) {
@@ -187,15 +192,35 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
 }
 
 /**
- * FIX #10: Emit a single consolidated per-run SUMMARY debug entry, grouping the
- * run's outcome under a runId: durations, Agent 1 ok/failed, Agent 3 fact
- * NEW/UPDATED/SKIPPED counts, and token numbers. mainOutput is usually not known
- * yet at this point (it lands on MESSAGE_RECEIVED), so it is reported when present.
+ * FIX #10 + debug-log redesign §3: Emit ONE consolidated per-run summary debug entry,
+ * grouping the run's outcome under a runId: duration, which agents ran/ok/failed, fact
+ * NEW/UPDATED/SKIPPED/EVICTED counts, and the token breakdown.
+ *
+ * Structured: tagged subsystem:'pipeline', event:'run.summary', level info (pass/fail when
+ * an agent errored / run cancelled), with a full `data` blob for the (later-phase) group
+ * header UI. The legacy `[runId] SUMMARY …` message text is preserved for back-compat readers.
+ *
+ * Fact counts: derived from memoryResult.applied when present; callers may also pass an
+ * explicit `facts` override ({ NEW, UPDATED, SKIPPED, EVICTED }) — e.g. the post-reply path,
+ * which knows EVICTED counts the inline path can't see.
+ *
+ * @param {object} a
+ * @param {string} a.runId
+ * @param {number} a.startTime          epoch ms the run began (duration = now - startTime)
+ * @param {number} a.baselineInput
+ * @param {number} a.actualInput
+ * @param {object} [a.draftResult]      Agent 1 result (ok/failed + tokens)
+ * @param {object} [a.memoryResult]     Agent 3 result (updates/applied + tokens + mainOutput)
+ * @param {boolean} [a.cancelled]
+ * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts }) {
     try {
         const duration = Date.now() - startTime;
         const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
+        const agent1Ran = !!draftResult;
+        const agent3Ran = !!memoryResult;
+        const agent3Ok = agent3Ran && !memoryResult?.error;
         const updates = Array.isArray(memoryResult?.updates) ? memoryResult.updates : [];
         const applied = Array.isArray(memoryResult?.applied)
             ? memoryResult.applied
@@ -207,20 +232,44 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
             else if (st === 'UPDATED') nUpd++;
             else if (st === 'SKIPPED') nSkip++;
         }
+        // Explicit overrides win (caller knows better — e.g. EVICTED from the db path).
+        if (facts && typeof facts === 'object') {
+            if (Number.isFinite(facts.NEW)) nNew = facts.NEW;
+            if (Number.isFinite(facts.UPDATED)) nUpd = facts.UPDATED;
+            if (Number.isFinite(facts.SKIPPED)) nSkip = facts.SKIPPED;
+        }
+        const nEvict = Number.isFinite(facts?.EVICTED) ? facts.EVICTED : 0;
         const a1In = Number(draftResult?.tokensIn) || 0;
         const a1Out = Number(draftResult?.tokensOut) || 0;
         const a3In = Number(memoryResult?.tokensIn) || 0;
         const a3Out = Number(memoryResult?.tokensOut) || 0;
         const bIn = Number(baselineInput) || 0;
         const aIn = Number(actualInput) || 0;
-        const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 here
+        const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 on the inline path
         const netIn = (aIn + a1In + a3In) - bIn;
+        const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
         addDebugLog('info',
             `[${runId}] SUMMARY ${cancelled ? '(cancelled) ' : ''}` +
-            `dur=${duration}ms | Agent1=${agent1Ok ? 'ok' : 'failed'} | ` +
-            `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} | ` +
+            `dur=${duration}ms | Agent1=${agent1Ran ? (agent1Ok ? 'ok' : 'failed') : 'skipped'} | ` +
+            `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} EVICTED=${nEvict} | ` +
             `tokens: baselineIn=${bIn} actualIn=${aIn} a1(in/out)=${a1In}/${a1Out} ` +
             `a3(in/out)=${a3In}/${a3Out}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
+            {
+                runId,
+                subsystem: 'pipeline',
+                event: 'run.summary',
+                level: failed ? 'fail' : 'info',
+                data: {
+                    durationMs: duration,
+                    cancelled: !!cancelled,
+                    agents: {
+                        agent1: agent1Ran ? (agent1Ok ? 'ok' : 'failed') : 'skipped',
+                        agent3: agent3Ran ? (agent3Ok ? 'ok' : 'failed') : 'skipped',
+                    },
+                    facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
+                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, mainOut, netIn },
+                },
+            },
         );
     } catch (err) {
         addDebugLog('info', `Run summary failed (non-fatal): ${err.message || err}`);
@@ -463,9 +512,17 @@ async function runPipelineInline(data) {
     const startTime = Date.now();
     // FIX #10: short per-run id to group this run's log entries + the SUMMARY line.
     const runId = `R${startTime.toString(36).slice(-5)}`;
+    // Debug-log redesign §2: set the ambient run id so leaf logs (retrieval/db) auto-tag with
+    // this turn's runId without signature churn. ARM a pendingRun so the post-reply
+    // (MESSAGE_RECEIVED) extraction + reflection reuse THIS id instead of minting a fresh `M…`,
+    // keeping a turn's pre-reply and post-reply events under ONE run. endRun() clears the
+    // ambient id at every return path below.
+    beginRun(runId);
+    setPendingRun({ runId, startTime });
     const recentMessages = getRecentMessages(settings.agent1ContextMessages || 5);
     if (recentMessages.length === 0) {
         addDebugLog('info', 'No messages in chat, skipping pipeline');
+        endRun();
         return;
     }
 
@@ -549,6 +606,7 @@ async function runPipelineInline(data) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
         hideWorkingIndicator();
         updateStatus('error', 'Pipeline failed');
+        endRun(); // clear ambient run id on the abnormal exit
         return;
     } finally {
         isInternalCall = false;
@@ -732,6 +790,9 @@ async function runPipelineInline(data) {
         logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true });
         hideWorkingIndicator();
         updateStatus('idle');
+        // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
+        setPendingRun(null);
+        endRun();
         return;
     }
     // Always-on scene block: injected EVERY turn (above the facts) whenever enabled
@@ -802,6 +863,10 @@ async function runPipelineInline(data) {
 
     hideWorkingIndicator();
     updateStatus('running', 'Generating with facts...');
+    // Inline logging window is done. Clear the ambient run id so any unrelated logs that fire
+    // before the reply lands don't mis-tag; the armed pendingRun (set at run start) bridges the
+    // runId to the post-reply MESSAGE_RECEIVED path (Agent 3 extraction + reflection re-bind it).
+    endRun();
 }
 
 /**
@@ -862,7 +927,15 @@ async function runMemoryExtraction() {
     const capturedDbProfile = settings.activeDbProfile;
     const capturedCharAvatar = ctx0.characters?.[ctx0.characterId]?.avatar || '';
     const startTime = Date.now();
-    const runId = `M${startTime.toString(36).slice(-5)}`;
+    // Debug-log redesign §2: REUSE the inline run's id (armed as pendingRun at the start of
+    // this turn) so a turn's pre-reply (Agent 1, retrieval) and post-reply (Agent 3 extract,
+    // commit, evict) events all group under ONE id — the run the user saw start. Fall back to
+    // minting `M…` only when there's no armed run (e.g. full-chat re-extraction). consumePendingRun
+    // one-shot-clears it; we leave reflection's own runId carried via reflectionPending.
+    const pending = getPendingRun();
+    const runId = pending?.runId || `M${startTime.toString(36).slice(-5)}`;
+    // Set the ambient id so leaf db/eviction logs auto-tag with this run; endRun() in finally.
+    beginRun(runId);
 
     memoryExtractionInFlight = true;
     isInternalCall = true; // our extraction LLM call must not re-trigger the pipeline
@@ -984,6 +1057,7 @@ async function runMemoryExtraction() {
     } finally {
         memoryExtractionInFlight = false;
         isInternalCall = false;
+        endRun(); // clear the ambient run id once post-reply extraction's logging window closes
     }
 }
 
@@ -1275,6 +1349,10 @@ export function initPipeline() {
         // chat switch can't fire a consolidation against the new chat using old context.
         successfulRunsSinceReflection = 0;
         reflectionPending = null;
+        // Debug-log redesign §2: drop any armed pendingRun + clear the ambient run id so a chat
+        // switch can't leak the prior chat's runId onto the new chat's logs.
+        setPendingRun(null);
+        endRun();
         // Character-registry cadence is per-chat too: reset so a chat switch can't fire a
         // detection against the new chat using the old chat's accumulated run count.
         runsSinceEntityCheck = 0;
