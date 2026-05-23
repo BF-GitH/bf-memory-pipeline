@@ -11,14 +11,20 @@ import { retrieveFacts, extractContextKeywords, isFactVisible } from './fact-ret
 import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, setScene, getScene, getReflection } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, getReflection } from './settings.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
 let isInternalCall = false; // true when our agents are making LLM calls
 let chatChangedAt = 0;
 let lastTriggeredUserMsgIndex = -1;
-let lastInjection = null; // cached injection text for swipes/regens
+let lastInjection = null; // cached injection text for the FIRST generation (scene + facts + Agent-1 draft)
+// Phase 3b / FIX #8a: a SECOND cached injection with the SAME scene + facts but WITHOUT
+// Agent 1's draft scene-direction. Agent 1's draft is "what should happen next" planned
+// for the ORIGINAL roll; reusing it verbatim on a divergent swipe/regen mis-steers a very
+// different re-roll. So swipes/regens re-inject the stable facts + scene from here and DROP
+// the stale draft (facts are safe to reuse; the draft is not). Kept fast: no agent re-run.
+let lastInjectionNoDraft = null;
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
 let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
 let groupSkipToastShown = false; // show-once toast when skipping group chats
@@ -29,6 +35,18 @@ let runRecordedInput = false; // true once setRunTokens fired this generation cy
 let successfulRunsSinceReflection = 0;
 let reflectionPending = null; // {runId, charAvatar} captured at the run that armed it; consumed on MESSAGE_RECEIVED
 let reflectionInFlight = false; // guard so overlapping turns can't double-fire the pass
+// Phase 3b: Agent 3 (memory extraction) now runs on MESSAGE_RECEIVED, off the blocking
+// path. This guard prevents two MESSAGE_RECEIVED events (e.g. a fast follow-up turn) from
+// launching overlapping extractions that race on the same DB save.
+let memoryExtractionInFlight = false;
+// FIX #8b: debounce timer for swipe-SETTLE extraction. Navigating LEFT/RIGHT onto an
+// ALREADY-GENERATED swipe fires MESSAGE_SWIPED but NOT MESSAGE_RECEIVED, so the
+// MESSAGE_RECEIVED extraction never sees that settled content. We schedule a debounced
+// extraction after each swipe; rapid navigation keeps resetting it so only the FINAL
+// settled swipe extracts. Generating a NEW swipe DOES fire MESSAGE_RECEIVED, which
+// extracts and marks bf_mem_processed first — making this debounced fire a guarded no-op
+// (no double-extract). Cleared on chat change.
+let swipeSettleTimer = null;
 
 /**
  * Count tokens for a chat-completion message array (role wrappers included).
@@ -291,12 +309,20 @@ function shouldRunPipeline(data) {
 
 /**
  * Find the index of the last genuine AI message Agent 3 would target.
- * Mirrors the scan in runPipelineInline so shouldRunPipeline and the run agree.
+ * Mirrors the scan in shouldRunPipeline so the gate and the run agree.
  * Returns -1 if none.
+ *
+ * @param {Array} chat
+ * @param {boolean} [includeLast=false] - When false (PRE-generation, the historical
+ *   behaviour) the scan starts at chat.length-2 because the last message is the
+ *   just-sent USER message, not an AI reply. When true (POST-reply, the new Agent 3
+ *   home on MESSAGE_RECEIVED) the scan starts at chat.length-1 so the just-received
+ *   AI reply itself is the target — extracting the reply that just landed is exactly
+ *   what we want now that Agent 3 runs after generation.
  */
-function findMemoryTargetIndex(chat) {
+function findMemoryTargetIndex(chat, includeLast = false) {
     if (!Array.isArray(chat)) return -1;
-    for (let i = chat.length - 2; i >= 0; i--) {
+    for (let i = (includeLast ? chat.length - 1 : chat.length - 2); i >= 0; i--) {
         const msg = chat[i];
         if (!msg || msg.is_user || !msg.mes) continue;
         if (msg.is_system) continue;
@@ -310,13 +336,13 @@ function findMemoryTargetIndex(chat) {
 
 async function runPipelineInline(data) {
     const settings = getSettings();
-    // Capture-at-write: pin the active profile at pipeline start so that if the
-    // user switches chat/profile mid-run, our Agent 3 save still lands in the
-    // correct slot (the profile this pipeline was reading from).
+    // Capture-at-write: pin the active profile at pipeline start. Agent 3 (memory
+    // extraction) now runs POST-reply on MESSAGE_RECEIVED, but the reflection arming
+    // below still captures-at-write the profile this pipeline was reading from.
     const capturedDbProfile = settings?.activeDbProfile;
-    // Also capture the character's avatar — if the user switches character before
-    // Agent 3 finishes, writing facts would land on the wrong character's
-    // attachments (database.js keys storage on the LIVE characterId/avatar).
+    // Also capture the character's avatar — used by the scene/next-hint writes and
+    // the reflection arming so a mid-run character switch can't contaminate the wrong
+    // character's attachments (database.js keys storage on the LIVE characterId/avatar).
     const capturedCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
     pipelineCancelled = false; // fresh run, start uncancelled
     const context = SillyTavern.getContext();
@@ -354,41 +380,42 @@ async function runPipelineInline(data) {
     showWorkingIndicator();
     updateStatus('running', 'Preparing facts...');
 
-    // Find memory target (last AI message before the new user message).
-    // Uses the same scan as shouldRunPipeline (findMemoryTargetIndex) so the
-    // gate and the run never disagree about which message is the target.
-    // Skips system messages and extension-injected synthetic messages
-    // (Auto-Summarize, Tracker, etc.) — these aren't genuine character utterances
-    // and extracting "facts" from them pollutes the DB with second-order data.
-    const memoryTargetIndex = findMemoryTargetIndex(chat);
+    // NOTE: memory-extraction target selection (findMemoryTargetIndex) now lives in
+    // runMemoryExtraction() on the post-reply path — the blocking path no longer needs
+    // it because Agent 3 doesn't run here anymore.
 
     const formattedChat = formatMessagesForDraft(recentMessages);
 
-    // --- Run Agent 3 + Agent 1 + Speculative Retrieval in PARALLEL ---
-    // SAFETY: We use CMRS (ConnectionManagerRequestService) to call the memory profile
+    // --- Run Agent 1 + Speculative Retrieval in PARALLEL (NOT Agent 3) ---
+    // Phase 3b: Agent 3 (memory extraction about the PREVIOUS exchange) was MOVED OFF
+    // this latency-critical pre-generation path. It now runs POST-reply on
+    // MESSAGE_RECEIVED (runMemoryExtraction), so the user no longer waits for
+    // fact-extraction-about-the-last-turn before THIS reply generates. Only the agents
+    // that feed THIS reply stay here: Agent 1 (draft/menu) + speculative retrieval, and
+    // the Stage-2 finder runs after Agent 1 below.
+    // SAFETY: We use CMRS (ConnectionManagerRequestService) to call the agent profile
     // directly by ID, WITHOUT switching the active UI profile. This is safe during
     // mid-generation because it doesn't touch the DOM or active connection state.
-    updateStatus('running', 'Updating memory + drafting...');
-    addDebugLog('info', 'Running Agent 3 (memory) + Agent 1 (draft) + speculative retrieval in parallel...');
+    updateStatus('running', 'Drafting...');
+    addDebugLog('info', 'Running Agent 1 (draft) + speculative retrieval in parallel (Agent 3 deferred to post-reply)...');
 
     const agent1ProfileId = getAgent1ProfileId(settings);
-    const agent3ProfileId = getAgent3ProfileId(settings);
-    if (agent1ProfileId || agent3ProfileId) {
-        addDebugLog('info', `Profiles: Agent 1 = "${agent1ProfileId || 'default'}", Agent 3 = "${agent3ProfileId || 'default'}"`);
+    if (agent1ProfileId) {
+        addDebugLog('info', `Profiles: Agent 1 = "${agent1ProfileId || 'default'}"`);
     } else {
-        addDebugLog('info', 'No memory profiles configured, agents will use current connection');
+        addDebugLog('info', 'No Agent 1 profile configured, agent will use current connection');
     }
 
     let draftResult = null;
-    let memoryResult = null;
     let speculativeRetrieval = null;
 
     // Start speculative fact retrieval using context keywords (no LLM needed)
     const contextKeywords = extractContextKeywords(recentMessages);
     addDebugLog('info', `Speculative retrieval keywords: ${contextKeywords.join(', ')}`);
 
-    // Load databases once up front — reused for both Agent 1's fact inventory and
-    // Agent 3's existing-DB context, avoiding a duplicate fetch.
+    // Load databases once up front — reused for Agent 1's fact inventory/menu, the
+    // Stage-2 finder candidates, and the deterministic-retrieval fallback. (Agent 3's
+    // existing-DB context now loads separately on the post-reply extraction path.)
     const databases = await getAllDatabases();
     // Compact keys-only inventory (Category/key, no values) — kept for the #Needed_Facts
     // fallback path so deterministic retrieval can resolve exact keys by identity.
@@ -407,51 +434,13 @@ async function runPipelineInline(data) {
                 .catch(err => ({ draft: '', branches: [], neededFacts: [], raw: '', error: err.message })),
         );
 
-        // Agent 3: Memory update — single call that sees BOTH the latest user message
-        // (just-sent, safe to extract from) AND the N-1 AI message (already committed).
-        // This captures user disclosures ("I'm Bernd, I work at Google") that the prior
-        // AI-only target missed entirely.
-        // Gate on the per-message bf_mem_processed flag (source of truth) rather than
-        // the monotonic lastProcessedMessageIndex, which never rewound on swipe/regen
-        // and could permanently wall off later turns once it raced ahead.
-        const targetAlreadyProcessed = memoryTargetIndex >= 0
-            && !!chat[memoryTargetIndex]?.extra?.bf_mem_processed;
-        if (memoryTargetIndex >= 0 && !targetAlreadyProcessed) {
-            const targetMessage = chat[memoryTargetIndex];
-            const role = targetMessage.is_user ? 'USER' : 'AI';
-            // Gather up to agent3ContextMessages prior messages for richer Agent 3 context.
-            // Default = 2 means just the latest user + AI exchange (current behavior preserved).
-            const agent3Count = Math.max(1, settings.agent3ContextMessages || 2);
-            const agent3StartIdx = Math.max(0, chat.length - agent3Count - 1); // -1 to exclude memoryTargetIndex itself if it's the latest AI msg
-            const agent3PriorMessages = [];
-            for (let i = agent3StartIdx; i < chat.length; i++) {
-                if (i === memoryTargetIndex) continue; // exclude target, it's passed separately
-                if (chat[i] && chat[i].mes) {
-                    agent3PriorMessages.push({
-                        role: chat[i].is_user ? 'USER' : 'CHAR',
-                        text: chat[i].mes,
-                    });
-                }
-            }
-            addDebugLog('info', `Agent 3 target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
-
-            // Reuse the databases loaded above for Agent 1's inventory.
-            promises.push(
-                runMemoryUpdater(targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId, !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex)
-                    .catch(err => ({ updates: [], summary: '', raw: '', error: err.message })),
-            );
-        } else {
-            addDebugLog('info', `Agent 3: target already processed or none (target=${memoryTargetIndex}, processed=${targetAlreadyProcessed})`);
-            promises.push(Promise.resolve(null));
-        }
-
         // Speculative retrieval: start fact lookup with context keywords NOW (no LLM wait)
         promises.push(
             retrieveFacts(contextKeywords, [])
                 .catch(err => { addDebugLog('info', `Speculative retrieval failed: ${err.message}`); return null; }),
         );
 
-        [draftResult, memoryResult, speculativeRetrieval] = await Promise.all(promises);
+        [draftResult, speculativeRetrieval] = await Promise.all(promises);
     } catch (error) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
         hideWorkingIndicator();
@@ -461,97 +450,11 @@ async function runPipelineInline(data) {
         isInternalCall = false;
     }
 
-    // --- Process Agent 3 results ---
-    if (memoryResult && !memoryResult.error) {
-        // Always record what Agent 3 proposed (regardless of guards) for the
-        // Last Generated tab.
-        setLastGenerated(memoryResult.updates || []);
-        if (pipelineCancelled) {
-            addDebugLog('info', `Pipeline cancelled — discarding ${memoryResult.updates.length} Agent 3 updates`);
-            // Mark all as SKIPPED for Last Inserted tab.
-            setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
-        } else {
-            const currentCharAvatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || '';
-            if (currentCharAvatar !== capturedCharAvatar) {
-                addDebugLog('fail', `Character changed mid-pipeline (${capturedCharAvatar} -> ${currentCharAvatar}) — discarding ${memoryResult.updates.length} Agent 3 updates to avoid cross-character contamination`);
-                if (typeof toastr !== 'undefined') {
-                    toastr.warning('BF Memory: extraction discarded — you switched characters mid-generation');
-                }
-                // Mark all as SKIPPED for Last Inserted tab.
-                setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
-            } else {
-                // Last Inserted = only the facts that ACTUALLY changed stored state
-                // (NEW or UPDATED), with the status applyUpdates computed. This is the
-                // committed subset — distinct from Last Generated (full proposed set),
-                // fixing the "both panels identical" bug (FIX #5). Fall back to deriving
-                // the changed subset from .updates if .applied is absent (older shape).
-                const committed = Array.isArray(memoryResult.applied)
-                    ? memoryResult.applied
-                    : (memoryResult.updates || []).filter(u => u.changed ?? u.wasNew).map(u => ({
-                        ...u,
-                        status: u.status || (u.wasNew ? 'NEW' : 'UPDATED'),
-                    }));
-                addDebugLog('info', `Agent 3: ${memoryResult.updates.length} proposed, ${committed.length} committed. ${memoryResult.summary}`);
-                setLastInserted(committed);
-                for (const update of memoryResult.updates) {
-                    trackUpdate(update);
-                }
-                lastProcessedMessageIndex = memoryTargetIndex;
-
-                // Mark the target AI message as processed so the per-message
-                // icon (and "Run on full chat" skip-already-done) can see it.
-                if (chat[memoryTargetIndex]) {
-                    chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: true };
-                }
-                // If we also processed the latest user message via prevUserMsg / priorMessages,
-                // mark it too (Agent 3 saw it in the same call).
-                if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]) {
-                    chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: true };
-                }
-                // Persist to chat .jsonl
-                SillyTavern.getContext().saveChatDebounced?.();
-
-                // Check if review popup is due (defer to after generation to avoid blocking)
-                if (tickMessageCounter(settings.reviewInterval || 10)) {
-                    addDebugLog('info', 'Review interval reached, will show popup after generation');
-                    // Schedule popup after generation completes
-                    // Capture chat ID at schedule time. If the user switches chats during
-                    // the 2s delay, the popup must not pop in the wrong chat or write to
-                    // the wrong character's DB.
-                    const targetChatIdForPopup = SillyTavern.getContext().chatId;
-                    setTimeout(async () => {
-                        if (SillyTavern.getContext().chatId !== targetChatIdForPopup) {
-                            addDebugLog('info', 'Skipping review popup: chat changed since pipeline finished');
-                            return;
-                        }
-                        await showReviewPopup(
-                            () => addDebugLog('info', 'User accepted all memory updates'),
-                            async (editedItems) => {
-                                addDebugLog('info', `User edited ${editedItems.length} items`);
-                                appendLastInserted(editedItems.map(i => ({ ...i, status: 'UPDATED' })));
-                                const dbs = await getAllDatabases();
-                                for (const item of editedItems) {
-                                    if (!dbs[item.category]) {
-                                        dbs[item.category] = createEmptyDatabase(item.category);
-                                    }
-                                    upsertFact(dbs[item.category], item);
-                                    await saveDatabase(dbs[item.category]);
-                                }
-                            },
-                        );
-                    }, 2000);
-                }
-                // Persist to active DB profile immediately after Agent 3 writes
-                // Use the profile captured at pipeline start, not whatever is active now —
-                // user may have switched chats while Agent 3 was running.
-                if (memoryResult.updates.length > 0) {
-                    await saveCurrentToActiveProfile(capturedDbProfile);
-                }
-            }
-        }
-    } else if (memoryResult?.error) {
-        addDebugLog('fail', `Agent 3 error: ${memoryResult.error}`);
-    }
+    // --- Agent 3 (memory extraction) is no longer processed here ---
+    // It was moved to runMemoryExtraction() on the MESSAGE_RECEIVED path (Phase 3b),
+    // so all of its commit logic (Last Generated/Inserted, bf_mem_processed marking,
+    // capture-at-write profile save, review popup, character-changed guard) now lives
+    // there. The blocking path only feeds THIS reply.
 
     // --- Process Agent 1 results + merge with speculative retrieval ---
     // GRACEFUL DEGRADATION: if Agent 1 errored (e.g. provider returned empty completion
@@ -705,8 +608,10 @@ async function runPipelineInline(data) {
         addDebugLog('info', 'Pipeline cancelled — skipping injection');
         // Still record the agent token cost (input == baseline since we didn't inject)
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
-        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult, cancelled: true });
+        // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
+        // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
+        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true });
         hideWorkingIndicator();
         updateStatus('idle');
         return;
@@ -727,7 +632,13 @@ async function runPipelineInline(data) {
     // reflectionInject is retained as an inert setting for back-compat (default now false).
 
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, sceneBlock);
-    lastInjection = injection; // Cache for swipes/regens (scene block included)
+    lastInjection = injection; // Used for THIS first generation only.
+    // FIX #8a: cache a draft-less variant for swipes/regens. Same scene + facts (those are
+    // turn-stable and safe to reuse), but pass an empty draft so the stale "what happens
+    // next" direction can't mis-steer a divergent re-roll. buildWriterInjection renders an
+    // empty draft as "(no direction)" inside the #Scene Direction slot — a neutral
+    // placeholder that doesn't push the re-roll toward the original swipe's planned beat.
+    lastInjectionNoDraft = buildWriterInjection('', retrieval.formatted, sceneBlock);
 
     // Optional: trim main-model chat history to last N messages — relies on facts to
     // replace older context. Default 0 = don't trim (main model sees full chat as usual).
@@ -742,10 +653,13 @@ async function runPipelineInline(data) {
     let actualInput = baselineInput;
     try { actualInput = await countChatTokens(actualArr); } catch { actualInput = baselineInput; }
 
-    // Record token metrics for the Tokens tab (agent counts come from result objects)
-    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult });
+    // Record token metrics for the Tokens tab. Agent 3 no longer runs on this path
+    // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
+    // the MESSAGE_RECEIVED path, which updates lastRunTokens.agent3* without bumping
+    // the run count or re-counting input.
+    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled: false });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false });
 
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
@@ -770,6 +684,189 @@ async function runPipelineInline(data) {
 
     hideWorkingIndicator();
     updateStatus('running', 'Generating with facts...');
+}
+
+/**
+ * Agent 3 (memory extraction), Phase 3b — runs POST-reply on MESSAGE_RECEIVED, OFF the
+ * latency-critical pre-generation path. The just-completed exchange (the user message +
+ * the AI reply that just landed) is now FULLY present in chat, so we extract from the real
+ * accepted text — including the ACCEPTED swipe (the active swipe IS the message's current
+ * .mes, so chat[target].mes is exactly what the user settled on; FIX #8b).
+ *
+ * Every guard from the old blocking-path commit is preserved here, with capture-at-write
+ * pinned at extraction start (the correct moment now that timing shifted post-reply):
+ *  - enabled / group / dry / internal skips
+ *  - pipelineCancelled (a Stop discards the extraction)
+ *  - bf_mem_processed gating (no double-extract of an already-processed exchange)
+ *  - capturedDbProfile / capturedCharAvatar capture-at-write (right slot / right character)
+ *  - saveChatDebounced + saveCurrentToActiveProfile + review popup
+ * Wrapped in try/catch: an extraction failure must NEVER break generation or the next turn.
+ */
+async function runMemoryExtraction() {
+    if (memoryExtractionInFlight) return; // a prior extraction is still committing
+    const settings = getSettings();
+    if (!settings || !settings.enabled) return;
+    if (isInternalCall) return; // never extract off our own agent calls
+    if (pipelineCancelled) {
+        addDebugLog('info', 'Agent 3 (post-reply): skipped — generation was stopped/cancelled');
+        return;
+    }
+    const ctx0 = SillyTavern.getContext();
+    if (ctx0.groupId || ctx0.selected_group) return; // group chats unsupported (same as gate)
+
+    const chat = ctx0.chat;
+    if (!Array.isArray(chat) || chat.length === 0) return;
+
+    // Target the JUST-RECEIVED AI message (includeLast=true: the reply now exists at the
+    // tail of chat). This also closes the swipe-settle gap — when the user swipes then
+    // stops, chat[target].mes already holds the ACCEPTED swipe's content.
+    const memoryTargetIndex = findMemoryTargetIndex(chat, true);
+    if (memoryTargetIndex < 0) {
+        addDebugLog('info', 'Agent 3 (post-reply): no genuine AI message to extract — skipping');
+        return;
+    }
+    // bf_mem_processed gating (source of truth): don't re-extract an exchange already done.
+    // On a swipe the MESSAGE_SWIPED handler clears this flag, so the accepted swipe re-runs.
+    if (chat[memoryTargetIndex]?.extra?.bf_mem_processed) {
+        addDebugLog('info', `Agent 3 (post-reply): target msg ${memoryTargetIndex} already processed — skipping (no double-extract)`);
+        return;
+    }
+
+    // Find the latest USER message (for @src:user attribution / prior-context window).
+    let lastUserMsgIndex = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i] && chat[i].is_user) { lastUserMsgIndex = i; break; }
+    }
+
+    // CAPTURE-AT-WRITE at extraction start (correct moment now timing is post-reply):
+    // pin the active DB profile + character avatar so a mid-extraction chat/character
+    // switch can't land facts in the wrong slot or contaminate another character.
+    const capturedDbProfile = settings.activeDbProfile;
+    const capturedCharAvatar = ctx0.characters?.[ctx0.characterId]?.avatar || '';
+    const startTime = Date.now();
+    const runId = `M${startTime.toString(36).slice(-5)}`;
+
+    memoryExtractionInFlight = true;
+    isInternalCall = true; // our extraction LLM call must not re-trigger the pipeline
+    let memoryResult = null;
+    try {
+        const characterInfo = getCharacterInfo();
+        const userPersona = getUserPersona();
+        const targetMessage = chat[memoryTargetIndex];
+        const role = targetMessage.is_user ? 'USER' : 'AI';
+
+        // Load databases (Agent 3's existing-DB context).
+        const databases = await getAllDatabases();
+
+        // Gather up to agent3ContextMessages prior messages for richer context. Default = 2
+        // means the latest user + AI exchange (current behavior preserved). The target is
+        // passed separately, so exclude it from the prior window.
+        const agent3Count = Math.max(1, settings.agent3ContextMessages || 2);
+        const agent3StartIdx = Math.max(0, chat.length - agent3Count - 1);
+        const agent3PriorMessages = [];
+        for (let i = agent3StartIdx; i < chat.length; i++) {
+            if (i === memoryTargetIndex) continue;
+            if (chat[i] && chat[i].mes) {
+                agent3PriorMessages.push({ role: chat[i].is_user ? 'USER' : 'CHAR', text: chat[i].mes });
+            }
+        }
+        addDebugLog('info', `[${runId}] Agent 3 (post-reply) target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
+
+        const agent3ProfileId = getAgent3ProfileId(settings);
+        memoryResult = await runMemoryUpdater(
+            targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId,
+            !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex,
+        ).catch(err => ({ updates: [], summary: '', raw: '', error: err.message, tokensIn: 0, tokensOut: 0 }));
+
+        // Fold Agent 3's tokens into the session totals WITHOUT bumping the run count
+        // (the run was already counted on the blocking path) and update lastRunTokens.
+        addAgent3Tokens({ agent3Input: memoryResult?.tokensIn || 0, agent3Output: memoryResult?.tokensOut || 0 });
+
+        if (!memoryResult || memoryResult.error) {
+            if (memoryResult?.error) addDebugLog('fail', `[${runId}] Agent 3 error: ${memoryResult.error}`);
+            return;
+        }
+
+        // Always record what Agent 3 proposed (for the Last Generated tab).
+        setLastGenerated(memoryResult.updates || []);
+
+        // pipelineCancelled may have flipped (user clicked Stop) while we awaited the LLM.
+        if (pipelineCancelled) {
+            addDebugLog('info', `[${runId}] Cancelled mid-extraction — discarding ${memoryResult.updates.length} updates`);
+            setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
+            return;
+        }
+
+        // Character-changed guard: don't write to another character's attachments.
+        const liveCtx = SillyTavern.getContext();
+        const currentCharAvatar = liveCtx.characters?.[liveCtx.characterId]?.avatar || '';
+        if (currentCharAvatar !== capturedCharAvatar) {
+            addDebugLog('fail', `[${runId}] Character changed mid-extraction (${capturedCharAvatar} -> ${currentCharAvatar}) — discarding ${memoryResult.updates.length} updates`);
+            if (typeof toastr !== 'undefined') {
+                toastr.warning('BF Memory: extraction discarded — you switched characters');
+            }
+            setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
+            return;
+        }
+
+        // Last Inserted = only facts that actually changed stored state (NEW/UPDATED).
+        const committed = Array.isArray(memoryResult.applied)
+            ? memoryResult.applied
+            : (memoryResult.updates || []).filter(u => u.changed ?? u.wasNew).map(u => ({
+                ...u,
+                status: u.status || (u.wasNew ? 'NEW' : 'UPDATED'),
+            }));
+        addDebugLog('info', `[${runId}] Agent 3: ${memoryResult.updates.length} proposed, ${committed.length} committed. ${memoryResult.summary}`);
+        setLastInserted(committed);
+        for (const update of memoryResult.updates) trackUpdate(update);
+        lastProcessedMessageIndex = memoryTargetIndex;
+
+        // Mark the AI target + the user message (Agent 3 saw both) as processed so the
+        // per-message icon / "skip already processed" / our own re-extract gate honor it.
+        if (chat[memoryTargetIndex]) {
+            chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: true };
+        }
+        if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]) {
+            chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: true };
+        }
+        SillyTavern.getContext().saveChatDebounced?.();
+
+        // Review popup (deferred), capturing the chat id so it can't pop in the wrong chat.
+        if (tickMessageCounter(settings.reviewInterval || 10)) {
+            addDebugLog('info', `[${runId}] Review interval reached, will show popup shortly`);
+            const targetChatIdForPopup = SillyTavern.getContext().chatId;
+            setTimeout(async () => {
+                if (SillyTavern.getContext().chatId !== targetChatIdForPopup) {
+                    addDebugLog('info', 'Skipping review popup: chat changed since extraction finished');
+                    return;
+                }
+                await showReviewPopup(
+                    () => addDebugLog('info', 'User accepted all memory updates'),
+                    async (editedItems) => {
+                        addDebugLog('info', `User edited ${editedItems.length} items`);
+                        appendLastInserted(editedItems.map(i => ({ ...i, status: 'UPDATED' })));
+                        const dbs = await getAllDatabases();
+                        for (const item of editedItems) {
+                            if (!dbs[item.category]) dbs[item.category] = createEmptyDatabase(item.category);
+                            upsertFact(dbs[item.category], item);
+                            await saveDatabase(dbs[item.category]);
+                        }
+                    },
+                );
+            }, 2000);
+        }
+
+        // Persist to the captured DB profile slot (capture-at-write).
+        if (memoryResult.updates.length > 0) {
+            await saveCurrentToActiveProfile(capturedDbProfile);
+        }
+    } catch (err) {
+        // Graceful degradation: a memory-extraction failure must never break the next turn.
+        addDebugLog('fail', `[${runId}] Agent 3 (post-reply) failed (non-fatal): ${err.message || err}`);
+    } finally {
+        memoryExtractionInFlight = false;
+        isInternalCall = false;
+    }
 }
 
 /**
@@ -835,15 +932,19 @@ export function initPipeline() {
             return;
         }
 
-        // Swipe/regen: re-inject cached facts (no agents, instant)
-        // Skip if pipeline just injected in this same generation cycle (double-fire guard)
-        if (lastInjection && !isInternalCall && !data?.dryRun && !pipelineJustInjected) {
+        // Swipe/regen: re-inject cached facts (no agents, instant).
+        // FIX #8a: use the DRAFT-LESS cached injection (lastInjectionNoDraft) — the same
+        // scene + facts as the first roll, but WITHOUT Agent 1's stale draft scene-direction,
+        // which was planned for the original roll and would mis-steer a divergent re-roll.
+        // Skip if pipeline just injected in this same generation cycle (double-fire guard).
+        const swipeInjection = lastInjectionNoDraft || lastInjection;
+        if (swipeInjection && !isInternalCall && !data?.dryRun && !pipelineJustInjected) {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
 
-            const success = injectMemoryContext(data, lastInjection);
+            const success = injectMemoryContext(data, swipeInjection);
             if (success) {
-                addDebugLog('info', `Swipe/regen: re-injected cached facts (${lastInjection.length} chars)`);
+                addDebugLog('info', `Swipe/regen: re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
             }
         }
     });
@@ -856,13 +957,14 @@ export function initPipeline() {
             return;
         }
 
-        // Swipe/regen: re-inject cached facts
-        if (lastInjection && data && typeof data.prompt === 'string') {
+        // Swipe/regen: re-inject cached facts (FIX #8a: draft-less variant).
+        const swipeInjection = lastInjectionNoDraft || lastInjection;
+        if (swipeInjection && data && typeof data.prompt === 'string') {
             const settings = getSettings();
             if (!settings || !settings.enabled) return;
 
-            data.prompt = lastInjection + '\n\n' + data.prompt;
-            addDebugLog('info', `Swipe/regen (text): re-injected cached facts (${lastInjection.length} chars)`);
+            data.prompt = swipeInjection + '\n\n' + data.prompt;
+            addDebugLog('info', `Swipe/regen (text): re-injected cached facts without stale draft (${swipeInjection.length} chars)`);
         }
     });
 
@@ -893,8 +995,17 @@ export function initPipeline() {
         // One run = one input record = one output attribution. Disarm until the next run.
         runRecordedInput = false;
 
-        // Reflection / consolidation: now that the reply has landed, run an armed pass
-        // off the latency-critical path. Fully self-guarded + try/catch'd internally.
+        // Phase 3b: Agent 3 (memory extraction about the just-completed exchange) now runs
+        // HERE, off the latency-critical pre-generation path. The AI reply has landed (and
+        // any accepted swipe IS the message's current text), so we extract the real accepted
+        // content. Fully self-guarded + try/catch'd internally — a failure can't break the
+        // turn. Awaited before reflection so the two post-reply LLM passes don't race on the
+        // shared isInternalCall flag (both are off the critical path; serializing is safe).
+        await runMemoryExtraction();
+
+        // Reflection / consolidation: now that the reply has landed (and extraction has
+        // committed its facts), run an armed pass off the latency-critical path. Fully
+        // self-guarded + try/catch'd internally.
         maybeRunReflection();
     });
 
@@ -960,6 +1071,18 @@ export function initPipeline() {
             SillyTavern.getContext().saveChatDebounced?.();
         }
         addDebugLog('info', `Message swiped (idx ${swipedIdx}) — reset trigger indices, cleared bf_mem_processed`);
+
+        // FIX #8b: schedule a debounced settle-extraction. If a generation follows (a NEW
+        // swipe), MESSAGE_RECEIVED extracts + marks bf_mem_processed before this fires, so
+        // runMemoryExtraction's own gate makes this a no-op. If the user instead navigated
+        // onto an existing swipe and stopped, this fires after the quiet window and extracts
+        // the settled content. Rapid navigation keeps resetting the timer (only the last
+        // settled swipe extracts). Fully guarded inside runMemoryExtraction (try/catch).
+        if (swipeSettleTimer) clearTimeout(swipeSettleTimer);
+        swipeSettleTimer = setTimeout(() => {
+            swipeSettleTimer = null;
+            runMemoryExtraction();
+        }, 1800);
     });
 
     // Reset on chat change
@@ -967,7 +1090,10 @@ export function initPipeline() {
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
         lastInjection = null;
+        lastInjectionNoDraft = null;
         pipelineJustInjected = false;
+        // Drop any pending swipe-settle extraction so it can't fire against the new chat.
+        if (swipeSettleTimer) { clearTimeout(swipeSettleTimer); swipeSettleTimer = null; }
         groupSkipToastShown = false;
         chatChangedAt = Date.now();
         // Reflection cadence is per-chat: reset the counter and drop any armed pass so a

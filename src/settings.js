@@ -528,6 +528,26 @@ export function setRunTokens(run) {
     renderTokens();
 }
 
+// Called by pipeline.js MESSAGE_RECEIVED handler once Agent 3 (memory extraction)
+// runs off the blocking path. Agent 3 no longer participates in the pre-generation
+// setRunTokens call, so its input/output tokens are folded into the session totals
+// here WITHOUT bumping the run count (the run was already counted on the blocking
+// path) and WITHOUT touching baseline/actual input. Also stamps the figures onto
+// lastRunTokens so the per-run breakdown still shows the Agent 3 line.
+export function addAgent3Tokens({ agent3Input = 0, agent3Output = 0 } = {}) {
+    const inN = Number(agent3Input) || 0;
+    const outN = Number(agent3Output) || 0;
+    if (!inN && !outN) return;
+    sessionTokens.agentInput += inN;
+    sessionTokens.agentOutput += outN;
+    if (lastRunTokens) {
+        lastRunTokens.agent3Input = (Number(lastRunTokens.agent3Input) || 0) + inN;
+        lastRunTokens.agent3Output = (Number(lastRunTokens.agent3Output) || 0) + outN;
+    }
+    saveTokensToMeta();
+    renderTokens();
+}
+
 // Called by pipeline.js MESSAGE_RECEIVED handler when the main reply lands.
 export function setMainOutputTokens(n) {
     const out = Number(n) || 0;
