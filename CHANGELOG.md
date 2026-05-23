@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.11.0] - 2026-05-23
+
+### Fixed — 10 issues surfaced by a long real-session bug report
+Each issue was diagnosed by an independent investigation pass, then fixed.
+
+**Reliability**
+- **Agent 3 silently stopped mid-session.** The trigger gate relied on a monotonic `lastTriggeredUserMsgIndex` that never rewound on swipe/Stop, so once it got ahead it permanently skipped every later turn. Now gated on the per-message `bf_mem_processed` flag (source of truth), with a shared `findMemoryTargetIndex()` and a new `MESSAGE_SWIPED` handler that rewinds indices and clears the stale flag. ([src/pipeline.js](src/pipeline.js))
+- **Sticky cancel flag.** `pipelineCancelled` is now reset on `MESSAGE_RECEIVED`, so a Stop on one turn can't poison later turns.
+- **Token counter desync.** `setRunTokens` (input) only ran on the happy path while `setMainOutputTokens` (output) fired on every reply incl. swipes. Token recording now runs even on the cancelled/early-return path (wrapped in try/catch via `recordRunTokens`), and output is gated on a per-cycle `runRecordedInput` flag. `setRunTokens`/`setMainOutputTokens` are hardened against NaN and skip empty runs. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+
+**Memory quality**
+- **Source attribution off-by-one.** Facts were stamped with the AI message index even when disclosed in the user turn. Added an optional `@src:user|char` tag to the Agent 3 grammar; user-sourced facts now attribute to the user message index, char/untagged to the AI target. Live and backfill/icon paths now index identically (backward-compatible when the tag is absent). ([src/agent-memory.js](src/agent-memory.js), [src/pipeline.js](src/pipeline.js))
+- **Missed / contradictory facts.** (a) Agent 3 context window default raised 2 → 5 so long single-message backstory reveals fit. (b) Memory prompt's omission bias relaxed — higher cap on dense turns, short clauses allowed for genuine backstory, "skip when uncertain" softened to capture clearly-stated reveals. (c) `upsertFact` now reconciles on write: on exact-key miss it conservatively matches a normalized-key variant and updates in place instead of minting a parallel contradictory key. ([src/settings.js](src/settings.js), [src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js))
+- **Silent fact eviction.** `MAX_FACTS_PER_DB` (50) eviction was dropping facts with only a `console.warn`, so late-session facts vanished from exports with no trace. Eviction now logs to the debug panel (count + category + keys). Cap value unchanged — raising it is a deliberate token-cost decision. ([src/database.js](src/database.js))
+
+**UI / reporting**
+- **"Last Generated" == "Last Inserted".** Both panels were fed the same proposed array. `applyUpdates` now classifies each write NEW/UPDATED/SKIPPED and returns the committed subset (`.applied`); Last Generated keeps the full proposed set, Last Inserted shows only what actually changed. ([src/agent-memory.js](src/agent-memory.js), [src/pipeline.js](src/pipeline.js))
+- **Backfill didn't populate "Last Generated."** `runAgent3OnFullChat` now accumulates per-message results and calls `setLastGenerated`/`setLastInserted` at the end. ([src/settings.js](src/settings.js))
+- **Debug log didn't survive reload.** `chat_metadata.bf_mem_log` was saved via the debounced `saveMetadata`, so rapid entries superseded each other and only ~2 reached disk. Added a guaranteed synchronous flush on `beforeunload` (`flushDebugLogNow`) plus a throttled immediate chat save (≤ once / 5s). ([src/settings.js](src/settings.js))
+- **Incomplete debug log.** Added a consolidated per-run SUMMARY entry (runId, duration, Agent 1 ok/failed, Agent 3 NEW/UPDATED/SKIPPED, full token breakdown). Enable/disable state changes are now logged (incl. the corrupt-settings reset and validation coercion that could silently flip `enabled` off). `MAX_DEBUG_ENTRIES` raised 200 → 500. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+
+**Cost**
+- **Full-chat backfill API cost.** Confirmed `skipAlreadyProcessed` defaults ON and short-circuits *before* the LLM call; added a trivially-empty-message pre-filter (empty/whitespace, < 15 visible chars, pure-OOC) so no call is spent on zero-fact messages; the confirm dialog now shows an estimate of how many LLM calls the run will make. (True multi-message batching deferred — it would change the Agent 3 output contract.) ([src/settings.js](src/settings.js))
+
 ## [0.10.0] - 2026-05-17
 
 ### Changed — settings reorganized into per-agent tabs
