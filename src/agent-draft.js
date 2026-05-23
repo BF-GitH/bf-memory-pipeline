@@ -20,7 +20,10 @@ OUTPUT FORMAT (follow exactly):
 [Write 1-3 sentences describing what the character would do/say. Include the emotional tone and any actions.]
 
 #Branches:
-[One branch per line, chosen FROM THE MEMORY MENU below. The menu is organized in TWO layers: a \`Category\` (the domain, e.g. \`People\`, \`Places\`, \`Events\`) and, under it, an \`aspect\` (a sub-bucket, e.g. \`identity\`, \`appearance\`, \`status\`). A branch is either a whole \`Category\` (e.g. \`People\`) or a precise \`Category/aspect\` (e.g. \`People/appearance\`, \`Places/feature\`). A specific CHARACTER is NOT a branch — facts about a person live across many categories/aspects, so pick the aspects that matter (e.g. for who someone is, pick \`People/identity\`; for current state, \`People/status\`). Pick the branches whose contents matter for the CURRENT moment — the people/places present, active goals, and anything the chat refers to even by PARAPHRASE. Prefer \`Category/aspect\` precision; fall back to the whole \`Category\` when unsure. A second agent will then read the full facts under the branches you pick, so pick generously enough to cover the moment but skip aspects not relevant right now. If nothing is relevant, output a single line: none]
+[One branch per line, chosen FROM THE MEMORY MENU below. The menu is organized in TWO layers: a \`Category\` (the domain, e.g. \`People\`, \`Places\`, \`Events\`) and, under it, an \`aspect\` (a sub-bucket, e.g. \`identity\`, \`appearance\`, \`status\`). A branch is either a whole \`Category\` (e.g. \`People\`) or a precise \`Category/aspect\` (e.g. \`People/appearance\`, \`Places/feature\`). A specific CHARACTER is NOT a branch — facts about a person live across many categories/aspects, so pick the ASPECTS that matter (e.g. for who someone is, pick \`People/identity\`; for current state, \`People/status\`). To bound WHICH characters' facts get pulled, name them in #Focus below (not here). Pick the branches whose contents matter for the CURRENT moment — the people/places present, active goals, and anything the chat refers to even by PARAPHRASE. Prefer \`Category/aspect\` precision; fall back to the whole \`Category\` when unsure. A second agent will then read the full facts under the branches you pick, so pick generously enough to cover the moment but skip aspects not relevant right now. If nothing is relevant, output a single line: none]
+
+#Focus:
+[OPTIONAL. Comma-separated names of the CHARACTER(S) (and/or {{user}}, {{char}}) currently in focus this moment — who the reply is really about. This does NOT change your #Branches (those stay Category/aspect); it lets the detail step keep facts about THESE people (plus general/world facts) and skip facts about OTHER, unrelated characters living in the same aspects — saving effort. Leave empty if it's a general/world moment with no particular person in focus.]
 
 #Needed_Facts:
 [Optional fallback keywords for the deterministic search, used only if the detail step is unavailable. Semicolon-separated. May include exact \`Category/key\` entries, or a few free-text keywords (e.g. <NAME> appearance) for things NOT yet stored. May be left empty.]
@@ -38,6 +41,7 @@ RULES:
 - Keep the draft SHORT - just the idea, not the full response
 - Pick branches from the MEMORY MENU that cover the people/places present and active threads — match paraphrases in the scene to the right Category/aspect. This is your most important job.
 - Prefer \`Category/aspect\` precision; use a whole \`Category\` only when the relevant aspect is unclear.
+- Use #Focus to name who the moment is about so unrelated characters' facts in the same aspects are skipped; leave it empty for a general/world moment.
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting
@@ -71,7 +75,7 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 1 (Draft) error:', error);
-        return { draft: '', branches: [], neededFacts: [], nextHint: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
+        return { draft: '', branches: [], focus: [], neededFacts: [], nextHint: [], scene: null, raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
     }
 }
 
@@ -92,10 +96,10 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
     if (userPersona) {
         dataParts.push(`## User Persona\n${userPersona}`);
     }
-    // STAGE 1 MENU (KIND×SUBJECT map, counts, no values). Agent 1 picks #Branches from
+    // STAGE 1 MENU (Category × aspect map, counts, no values). Agent 1 picks #Branches from
     // this; a second agent then reads the full facts under the picked branches.
     if (menu && menu.trim()) {
-        dataParts.push(`## Memory Menu (pick #Branches from these — Category or Category/subject)\n${menu.trim()}`);
+        dataParts.push(`## Memory Menu (pick #Branches from these — Category or Category/aspect)\n${menu.trim()}`);
     }
     // Existing-fact inventory (Category/key only). Kept for the #Needed_Facts fallback
     // path so deterministic retrieval can still resolve exact keys by identity.
@@ -103,7 +107,7 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
         dataParts.push(`## Existing Fact Keys (for #Needed_Facts fallback — exact Category/key)\n${factInventory.trim()}`);
     }
     dataParts.push(`## Recent Chat\n${recentChat}`);
-    dataParts.push('\nNow output ONLY the #Draft:, #Branches:, #Needed_Facts:, #NextHint:, and #Scene: sections.');
+    dataParts.push('\nNow output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, and #Scene: sections.');
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }
@@ -116,7 +120,8 @@ function buildDraftPrompt(recentChat, characterInfo, userPersona, factInventory 
 function parseDraftResult(response) {
     const result = {
         draft: '',
-        branches: [], // STAGE 1 picks: `Category` or `Category/subject` strings
+        branches: [], // STAGE 1 picks: `Category` or `Category/aspect` strings (character-agnostic)
+        focus: [], // OPTIONAL focus character(s) for the tag-filter (3-layer model); never a branch
         neededFacts: [],
         nextHint: [], // refinement #11: backstage breadcrumb of topics likely relevant next scene
         scene: null, // optional #SCENE parse: { location, present[], goals[], newBeats[] }
@@ -130,21 +135,35 @@ function parseDraftResult(response) {
     }
 
     // Extract draft section (bounded before any later section so it doesn't swallow them)
-    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Branches|#Needed_Facts|#Needed Facts|#Scene|$)/i);
+    const draftMatch = response.match(/#Draft:?\s*([\s\S]*?)(?=#Branches|#Focus|#Needed_Facts|#Needed Facts|#Scene|$)/i);
     if (draftMatch) {
         result.draft = draftMatch[1].trim();
     }
 
-    // Extract #Branches section (STAGE 1 menu picks). Bounded before #Needed_Facts/#Scene.
+    // Extract #Branches section (STAGE 1 menu picks). Bounded before #Focus/#Needed_Facts/#Scene.
     // One branch per line; tolerate bullets/commas/semicolons. Drop bracketed placeholders
-    // and a lone "none". Keep the `Category` or `Category/subject` token verbatim —
-    // collectBranchFacts normalizes punctuation/case downstream.
-    const branchesMatch = response.match(/#Branches:?\s*([\s\S]*?)(?=#Needed[_ ]Facts|#Scene|$)/i);
+    // and a lone "none". Keep the `Category` or `Category/aspect` token verbatim (the menu axis
+    // is now Layer-1/Layer-2, character-agnostic) — collectBranchFacts normalizes punctuation/
+    // case downstream. A focus CHARACTER is captured separately in #Focus, never as a branch.
+    const branchesMatch = response.match(/#Branches:?\s*([\s\S]*?)(?=#Focus|#Needed[_ ]Facts|#Scene|$)/i);
     if (branchesMatch) {
         result.branches = branchesMatch[1]
             .split(/[;\n,]+/)
             .map(b => b.replace(/^[\s\-*•\d.)\]]+/, '').trim())
             .filter(b => b.length > 0 && !/^\[.*\]$/.test(b) && !/^(none|n\/a|unknown|tbd)$/i.test(b));
+    }
+
+    // Extract OPTIONAL #Focus section (3-layer model): the character(s) currently in focus.
+    // Used ONLY by the finder candidate gather as a CHARACTER-TAG filter (keep facts whose
+    // `involved`/`subject` includes a focus character, plus untagged general/world facts) — it
+    // is NOT a branch and never changes which categories/aspects are read. Bounded before
+    // #Needed_Facts/#NextHint/#Scene. Same tolerant split as branches; drop placeholders/"none".
+    const focusMatch = response.match(/#Focus:?\s*([\s\S]*?)(?=#Needed[_ ]Facts|#Next[_ ]?Hint|#Scene|$)/i);
+    if (focusMatch) {
+        result.focus = focusMatch[1]
+            .split(/[;\n,]+/)
+            .map(f => f.replace(/^[\s\-*•\d.)\]]+/, '').replace(/^@/, '').trim())
+            .filter(f => f.length > 0 && !/^\[.*\]$/.test(f) && !/^(none|n\/a|unknown|tbd|general|world)$/i.test(f));
     }
 
     // Extract needed facts section (bounded before #NextHint/#Scene so it doesn't swallow them)
@@ -226,7 +245,8 @@ function parseSceneBlock(response) {
 /**
  * @typedef {Object} DraftResult
  * @property {string} draft - The draft reply idea
- * @property {string[]} branches - STAGE 1 menu picks (`Category` or `Category/subject`)
+ * @property {string[]} branches - STAGE 1 menu picks (`Category` or `Category/aspect`, character-agnostic)
+ * @property {string[]} focus - OPTIONAL focus character name(s) for the finder's character-tag filter (3-layer model). Empty for a general/world moment. Never a branch.
  * @property {string[]} neededFacts - List of fact categories/keywords to look up
  * @property {string[]} nextHint - Backstage breadcrumb: topics likely relevant next scene (refinement #11). Stored in message.extra, never injected/shown.
  * @property {{location:string, present:string[], goals:string[], newBeats:string[]}|null} scene - Optional parsed #Scene block (null if absent)

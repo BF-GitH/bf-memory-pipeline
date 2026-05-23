@@ -142,8 +142,8 @@ function parseFinderResult(response, candidates, maxFacts) {
     const byId = new Map();
     for (const c of candidates) {
         byId.set(`${norm(c.category)}/${norm(c.fact.key)}`, c);
-        // Also index by subject path so a `Category/subject` line still resolves usefully
-        // (maps to nothing specific — we keep exact key resolution primary; subject handled below).
+        // Non-leaf picks (`Category/aspect`, or a back-compat `Category/subject`) are resolved
+        // below by matching deriveAspect/deriveSubject, not via this exact-key index.
     }
 
     // Isolate the #Facts: block (tolerant of label variants); fall back to whole text.

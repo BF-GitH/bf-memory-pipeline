@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './ag
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, getReflection, reloadEntitiesUI } from './settings.js';
@@ -55,6 +55,50 @@ let entityCheckInFlight = false;
 // extracts and marks bf_mem_processed first — making this debounced fire a guarded no-op
 // (no double-extract). Cleared on chat change.
 let swipeSettleTimer = null;
+
+/**
+ * CHARACTER-TAG FILTER for the Stage-2 finder candidate gather (3-layer model). The branch
+ * picks Agent 1 makes are character-AGNOSTIC (`Category` / `Category/aspect`), so
+ * collectBranchFacts hands back EVERY character's facts living in those aspects. That is the
+ * cost this model exists to avoid: when Agent 1 named the focus character(s) in #Focus, we
+ * narrow the candidates to facts that actually concern those people PLUS general/world facts,
+ * and drop facts tagged to OTHER, unrelated characters in the same aspect.
+ *
+ * Keep a candidate when ANY holds:
+ *   - no focus characters were named (general moment) — keep everything (no narrowing);
+ *   - the fact is in the Unsorted catch-all (always kept, per the model);
+ *   - the fact is NOT character-scoped (place/event/world facts are general context: a place
+ *     or event must stay recallable independent of any character — see link-following);
+ *   - the fact carries NO character tag (empty `involved` AND no character `subject`) — a
+ *     general/shared fact with no specific owner;
+ *   - the fact's `involved` participants OR its `subject` include a focus character.
+ * Otherwise (a character-scoped fact owned by / about ONLY non-focus characters) drop it.
+ *
+ * Names are compared case-insensitively; `involved` holds clean names (the `@` sigil is
+ * stripped at write time) and #Focus names have any leading `@` stripped at parse time.
+ * @param {Array<{fact: Object, category: string}>} candidates
+ * @param {string[]} focus - focus character names from Agent 1's #Focus (may be empty)
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+function filterCandidatesByFocus(candidates, focus) {
+    const focusSet = new Set((focus || []).map(f => String(f || '').trim().toLowerCase()).filter(Boolean));
+    if (focusSet.size === 0) return candidates; // general moment — no character narrowing
+    return candidates.filter(({ fact, category }) => {
+        if (String(category || '').toLowerCase() === 'unsorted') return true; // catch-all always kept
+        // Place/event/world facts are general context, not owned by a single character.
+        if (deriveScope(fact) !== 'character') return true;
+        const involved = Array.isArray(fact.involved)
+            ? fact.involved.map(p => String(p || '').trim().toLowerCase()).filter(Boolean)
+            : [];
+        const subject = deriveSubject(fact); // already lowercased
+        // No character tag at all -> general/shared fact, keep it.
+        if (involved.length === 0 && !subject) return true;
+        // Keep when any participant or the subject is one of the focus characters.
+        if (subject && focusSet.has(subject)) return true;
+        for (const p of involved) if (focusSet.has(p)) return true;
+        return false; // character-scoped fact about ONLY non-focus characters -> drop
+    });
+}
 
 /**
  * Count tokens for a chat-completion message array (role wrappers included).
@@ -428,7 +472,7 @@ async function runPipelineInline(data) {
     // Compact keys-only inventory (Category/key, no values) — kept for the #Needed_Facts
     // fallback path so deterministic retrieval can resolve exact keys by identity.
     const factInventory = summarizeKeys(databases);
-    // STAGE 1 menu: compact KIND×SUBJECT map (counts, NO values) Agent 1 picks branches from.
+    // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
     const factMenu = summarizeMenu(databases);
     addDebugLog('info', `Fact inventory for Agent 1: ${factInventory ? factInventory.split('\n').length + ' keys' : 'empty'}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
@@ -470,15 +514,17 @@ async function runPipelineInline(data) {
     // the retrieved facts with no draft. Memory > nothing.
     if (!draftResult || draftResult.error) {
         addDebugLog('fail', `Agent 1 error: ${draftResult?.error || 'no result'} — continuing with facts only (no draft)`);
-        draftResult = { draft: '', branches: [], neededFacts: [], scene: null, raw: '' };
+        draftResult = { draft: '', branches: [], focus: [], neededFacts: [], scene: null, raw: '' };
     }
-    // Older Agent 1 result shapes (or partial parses) may lack branches/neededFacts/nextHint.
+    // Older Agent 1 result shapes (or partial parses) may lack branches/focus/neededFacts/nextHint.
     if (!Array.isArray(draftResult.branches)) draftResult.branches = [];
+    if (!Array.isArray(draftResult.focus)) draftResult.focus = [];
     if (!Array.isArray(draftResult.neededFacts)) draftResult.neededFacts = [];
     if (!Array.isArray(draftResult.nextHint)) draftResult.nextHint = [];
 
     addDebugLog('info', `Agent 1 done: "${draftResult.draft.substring(0, 80)}..."`);
     addDebugLog('info', `Branches picked: ${draftResult.branches.join('; ') || '(none)'}`);
+    addDebugLog('info', `Focus character(s): ${draftResult.focus.join(', ') || '(none — general moment)'}`);
     addDebugLog('info', `Needed facts (fallback): ${draftResult.neededFacts.join('; ')}`);
 
     // --- Scene card: persist Agent 1's #SCENE parse (no extra LLM call) ---
@@ -564,8 +610,14 @@ async function runPipelineInline(data) {
     if (wantFinder) {
         // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
         // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
-        // Visibility-filter defensively (the finder must never see a hidden fact).
-        const candidatesAll = collectBranchFacts(databases, draftResult.branches);
+        const branchFacts = collectBranchFacts(databases, draftResult.branches);
+        // CHARACTER-TAG FILTER (3-layer model): branches are character-agnostic, so the gather
+        // above returns EVERY character's facts in those aspects. When Agent 1 named the focus
+        // character(s), narrow to facts about THEM plus general/world facts and DROP unrelated
+        // characters' facts — the whole point of the model (bounded by character relevance,
+        // saving tokens). Applied BEFORE link-following so place⇄event⇄people expansion can
+        // still surface the linked people of an in-scope event. No focus = no narrowing.
+        const candidatesAll = filterCandidatesByFocus(branchFacts, draftResult.focus);
         // LINK-FOLLOWING (Phase 4b): when Agent 1 picks a PLACE/person branch, surface the
         // linked events (and an event's place+people) to the finder too, so the same
         // scope-graph traversal that helps deterministic retrieval also benefits the finder.
@@ -573,7 +625,7 @@ async function runPipelineInline(data) {
         const branchSeen = new Set(candidatesAll.map(({ fact, category }) => `${category}:${fact.key}`));
         expandLinks(databases, candidatesAll, branchSeen);
         const candidates = candidatesAll.filter(({ fact }) => isFactVisible(fact));
-        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted (incl. link expansion)`);
+        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion)`);
         try {
             const finder = await runFinderAgent({
                 candidates,
