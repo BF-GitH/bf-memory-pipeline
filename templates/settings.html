@@ -81,6 +81,32 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Drafter system prompt..."></textarea>
                         <small class="bf-mem-hint">Tells the Drafter how to plan a reply and list needed facts.</small>
+                        <details id="bf_mem_drafter_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message. At runtime a <b>USER</b> message is built and appended from live data. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Drafter prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Memory Menu (pick #Branches from these — Category or Category/aspect)
+<span class="bf-mem-asm-ph">{live Category × aspect menu w/ counts}</span>
+
+## Existing Fact Keys (for #Needed_Facts fallback — exact Category/key)
+<span class="bf-mem-asm-ph">{compact key inventory — ONLY when the Librarian is OFF}</span>
+
+## Recent Chat
+<span class="bf-mem-asm-ph">{last N messages — "Context Messages" above}</span>
+
+Now output ONLY the #Draft:, #Branches:, #Focus:, #Needed_Facts:, #NextHint:, and #Scene: sections.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty.</p>
+                            </div>
+                        </details>
                     </div>
                 </div>
             </div>
@@ -115,6 +141,32 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Librarian system prompt..."></textarea>
                         <small class="bf-mem-hint">Tells the Librarian how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
+                        <details id="bf_mem_librarian_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message. At runtime a <b>USER</b> message is built from the Drafter's draft, recent chat, and the candidate facts under the picked branches. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Librarian prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Scene Direction (draft of next reply)
+<span class="bf-mem-asm-ph">{the Drafter's #Draft}</span>
+
+## Recent Chat
+<span class="bf-mem-asm-ph">{last 2 messages}</span>
+
+## Candidate Facts (choose from these, by Category/key)
+<span class="bf-mem-asm-ph">{full facts under the Drafter's picked branches + all Unsorted, as Category/key = value}</span>
+
+Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Category/key identifiers.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty.</p>
+                            </div>
+                        </details>
                     </div>
                 </div>
             </div>
@@ -169,6 +221,23 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_writer_format" class="bf-mem-textarea" rows="6" placeholder="Writer injection header/footer..."></textarea>
                         <small class="bf-mem-hint">Template wrapping the facts injected into the main model's prompt. Use {draft} and {facts} placeholders.</small>
+                        <details id="bf_mem_writer_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>Unlike the other agents, the Writer prompt is NOT replaced. The template above is <b>INJECTED</b> as a system message into your main model's existing context (right before the last user message). That context ALREADY contains:</p>
+<pre><span class="bf-mem-asm-ph">{SillyTavern active system prompt}</span>
+<span class="bf-mem-asm-ph">{character card}</span>
+<span class="bf-mem-asm-ph">{your persona}</span>
+<span class="bf-mem-asm-ph">{full chat history}</span>   (or last N msgs if "Context Limit" &gt; 0)</pre>
+                                <p>and we ADD the injected block below (built from the template above, filling {facts} and {draft}). The scene card, when "Inject live scene card" is on, is prepended ABOVE the template:</p>
+<pre><span class="bf-mem-asm-label">[INJECTED system message]</span>
+[Scene] Location: … | Present: … | Goal: … | Recently: …   <span class="bf-mem-asm-ph">(scene card, only if enabled)</span>
+
+<span class="bf-mem-asm-ph">{your Writer Injection Format template above, with:}</span>
+  {facts}  → <span class="bf-mem-asm-ph">the Librarian's / retrieval's chosen facts</span>
+  {draft}  → <span class="bf-mem-asm-ph">the Drafter's #Draft (scene direction)</span></pre>
+                            </div>
+                        </details>
                     </div>
                 </div>
             </div>
@@ -200,6 +269,30 @@
                     <div class="bf-mem-section-body">
                         <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
                         <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
+                        <details id="bf_mem_scribe_assembly" class="bf-mem-assembly">
+                            <summary>What actually gets sent (assembly order)</summary>
+                            <div class="bf-mem-assembly-body">
+                                <p>The prompt field above is only the <b>SYSTEM</b> message ({{user}}/{{char}} macros resolved). At runtime a <b>USER</b> message is built from the live data and the messages to analyze. The full call looks like:</p>
+<pre><span class="bf-mem-asm-label">[SYSTEM]</span> your Scribe prompt above
+
+<span class="bf-mem-asm-label">[USER]</span>
+## Character Info ({{char}})
+<span class="bf-mem-asm-ph">{character card}</span>
+
+## User Persona ({{user}})
+<span class="bf-mem-asm-ph">{your persona}</span>
+
+## Existing Databases
+<span class="bf-mem-asm-ph">{full DB summary — every active fact as Category/key = value}</span>
+
+## Messages to Analyze
+[USER:{{user}}] <span class="bf-mem-asm-ph">{the user message}</span>
+[CHAR:{{char}}] <span class="bf-mem-asm-ph">{the AI reply}</span>
+
+Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
+                                <p>Each <code>##</code> section is omitted if its data is empty. "Context Messages" above sets how many recent messages appear in the analyzed block.</p>
+                            </div>
+                        </details>
                     </div>
                 </div>
                 <div class="bf-mem-section">
