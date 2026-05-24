@@ -1597,6 +1597,141 @@ async function deleteAttachmentFile(url) {
     }
 }
 
+// =============================================================================
+// DEBUG-LOG FILE (persistent verbose firehose). The verbose debug log is far too
+// large for chat_metadata (which round-trips into the chat .jsonl), so the FULL
+// buffer — including verbose entries — is persisted to its OWN character-attachment
+// file, REUSING the exact same attachment infrastructure the fact DBs use
+// (uploadFileAttachment to write, fetch() to read, deleteFileFromServer to replace).
+//
+// SCOPING: ST attachments are stored per-CHARACTER-AVATAR, but the debug log is
+// per-CHAT, so the filename embeds a sanitized chatId — each chat gets its own log
+// file under the character's attachment list. A character with N chats accumulates
+// N log files (single-file-per-chat, overwritten in place like saveDatabase).
+//
+// COST NOTE: like saveDatabase, every write RE-UPLOADS the whole file (ST has no
+// append API). settings.js therefore THROTTLES writes (not per-entry) and only
+// flushes on a throttled cadence + beforeunload. The byte/entry cap there bounds the
+// re-upload size.
+// =============================================================================
+
+const DEBUGLOG_PREFIX = 'bf_mem_debuglog_';
+
+/** Sanitize a chatId into a filesystem-safe token (mirrors saveDatabase's category sanitizer). */
+function safeChatToken(chatId) {
+    return String(chatId || 'default').toLowerCase().replace(/[^a-z0-9]/g, '_').slice(0, 80) || 'default';
+}
+
+/** The attachment file name for a chat's debug log. */
+function debugLogFileName(chatId) {
+    return `${DEBUGLOG_PREFIX}${safeChatToken(chatId)}.json`;
+}
+
+/**
+ * Read the persisted debug-log file for a chat back into a plain array of entries.
+ * Returns [] when there is no file (new chat), the character has no avatar, or any
+ * fetch/parse error — file I/O must NEVER throw into the pipeline.
+ * @param {string} chatId
+ * @returns {Promise<Array>}
+ */
+export async function loadDebugLogFile(chatId) {
+    try {
+        const avatar = getCharacterAvatar();
+        if (!avatar) return [];
+        const context = getContext();
+        const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
+        const fileName = debugLogFileName(chatId);
+        const attachment = attachments.find(a => a.name === fileName);
+        if (!attachment) return []; // new chat — no file yet (back-compat / missing-file path)
+        const content = await fetchAttachmentContent(attachment.url);
+        if (!content) return [];
+        const parsed = JSON.parse(content);
+        // File shape: { v, chatId, savedAt, entries: [...] }. Tolerate a bare array too.
+        const entries = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.entries) ? parsed.entries : []);
+        return entries.filter(e => e && typeof e === 'object' && typeof e.message === 'string');
+    } catch (e) {
+        console.error('[BFMemory] Failed to load debug-log file', e);
+        return [];
+    }
+}
+
+/**
+ * Persist the FULL debug-log buffer (incl. verbose) to the chat's own attachment file,
+ * overwriting any existing file (single-file overwrite, exactly like saveDatabase).
+ * Wrapped end-to-end in try/catch — a failed upload must never break the pipeline or
+ * lose the in-RAM buffer.
+ * @param {string} chatId
+ * @param {Array} entries - the full RAM ring buffer (newest-first), already capped by caller
+ * @returns {Promise<boolean>} true on a successful upload
+ */
+export async function saveDebugLogFile(chatId, entries) {
+    try {
+        const avatar = getCharacterAvatar();
+        if (!avatar) return false; // no character — nothing to attach to (stays in RAM)
+
+        const fileName = debugLogFileName(chatId);
+        const payload = {
+            v: 1,
+            chatId: String(chatId || ''),
+            savedAt: Date.now(),
+            entries: Array.isArray(entries) ? entries : [],
+        };
+        const content = JSON.stringify(payload);
+        const base64Data = btoa(unescape(encodeURIComponent(content)));
+
+        const context = getContext();
+        const extensionSettings = context.extensionSettings;
+        if (!extensionSettings.character_attachments) extensionSettings.character_attachments = {};
+        if (!extensionSettings.character_attachments[avatar]) extensionSettings.character_attachments[avatar] = [];
+        const attachments = extensionSettings.character_attachments[avatar];
+
+        // Remove existing log file for this chat (overwrite-in-place).
+        const existingIdx = attachments.findIndex(a => a.name === fileName);
+        if (existingIdx >= 0) {
+            try { await deleteAttachmentFile(attachments[existingIdx].url); } catch { /* ignore */ }
+            attachments.splice(existingIdx, 1);
+        }
+
+        const { uploadFileAttachment } = await import('../../../../chats.js');
+        const uniqueName = `${Date.now()}_${fileName}`;
+        const fileUrl = await uploadFileAttachment(uniqueName, base64Data);
+        if (!fileUrl) return false;
+
+        attachments.push({ url: fileUrl, size: content.length, name: fileName, created: Date.now() });
+
+        if (context.saveSettingsDebounced) {
+            context.saveSettingsDebounced();
+            if (typeof context.saveSettingsDebounced.flush === 'function') context.saveSettingsDebounced.flush();
+        }
+        return true;
+    } catch (e) {
+        console.error('[BFMemory] Failed to save debug-log file', e);
+        return false;
+    }
+}
+
+/**
+ * Delete a chat's debug-log file (used by "clear logs"). Best-effort; never throws.
+ * @param {string} chatId
+ */
+export async function deleteDebugLogFile(chatId) {
+    try {
+        const avatar = getCharacterAvatar();
+        if (!avatar) return;
+        const context = getContext();
+        const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
+        const fileName = debugLogFileName(chatId);
+        const idx = attachments.findIndex(a => a.name === fileName);
+        if (idx >= 0) {
+            try { await deleteAttachmentFile(attachments[idx].url); } catch { /* ignore */ }
+            attachments.splice(idx, 1);
+            context.saveSettingsDebounced?.();
+        }
+    } catch (e) {
+        console.error('[BFMemory] Failed to delete debug-log file', e);
+    }
+}
+
 /**
  * @typedef {Object} DatabaseSchema
  * @property {string} category - Database category name

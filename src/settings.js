@@ -341,6 +341,21 @@ const LOG_META_KEY = 'bf_mem_log';
 const LOG_FLUSH_THROTTLE_MS = 5000;
 let lastLogFlushAt = 0;
 
+// --- Persistent debug-log FILE (full firehose, incl. verbose) ---
+// The chat_metadata slice above stays small & verbose-STRIPPED for instant load; the FULL
+// RAM ring buffer (incl. verbose) is ALSO mirrored to a dedicated per-chat attachment file
+// (bf_mem_debuglog_<chatId>.json) via database.js, reusing the fact-DB attachment infra.
+// That re-uploads the whole file each write (ST has no append), so we THROTTLE it on the
+// same cadence as the metadata flush and only force it on beforeunload.
+const LOG_FILE_FLUSH_THROTTLE_MS = 15000; // file write is heavier than metadata — throttle harder
+let lastLogFileFlushAt = 0;               // last successful/attempted file write
+let logFileDirty = false;                 // entries changed since the last file write
+let logFileWriteInFlight = false;         // guard against overlapping async uploads
+// FILE CAP: how many newest entries (incl. verbose) the file retains. Bounds the re-upload
+// size — at ~0.5 KB/entry this is roughly a 1.5–2 MB JSON ceiling. Oldest entries beyond
+// this are dropped (the RAM ring buffer is the smaller MAX_DEBUG_ENTRIES_MEM cap).
+const MAX_DEBUG_ENTRIES_FILE = 4000;
+
 // --- runId threading (debug-log redesign §2) ---
 // Ambient current run id. Any addDebugLog with no explicit opts.runId inherits this, so
 // leaf logs (db/retrieval/eviction) auto-group without taking a runId parameter. An explicit
@@ -402,6 +417,50 @@ function flushDebugLogNow() {
         else if (typeof ctx.saveChatConditional === 'function') ctx.saveChatConditional();
         lastLogFlushAt = Date.now();
     } catch { /* best-effort */ }
+    // Also force the FULL (incl-verbose) file to flush. This is async/fire-and-forget;
+    // on beforeunload the browser may not await it, but the throttled writes during the
+    // session mean at most the last <throttle-window of verbose entries are at risk —
+    // the metadata slice (above) and earlier file writes already reached disk.
+    try { void flushDebugLogFile(true); } catch { /* best-effort */ }
+}
+
+/**
+ * Build the FULL file payload: the whole RAM ring buffer (incl. verbose) capped at
+ * MAX_DEBUG_ENTRIES_FILE newest entries. Kept newest-first to match the buffer; the loader
+ * preserves order. This is what lands in the dedicated attachment file (NOT chat_metadata).
+ */
+function buildFileEntries() {
+    return debugLog.slice(0, MAX_DEBUG_ENTRIES_FILE);
+}
+
+/**
+ * Throttled, best-effort write of the FULL debug log to its dedicated attachment file.
+ * Re-uploading the whole file is expensive, so this respects LOG_FILE_FLUSH_THROTTLE_MS
+ * and never overlaps an in-flight upload. `force` (beforeunload / explicit flush) bypasses
+ * the throttle. Async + fire-and-forget from addDebugLog; all errors are swallowed inside
+ * database.js so the RAM buffer is never at risk.
+ * @param {boolean} [force]
+ */
+async function flushDebugLogFile(force = false) {
+    if (!logFileDirty && !force) return;
+    if (logFileWriteInFlight) return; // a write is already running; dirty flag stays set
+    if (!force && (Date.now() - lastLogFileFlushAt < LOG_FILE_FLUSH_THROTTLE_MS)) return;
+    let chatId = '';
+    try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+    if (!chatId) return; // no chat open — keep entries in RAM until one is
+    logFileWriteInFlight = true;
+    lastLogFileFlushAt = Date.now();
+    const snapshot = buildFileEntries(); // capture before the await so concurrent appends aren't lost-tracked
+    logFileDirty = false;                // optimistic; re-set on failure below
+    try {
+        const { saveDebugLogFile } = await import('./database.js');
+        const ok = await saveDebugLogFile(chatId, snapshot);
+        if (!ok) logFileDirty = true; // upload failed/skipped — retry on the next tick
+    } catch {
+        logFileDirty = true;          // never throws into callers; just mark for retry
+    } finally {
+        logFileWriteInFlight = false;
+    }
 }
 
 /**
@@ -474,10 +533,42 @@ function saveDebugLogToMeta() {
     } catch { /* best-effort */ }
 }
 
-/** Re-load the debug log from the current chat's metadata. Called on CHAT_CHANGED. */
+/**
+ * Re-load the debug log on chat open / CHAT_CHANGED. Two-stage:
+ *   1) SYNC: load the small verbose-stripped chat_metadata slice for an INSTANT render.
+ *   2) ASYNC: fetch the dedicated per-chat attachment FILE (the full firehose, incl.
+ *      verbose) and, if it has more entries than the metadata slice, swap it in. The file
+ *      is the superset/preferred source; the slice is just the fast first paint. A new chat
+ *      with no file keeps the (possibly empty) metadata slice — graceful missing-file path.
+ * A token guards against an out-of-order resolve when the user switches chats mid-fetch.
+ */
+let debugLogLoadToken = 0;
 export function reloadDebugLogFromChat() {
     debugLog = loadDebugLogFromMeta();
     renderDebugLog();
+    // Reset file-flush bookkeeping so the freshly-loaded chat starts clean.
+    logFileDirty = false;
+    const myToken = ++debugLogLoadToken;
+    let chatId = '';
+    try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+    if (!chatId) return;
+    (async () => {
+        try {
+            const { loadDebugLogFile } = await import('./database.js');
+            const fileEntries = await loadDebugLogFile(chatId);
+            // Bail if the user switched chats (or this chat reloaded) while we were fetching.
+            if (myToken !== debugLogLoadToken) return;
+            if (Array.isArray(fileEntries) && fileEntries.length) {
+                // The file is the superset (it carries verbose + more history). Prefer it
+                // whenever it has at least as many entries as the metadata slice.
+                const merged = fileEntries.map(backfillEntry).slice(0, MAX_DEBUG_ENTRIES_MEM);
+                if (merged.length >= debugLog.length) {
+                    debugLog = merged;
+                    renderDebugLog();
+                }
+            }
+        } catch { /* best-effort — keep the metadata slice already loaded */ }
+    })();
 }
 
 /** Map a legacy `type` to a 5-value level (for existing 2-arg call sites). */
@@ -548,9 +639,11 @@ export function addDebugLog(type, message, opts = {}) {
     debugLog.unshift(entry);
     if (debugLog.length > MAX_DEBUG_ENTRIES_MEM) debugLog.length = MAX_DEBUG_ENTRIES_MEM;
 
-    // Persist a verbose-stripped, byte-budgeted slice to chat_metadata (survives reload).
-    // (Verbose entries are already excluded by buildPersistSlice; the firehose stays in RAM.)
+    // Persist a verbose-stripped, byte-budgeted slice to chat_metadata (survives reload,
+    // instant load). The FULL buffer (incl. verbose) goes to the dedicated attachment file.
     saveDebugLogToMeta();
+    logFileDirty = true;
+    void flushDebugLogFile(false); // throttled; async fire-and-forget (errors swallowed)
     renderDebugLog();
 
     if (extensionSettings?.debugMode) {
@@ -2510,7 +2603,17 @@ export async function initSettings() {
 
     $('#bf_mem_clear_log').on('click', () => {
         debugLog = [];
-        saveDebugLogToMeta(); // also clear the persistent copy
+        saveDebugLogToMeta(); // also clear the persistent metadata slice
+        // Also delete the dedicated debug-log FILE for this chat (best-effort, async).
+        logFileDirty = false;
+        let chatId = '';
+        try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+        if (chatId) {
+            (async () => {
+                try { const { deleteDebugLogFile } = await import('./database.js'); await deleteDebugLogFile(chatId); }
+                catch { /* best-effort */ }
+            })();
+        }
         renderDebugLog();
     });
 
