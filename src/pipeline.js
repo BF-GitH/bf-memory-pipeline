@@ -12,7 +12,7 @@ import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, ups
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
@@ -256,7 +256,7 @@ async function countChatTokens(arr) {
  * MESSAGE_RECEIVED handler only attributes main-model output to a run that actually
  * recorded input this generation cycle (prevents swipe-driven counter desync).
  */
-function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult }) {
+function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult, finderTokens }) {
     try {
         setRunTokens({
             baselineInput: baselineInput || 0,
@@ -265,6 +265,10 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
             agent1Output: draftResult?.tokensOut || 0,
             agent3Input: memoryResult?.tokensIn || 0,
             agent3Output: memoryResult?.tokensOut || 0,
+            // Stage-2 finder (Agent 4) — its own slot so the Tokens tab can show it discretely
+            // and the NET-vs-baseline calc counts it. 0 when the finder didn't run/complete.
+            finderInput: finderTokens?.input || 0,
+            finderOutput: finderTokens?.output || 0,
             mainOutput: 0,
         });
         runRecordedInput = true;
@@ -296,7 +300,7 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages, finderTokens, reflectionTokens }) {
     try {
         const duration = Date.now() - startTime;
         const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
@@ -328,7 +332,13 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
         const bIn = Number(baselineInput) || 0;
         const aIn = Number(actualInput) || 0;
         const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 on the inline path
-        const netIn = (aIn + a1In + a3In) - bIn;
+        // Stage-2 finder (Agent 4) + reflection pass tokens — folded into the NET so the per-run
+        // summary reflects the TRUE extension overhead (previously these two agents were omitted).
+        const fIn = Number(finderTokens?.input) || 0;
+        const fOut = Number(finderTokens?.output) || 0;
+        const rIn = Number(reflectionTokens?.input) || 0;
+        const rOut = Number(reflectionTokens?.output) || 0;
+        const netIn = (aIn + a1In + a3In + fIn + rIn) - bIn;
         const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
         // Observability: stamp the DB context this run executed against, so every per-turn
         // summary line says which profile/avatar it touched (read-only — no behavior change).
@@ -345,7 +355,8 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
             `dur=${duration}ms | Agent1=${agent1Ran ? (agent1Ok ? 'ok' : 'failed') : 'skipped'} | ` +
             `Agent3 NEW=${nNew} UPDATED=${nUpd} SKIPPED=${nSkip} EVICTED=${nEvict} | ` +
             `tokens: baselineIn=${bIn} actualIn=${aIn} a1(in/out)=${a1In}/${a1Out} ` +
-            `a3(in/out)=${a3In}/${a3Out}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
+            `a3(in/out)=${a3In}/${a3Out}${fIn || fOut ? ` finder(in/out)=${fIn}/${fOut}` : ''}` +
+            `${rIn || rOut ? ` refl(in/out)=${rIn}/${rOut}` : ''}${mainOut ? ` mainOut=${mainOut}` : ''} net=${netIn >= 0 ? '+' : ''}${netIn}`,
             {
                 runId,
                 subsystem: 'pipeline',
@@ -359,7 +370,7 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
                         agent3: agent3Ran ? (agent3Ok ? 'ok' : 'failed') : 'skipped',
                     },
                     facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
-                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, mainOut, netIn },
+                    tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, finderIn: fIn, finderOut: fOut, reflectionIn: rIn, reflectionOut: rOut, mainOut, netIn },
                     // PER-STAGE TIMING BREAKDOWN (observability only — slowness hunt). Whatever the
                     // caller measured this run (blocking-path stages and/or post-reply agent3 etc).
                     // Null/absent when a path didn't supply it. Keeps the legacy fields intact.
@@ -896,6 +907,11 @@ async function runPipelineInline(data) {
     };
 
     let retrieval = null;
+    // TOKEN TRACKING (Tokens tab): the Stage-2 finder (Agent 4) is an LLM call whose cost was
+    // previously discarded. Capture its in/out token counts here so they fold into the run/session
+    // totals + get their own Tokens-tab row. Only populated when the finder actually completed
+    // (beat the budget); a budget-aborted/disabled/errored finder contributes 0.
+    let finderTokens = { input: 0, output: 0 };
     // wantFinder was computed up front (gates whether the fact inventory was built for Agent 1).
     if (wantFinder) {
         // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
@@ -995,6 +1011,15 @@ async function runPipelineInline(data) {
                     finderOverBudgetStreak = 0;
                     finderTrippedTurns = 0;
                     const finder = raced;
+                    // TOKEN CAPTURE: the finder LLM call ran and returned (beat the budget), so its
+                    // tokens were spent whether or not it chose facts — record them for the Tokens tab.
+                    finderTokens = { input: Number(finder?.tokensIn) || 0, output: Number(finder?.tokensOut) || 0 };
+                    if (finderTokens.input || finderTokens.output) {
+                        addDebugLog('info', `STAGE 2 finder tokens: in=${finderTokens.input} out=${finderTokens.output}`, {
+                            subsystem: 'finder', event: 'finder.run',
+                            data: { agent: 'finder', profileId: finderProfileId || null, tokensIn: finderTokens.input, tokensOut: finderTokens.output },
+                        });
+                    }
                     // Use finder results when it succeeded AND chose something. Empty/error => fall back.
                     if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
                         const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
@@ -1089,8 +1114,8 @@ async function runPipelineInline(data) {
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
-        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs });
+        recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, finderTokens });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs, finderTokens });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -1186,10 +1211,10 @@ async function runPipelineInline(data) {
     // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
     // the MESSAGE_RECEIVED path, which updates lastRunTokens.agent3* without bumping
     // the run count or re-counting input.
-    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null });
+    recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null, finderTokens });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
     // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs });
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs, finderTokens });
 
     // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
     // Pure log — emitting it changes no state and runs after the blocking work is recorded.
@@ -1561,13 +1586,27 @@ async function maybeRunReflection() {
         updateStatus('running', 'Reflecting (consolidating memory)...');
         // FIX #12: no longer pass prevReflection — the rolling #STORY summary was dropped, so
         // re-feeding the prior summary into the reflection prompt was wasted input tokens.
-        await runReflection({
+        const reflResult = await runReflection({
             runId: pending.runId,
             scene: getScene(),
             characterInfo: pending.characterInfo || '',
             userPersona: pending.userPersona || '',
             profileId: pending.profileId || null,
         });
+        // TOKEN TRACKING (Tokens tab): the reflection pass is an LLM call whose cost was
+        // previously dropped entirely. Fold its in/out tokens into the current run's totals
+        // (mirrors addAgent3Tokens — post-reply update, no run-count bump, no input re-count).
+        try {
+            const rIn = Number(reflResult?.tokensIn) || 0;
+            const rOut = Number(reflResult?.tokensOut) || 0;
+            if (rIn || rOut) {
+                addReflectionTokens({ reflectionInput: rIn, reflectionOutput: rOut });
+                addDebugLog('info', `[${pending.runId}] Reflection tokens: in=${rIn} out=${rOut}`, {
+                    subsystem: 'reflection', event: 'reflection.run',
+                    data: { agent: 'reflection', profileId: pending.profileId || null, tokensIn: rIn, tokensOut: rOut },
+                });
+            }
+        } catch { /* token recording is best-effort — never break reflection */ }
         // Persist any observation facts the pass wrote to the active DB profile.
         try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch { /* best-effort */ }
         const reflectionMs = Date.now() - reflectStart;

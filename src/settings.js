@@ -79,7 +79,7 @@ function subsystemLabel(key) {
 }
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
-let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
+let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, finderInput, finderOutput, reflectionInput, reflectionOutput, mainOutput, ts, approx}
 let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
 // Scene card — the always-injected "what is true right now" core working-memory block.
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
@@ -1036,6 +1036,27 @@ function loadTokensFromMeta() {
         if (!md) return;
         const stored = md[TOKENS_META_KEY];
         if (stored && typeof stored === 'object') {
+            // BRANCH TOKEN-RESET (Fix #3a): ST creates a branch by COPYING the parent chat's
+            // chat_metadata, so a freshly-branched chat inherits the parent's bf_mem_tokens and the
+            // Tokens tab shows the parent's stale counters until the branch's first run. We stamp
+            // each saved record with the chatId it belongs to (ownerChatId); when the stored record's
+            // owner does NOT match the current chat, it was inherited (branch copy or any metadata
+            // clone) — so we DROP it and start this chat's own tally at zero rather than show
+            // inherited numbers. A run on this chat re-stamps the record via saveTokensToMeta.
+            const currentChatId = getCurrentChatId();
+            const owner = typeof stored.ownerChatId === 'string' ? stored.ownerChatId : null;
+            const inherited = !!currentChatId && owner !== null && owner !== currentChatId;
+            if (inherited) {
+                lastRunTokens = null;
+                sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutput: 0, mainOutput: 0, runs: 0 };
+                addDebugLog('info', `Tokens reset for inherited/branch chat ${currentChatId} (record owned by ${owner})`, {
+                    subsystem: 'settings', event: 'tokens.reset', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
+                    data: { chatId: currentChatId, ownerChatId: owner, isBranch: isBranchChat(currentChatId) },
+                });
+                // Re-stamp the metadata to this chat so it doesn't keep re-detecting as inherited.
+                saveTokensToMeta();
+                return;
+            }
             lastRunTokens = (stored.lastRun && typeof stored.lastRun === 'object') ? stored.lastRun : null;
             sessionTokens = (stored.session && typeof stored.session === 'object')
                 ? stored.session
@@ -1049,7 +1070,9 @@ function saveTokensToMeta() {
         const ctx = getContext();
         const md = ctx.chatMetadata || ctx.chat_metadata;
         if (!md) return;
-        md[TOKENS_META_KEY] = { lastRun: lastRunTokens, session: sessionTokens };
+        // Stamp the owning chatId so a later branch (which copies this metadata) can detect the
+        // record as inherited and reset it instead of showing this chat's counters (see loadTokensFromMeta).
+        md[TOKENS_META_KEY] = { lastRun: lastRunTokens, session: sessionTokens, ownerChatId: getCurrentChatId() || null };
         ctx.saveMetadata?.();
     } catch { /* best-effort */ }
 }
@@ -1060,8 +1083,10 @@ export function setRunTokens(run) {
     // can't poison the running session totals (they'd become NaN and stop adding up).
     const baselineInput = Number(run?.baselineInput) || 0;
     const actualInput   = Number(run?.actualInput) || 0;
-    const agentInput    = (Number(run?.agent1Input) || 0) + (Number(run?.agent3Input) || 0);
-    const agentOutput   = (Number(run?.agent1Output) || 0) + (Number(run?.agent3Output) || 0);
+    // Agent overhead now includes the Stage-2 finder (Agent 4). Scribe (agent3) is still folded
+    // in later via addAgent3Tokens, and reflection via addReflectionTokens (both post-reply).
+    const agentInput    = (Number(run?.agent1Input) || 0) + (Number(run?.agent3Input) || 0) + (Number(run?.finderInput) || 0);
+    const agentOutput   = (Number(run?.agent1Output) || 0) + (Number(run?.agent3Output) || 0) + (Number(run?.finderOutput) || 0);
 
     lastRunTokens = { ...run, ts: Date.now(), approx: true };
     // accumulate session
@@ -1094,6 +1119,26 @@ export function addAgent3Tokens({ agent3Input = 0, agent3Output = 0 } = {}) {
     if (lastRunTokens) {
         lastRunTokens.agent3Input = (Number(lastRunTokens.agent3Input) || 0) + inN;
         lastRunTokens.agent3Output = (Number(lastRunTokens.agent3Output) || 0) + outN;
+    }
+    saveTokensToMeta();
+    renderTokens();
+}
+
+// Called by pipeline.js maybeRunReflection() once the (post-reply, off-blocking-path)
+// reflection/consolidation pass completes. Mirrors addAgent3Tokens: folds the reflection
+// LLM call's input/output into the session AGENT overhead totals WITHOUT bumping the run
+// count (the run was already counted on the blocking path) and WITHOUT touching
+// baseline/actual input. Stamps the figures onto lastRunTokens so the per-run breakdown
+// shows the Reflection line. Reflection runs every N turns, so most runs add 0 here.
+export function addReflectionTokens({ reflectionInput = 0, reflectionOutput = 0 } = {}) {
+    const inN = Number(reflectionInput) || 0;
+    const outN = Number(reflectionOutput) || 0;
+    if (!inN && !outN) return;
+    sessionTokens.agentInput += inN;
+    sessionTokens.agentOutput += outN;
+    if (lastRunTokens) {
+        lastRunTokens.reflectionInput = (Number(lastRunTokens.reflectionInput) || 0) + inN;
+        lastRunTokens.reflectionOutput = (Number(lastRunTokens.reflectionOutput) || 0) + outN;
     }
     saveTokensToMeta();
     renderTokens();
@@ -1474,8 +1519,12 @@ function renderTokens() {
     }
 
     const L = lastRunTokens;
-    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0);
-    const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0);
+    // Extension total now includes ALL four pipeline agents that make LLM calls:
+    // Drafter (agent1), Scribe (agent3), Librarian/finder (Agent 4) and the Reflection pass.
+    const fIn = L.finderInput || 0, fOut = L.finderOutput || 0;
+    const rIn = L.reflectionInput || 0, rOut = L.reflectionOutput || 0;
+    const extIn = (L.actualInput || 0) + (L.agent1Input || 0) + (L.agent3Input || 0) + fIn + rIn;
+    const extOut = (L.mainOutput || 0) + (L.agent1Output || 0) + (L.agent3Output || 0) + fOut + rOut;
     const netIn = extIn - (L.baselineInput || 0);   // negative = saved
     const netOut = extOut - (L.mainOutput || 0);     // agent output overhead (always >= 0)
 
@@ -1498,7 +1547,9 @@ function renderTokens() {
                 <tr><td>Baseline (full chat)</td><td>${fmt(L.baselineInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
                 <tr><td>— Main model</td><td>${fmt(L.actualInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
                 <tr><td>— Drafter</td><td>${fmt(L.agent1Input)}</td><td>${fmt(L.agent1Output)}</td></tr>
+                <tr><td>— Librarian (finder)</td><td>${fmt(fIn)}</td><td>${fmt(fOut)}</td></tr>
                 <tr><td>— Scribe</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
+                <tr><td>— Reflection</td><td>${fmt(rIn)}</td><td>${fmt(rOut)}</td></tr>
                 <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
                 <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
             </tbody>
@@ -2534,10 +2585,24 @@ async function saveDbProfile(profileName) {
         savedAt: Date.now(),
     };
     extensionSettings.activeDbProfile = profileName;
+    // LINK the current chat to this manually-created profile so it actually attaches (empty
+    // linkedChats meant it would NOT auto-load on the next CHAT_CHANGED). linkChatToProfile is
+    // idempotent + calls saveSettings; clears any prior unlink so auto-link re-enables for this chat.
+    const currentChatId = getCurrentChatId();
+    if (currentChatId) {
+        linkChatToProfile(profileName, currentChatId);
+        // We just established this profile for the current chat — keep autoSaveDbProfile from
+        // re-loading/clobbering it on a later CHAT_CHANGED for the SAME chat.
+        lastAutoLoadedChat = currentChatId;
+    }
     saveSettings();
     refreshDbProfileDropdown();
+    refreshLinkedChatsField();
     toastr.success(`Saved profile "${profileName}"`, 'BF Memory');
-    addDebugLog('info', `DB profile saved: "${profileName}" (${Object.keys(databases).length} dbs)`);
+    addDebugLog('info', `DB profile saved: "${profileName}" (${Object.keys(databases).length} dbs)${currentChatId ? ` + linked to chat ${currentChatId}` : ''}`, {
+        subsystem: 'db', event: 'profile.saved', actor: 'USER', reason: 'SAVE_AS_NEW',
+        data: { profileName, dbCount: Object.keys(databases).length, linkedChat: currentChatId || null },
+    });
 }
 
 async function deleteDbProfile(profileName) {
@@ -2721,8 +2786,113 @@ function linkChatToProfile(profileName, chatId) {
  *   INTENTIONAL clear-to-empty actually persists to the profile (Layer C) and can no longer be
  *   resurrected by autoSaveDbProfile on the next CHAT_CHANGED.
  */
+/**
+ * EAGER PROFILE ENSURE (fact-write-time). Guarantee an active DB profile exists, is linked to the
+ * CURRENT chat, and is set active — so facts always land in a profile, not only after CHAT_CHANGED.
+ *
+ * Problem this fixes: activeDbProfile was set ONLY inside autoSaveDbProfile (CHAT_CHANGED/init). When a
+ * run raced ahead of that, or a branch chat's resolveBranchParentProfile returned null (parent never
+ * linked → facts only in the avatar store), activeDbProfile was empty at write time, so the
+ * saveCurrentToActiveProfile call no-op'd and the Database tab showed no profile.
+ *
+ * Resolution order (reuses the SAME helpers autoSaveDbProfile uses — no duplicated logic):
+ *   1. already-active profile that still exists → keep it
+ *   2. profile linked to this chat (findProfileForChat)
+ *   3. branch-inherit the parent's profile (resolveBranchParentProfile) and link this branch to it
+ *   4. auto-create a chat/character-named profile (seeded Layer-1 skeleton) and link it
+ * Then LINK the current chat + SET it active. Respects an explicit user unlink (does NOT re-link).
+ *
+ * NON-DESTRUCTIVE: this only ensures the profile RECORD + active pointer; it never loads/clears the
+ * working store (that is autoSaveDbProfile's job on CHAT_CHANGED), so it can't resurrect deleted data
+ * or clobber the avatar store. It never double-creates: an existing named profile is linked, not replaced.
+ *
+ * @returns {Promise<string|null>} the ensured active profile name, or null when none could be ensured
+ *   (no chatId, or the chat was explicitly unlinked by the user).
+ */
+async function ensureActiveProfileForCurrentChat() {
+    try {
+        const chatId = getCurrentChatId();
+        if (!chatId) return null;
+
+        // (1) Active profile already set AND still exists → reuse (most common case after CHAT_CHANGED).
+        const active = extensionSettings?.activeDbProfile;
+        if (active && extensionSettings?.dbProfiles?.[active]) {
+            // Make sure the active profile is actually linked to THIS chat (a race could have set it
+            // active before linking, e.g. via saveDbProfile pre-fix). Link defensively (idempotent).
+            if (!(extensionSettings.dbProfiles[active].linkedChats || []).includes(chatId) && !isChatUnlinked(chatId)) {
+                linkChatToProfile(active, chatId);
+            }
+            return active;
+        }
+
+        // RESPECT EXPLICIT UNLINK: if the user detached this chat from every profile, do NOT auto-link
+        // or auto-create one (mirrors autoSaveDbProfile's suppression). Facts stay in the working store.
+        if (isChatUnlinked(chatId)) return null;
+
+        if (!extensionSettings.dbProfiles) extensionSettings.dbProfiles = {};
+        const isBranch = isBranchChat(chatId);
+        let resolved = null;
+        let how = 'none';
+
+        // (2) Profile already linked to this chat.
+        resolved = findProfileForChat(chatId);
+        if (resolved) how = 'linked';
+
+        // (3) Branch-inherit the parent's profile.
+        if (!resolved && isBranch) {
+            const parentProfile = resolveBranchParentProfile(chatId);
+            if (parentProfile) { resolved = parentProfile; how = 'inherited-branch'; }
+        }
+
+        // (4) Auto-create (or link an existing same-named) chat/character-named profile.
+        if (!resolved) {
+            const chatLabel = getCurrentChatLabel();
+            if (chatLabel) {
+                if (!extensionSettings.dbProfiles[chatLabel]) {
+                    const { buildSkeletonDatabases } = await import('./database.js');
+                    extensionSettings.dbProfiles[chatLabel] = {
+                        databases: buildSkeletonDatabases(),
+                        savedAt: Date.now(),
+                        linkedChats: [],
+                    };
+                    how = 'auto-created';
+                } else {
+                    how = 'linked';
+                }
+                resolved = chatLabel;
+            }
+        }
+
+        if (!resolved) return null;
+
+        // LINK + ACTIVATE so the imminent fact write lands in this profile and the Database tab shows it.
+        linkChatToProfile(resolved, chatId);
+        extensionSettings.activeDbProfile = resolved;
+        // Keep autoSaveDbProfile from re-loading (and potentially clobbering) on a later CHAT_CHANGED
+        // for the SAME chat — we just established the profile for it.
+        lastAutoLoadedChat = chatId;
+        saveSettings();
+        try { refreshDbProfileDropdown(); refreshLinkedChatsField(); } catch { /* UI optional */ }
+        addDebugLog('info', `Ensured active DB profile "${resolved}" for chat ${chatId} at fact-write (${how})`, {
+            subsystem: 'db', event: 'db.connect', actor: 'SYSTEM', reason: 'EAGER_ENSURE',
+            data: { chatId, resolvedProfile: resolved, linkState: how, isBranch, eager: true },
+        });
+        return resolved;
+    } catch (err) {
+        addDebugLog('fail', `Eager profile ensure failed (non-fatal): ${err.message || err}`);
+        return null;
+    }
+}
+
 export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty = false } = {}) {
-    const profileName = profileKey || extensionSettings?.activeDbProfile;
+    let profileName = profileKey || extensionSettings?.activeDbProfile;
+    // EAGER ENSURE: when this is an every-turn extraction save (no explicit profileKey) and there is
+    // no active profile, ensure+link+activate one for the current chat NOW so the very first
+    // extraction lands in a profile instead of no-op'ing. Skipped when the caller named an explicit
+    // profileKey (those paths target a specific profile and shouldn't trigger auto-create).
+    if (!profileName && !profileKey) {
+        profileName = await ensureActiveProfileForCurrentChat();
+    }
     if (!profileName) return;
     // Integrity guard: refuse to write to a profile that no longer exists
     // (prevents resurrecting a deleted profile or clobbering wrong slot after rename)
