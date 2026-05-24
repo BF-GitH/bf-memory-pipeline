@@ -1237,11 +1237,17 @@ async function snapshotAvatar(avatar) {
         const rec = await idbGetRecord(avatar);
         if (!rec || !rec.databases) return;
         const stamp = Number(rec.updatedAt) || Date.now();
+        // The set of categories that SHOULD have a durable attachment file after this snapshot
+        // (i.e. categories that still hold ≥1 fact in IDB). Anything NOT in this set must have its
+        // stale attachment file removed below — otherwise an emptied/cleared category leaves a
+        // leftover file that the rehydrate path (loadAllDatabases CASE B) could read back.
+        const liveCategories = new Set();
         // Write each POPULATED category to its own attachment file (existing layout). Empty
         // categories are skipped (matches the write-on-first-fact policy that kept the backend
         // from accumulating empty files).
         for (const [category, sdb] of Object.entries(rec.databases)) {
             if (!sdb || !Array.isArray(sdb.facts) || sdb.facts.length === 0) continue;
+            liveCategories.add(category.toLowerCase().replace(/[^a-z0-9]/g, '_'));
             const payload = { ...sdb, category, snapshotVersion: SNAPSHOT_SCHEMA_VERSION, updatedAt: stamp };
             try {
                 await saveDatabaseToAttachment(avatar, payload);
@@ -1249,14 +1255,81 @@ async function snapshotAvatar(avatar) {
                 console.error(`[BFMemory] snapshot of "${category}" failed`, e);
             }
         }
+        // RECONCILE DELETIONS (F4): remove attachment files for DB categories that no longer have
+        // facts in IDB (emptied by clear/supersession or never re-written). Without this, an
+        // emptied category's old attachment survives and can rehydrate the working store. We match
+        // on the canonical `bf_memory_db_<slug>.json` shape and compare against the live slug set.
+        const reconciled = await reconcileDeletedAttachments(avatar, liveCategories);
         addDebugLog('debug', 'Durable snapshot written (IDB → attachments)', {
-            subsystem: 'db', event: 'db.snapshot', data: { updatedAt: stamp },
+            subsystem: 'db', event: 'db.snapshot',
+            data: { updatedAt: stamp, liveCategories: liveCategories.size, attachmentsRemoved: reconciled },
         });
     } catch (e) {
         _snapshotDirty.add(avatar); // re-mark so a later cadence retries; never propagate
         console.error('[BFMemory] snapshotAvatar failed', e);
     } finally {
         _snapshotInFlight = false;
+    }
+}
+
+/**
+ * Remove durable attachment files for DB categories that are NO LONGER live (no facts in IDB).
+ * Used by snapshotAvatar to keep the attachment layer in lock-step with the IDB working store so
+ * a cleared/emptied category cannot leave a leftover file that the rehydrate path reads back.
+ * Matches every `bf_memory_db_*.json` attachment whose slug is not in `liveSlugs` and removes it
+ * (file + array entry). Best-effort: a failed file delete still drops the stale array entry so the
+ * loader stops merging it. Never throws.
+ * @param {string} avatar
+ * @param {Set<string>} liveSlugs - sanitized category slugs that SHOULD keep a file
+ * @returns {Promise<number>} count of attachment entries removed
+ */
+async function reconcileDeletedAttachments(avatar, liveSlugs) {
+    const context = getContext();
+    const attachments = context.extensionSettings?.character_attachments?.[avatar];
+    if (!Array.isArray(attachments) || attachments.length === 0) return 0;
+    let removed = 0;
+    // Iterate a snapshot of indices high→low so splices don't shift the ones we still inspect.
+    for (let i = attachments.length - 1; i >= 0; i--) {
+        const a = attachments[i];
+        const name = a && a.name;
+        if (typeof name !== 'string' || !name.startsWith(DB_PREFIX) || !name.endsWith('.json')) continue;
+        const slug = name.slice(DB_PREFIX.length, -'.json'.length);
+        if (liveSlugs.has(slug)) continue; // still backed by a populated category — keep it
+        try {
+            await deleteAttachmentFile(a.url);
+        } catch { /* ignore — still drop the array entry below so the loader stops merging it */ }
+        attachments.splice(i, 1);
+        removed++;
+    }
+    if (removed > 0) context.saveSettingsDebounced?.();
+    return removed;
+}
+
+/**
+ * Cancel any ARMED throttled snapshot timer and clear the dirty flag for an avatar (defaults to
+ * the current character). Exported so a USER-initiated destructive op (per-category delete / Clear
+ * All) can guarantee that a snapshot armed by an earlier fact write does NOT fire afterward and
+ * re-materialize a just-deleted category's attachment file. Safe to call repeatedly; never throws.
+ * NOTE: this does not interrupt a snapshot already mid-upload (single-flight `_snapshotInFlight`);
+ * destructive callers flush a fresh, reconciling snapshot afterward so the final durable state is
+ * still the deleted/empty one.
+ * @param {string} [avatar] - defaults to getCharacterAvatar()
+ */
+export function cancelPendingSnapshot(avatar) {
+    try {
+        const target = avatar || getCharacterAvatar();
+        if (!target) return;
+        if (_snapshotTimers.has(target)) {
+            clearTimeout(_snapshotTimers.get(target));
+            _snapshotTimers.delete(target);
+        }
+        _snapshotDirty.delete(target);
+        addDebugLog('debug', 'Pending snapshot cancelled (destructive op)', {
+            subsystem: 'db', event: 'db.snapshot.cancelled', reason: 'DESTRUCTIVE_OP',
+            data: { avatar: target },
+        });
+    } catch (e) {
+        console.error('[BFMemory] cancelPendingSnapshot failed', e);
     }
 }
 
@@ -2152,6 +2225,12 @@ export async function deleteDatabase(category) {
 
     // Per-turn cache: deleting a category is a write — invalidate so a later read re-fetches.
     invalidateDatabaseCache();
+
+    // SNAPSHOT SAFETY (F4): cancel any throttled snapshot armed by an earlier fact write so its
+    // timer can't fire after this delete and re-upload the category we're about to remove. (An
+    // already-in-flight snapshot is reconciled by reconcileDeletedAttachments on its next pass /
+    // the caller's flushSnapshotNow, which deletes files for categories no longer live in IDB.)
+    cancelPendingSnapshot(avatar);
 
     // HYBRID: drop the category from the IDB working record first so the next read can't resurrect
     // it. Best-effort — on IDB failure we disable IDB and still remove the attachment below.

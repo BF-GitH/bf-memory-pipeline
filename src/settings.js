@@ -1956,10 +1956,23 @@ async function refreshDatabaseView() {
     // Bind delete buttons
     listEl.querySelectorAll('.bf-mem-db-delete').forEach(btn => {
         btn.addEventListener('click', async () => {
-            if (!confirm(`Delete database "${btn.dataset.category}"?`)) return;
-            const { deleteDatabase } = await import('./database.js');
-            await deleteDatabase(btn.dataset.category);
-            toastr.success(`Database "${btn.dataset.category}" deleted`, 'BF Memory');
+            const category = btn.dataset.category;
+            if (!confirm(`Delete database "${category}"?`)) return;
+            const { deleteDatabase, flushSnapshotNow } = await import('./database.js');
+            // Layer A (IDB) + Layer B (attachment file) — also cancels the armed snapshot timer.
+            await deleteDatabase(category);
+            // Layer C (dbProfiles snapshot): prune the category so autoSaveDbProfile can't resurrect
+            // it on the next CHAT_CHANGED. Without this, deleting from IDB+attachments leaves the
+            // full copy in the linked profile and it reloads on chat switch.
+            const { profilesPruned, factsPruned } = pruneActiveProfile(category);
+            // Force a reconciling snapshot now so the durable attachment layer reflects the deletion
+            // immediately (deletes the emptied category's file) rather than on the throttled cadence.
+            await flushSnapshotNow();
+            addDebugLog('pass', `Deleted category "${category}" (Layer A+B+C)`, {
+                subsystem: 'db', event: 'db.deleteCategory', actor: 'USER', reason: 'USER_DELETE',
+                data: { category, profilesPruned, factsPrunedFromProfile: factsPruned },
+            });
+            toastr.success(`Database "${category}" deleted`, 'BF Memory');
             refreshDatabaseView();
         });
     });
@@ -2178,8 +2191,19 @@ function linkChatToProfile(profileName, chatId) {
     saveSettings();
 }
 
-/** Save current databases to the active profile (call after DB changes) */
-export async function saveCurrentToActiveProfile(profileKey = null) {
+/**
+ * Save current databases to the active profile (call after DB changes).
+ *
+ * @param {string|null} profileKey - target profile (defaults to the active profile)
+ * @param {{ allowEmpty?: boolean }} [options]
+ * @param {boolean} [options.allowEmpty=false] - when false (the default for the every-turn
+ *   extraction call sites) a totally-empty working store is NOT written through — this guards
+ *   against a transient/failed getAllDatabases() load clobbering a populated profile with `{}`.
+ *   USER-initiated destructive ops (Clear All / per-category delete) pass `allowEmpty:true` so an
+ *   INTENTIONAL clear-to-empty actually persists to the profile (Layer C) and can no longer be
+ *   resurrected by autoSaveDbProfile on the next CHAT_CHANGED.
+ */
+export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty = false } = {}) {
     const profileName = profileKey || extensionSettings?.activeDbProfile;
     if (!profileName) return;
     // Integrity guard: refuse to write to a profile that no longer exists
@@ -2195,7 +2219,10 @@ export async function saveCurrentToActiveProfile(profileKey = null) {
         const { getAllDatabases } = await import('./database.js');
         const databases = await getAllDatabases();
         const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
-        if (totalFacts === 0) return;
+        // Empty-store guard: by default an empty map is treated as "nothing to save" so a transient
+        // load failure can't wipe a populated profile. An explicit clear/delete passes allowEmpty so
+        // the genuinely-cleared state is persisted (the populated copy must NOT survive a wipe).
+        if (totalFacts === 0 && !allowEmpty) return;
 
         extensionSettings.dbProfiles[profileName] = {
             ...extensionSettings.dbProfiles[profileName],
@@ -2203,10 +2230,67 @@ export async function saveCurrentToActiveProfile(profileKey = null) {
             savedAt: Date.now(),
         };
         saveSettings();
-        addDebugLog('info', `Saved to active profile "${profileName}" (${totalFacts} facts)`);
+        addDebugLog('info', `Saved to active profile "${profileName}" (${totalFacts} facts)`, {
+            subsystem: 'db', event: 'profile.saved', data: { profileName, totalFacts, allowEmpty },
+        });
     } catch (err) {
         addDebugLog('fail', `Failed to save active profile: ${err.message}`);
     }
+}
+
+/**
+ * Prune Layer C (the dbProfiles snapshot) so a USER-initiated delete/clear actually STICKS and
+ * cannot be resurrected by autoSaveDbProfile on the next CHAT_CHANGED. Without this, deleting from
+ * IDB + attachments leaves the full fact copy in extensionSettings.dbProfiles[active].databases,
+ * which autoSaveDbProfile reloads on chat switch.
+ *
+ * Prunes EVERY profile linked to the current chat (not just the active one) plus the active profile
+ * itself, so a re-link to a linked-but-not-active profile can't bring the data back.
+ *
+ * @param {string|null} category - a single category to remove, or null to empty ALL categories
+ * @returns {{ profilesPruned: string[], factsPruned: number }}
+ */
+function pruneActiveProfile(category = null) {
+    const profiles = extensionSettings?.dbProfiles;
+    if (!profiles || typeof profiles !== 'object') return { profilesPruned: [], factsPruned: 0 };
+
+    // Build the target set: the active profile + every profile linked to the current chat.
+    const targets = new Set();
+    const active = extensionSettings?.activeDbProfile;
+    if (active && profiles[active]) targets.add(active);
+    const chatId = getCurrentChatId();
+    if (chatId) {
+        for (const [name, profile] of Object.entries(profiles)) {
+            if ((profile?.linkedChats || []).includes(chatId)) targets.add(name);
+        }
+    }
+
+    const profilesPruned = [];
+    let factsPruned = 0;
+    for (const name of targets) {
+        const profile = profiles[name];
+        if (!profile || typeof profile !== 'object' || !profile.databases) continue;
+        let changed = false;
+        if (category == null) {
+            // Empty ALL categories. Replace the snapshot with a fresh empty skeleton so the full
+            // taxonomy still "exists" (zero facts) but no stored fact survives.
+            for (const db of Object.values(profile.databases)) {
+                factsPruned += (db?.facts?.length || 0);
+            }
+            profile.databases = {};
+            changed = true;
+        } else if (Object.prototype.hasOwnProperty.call(profile.databases, category)) {
+            factsPruned += (profile.databases[category]?.facts?.length || 0);
+            delete profile.databases[category];
+            changed = true;
+        }
+        if (changed) {
+            profile.savedAt = Date.now();
+            profilesPruned.push(name);
+        }
+    }
+    if (profilesPruned.length > 0) saveSettings();
+    return { profilesPruned, factsPruned };
 }
 
 /**
@@ -3031,18 +3115,34 @@ export async function initSettings() {
     });
 
     $('#bf_mem_clear_db').on('click', async () => {
-        if (!confirm('Clear ALL memory databases for this character? This cannot be undone.')) return;
-        const { getAllDatabases, deleteDatabase } = await import('./database.js');
+        if (!confirm('Reset memory to EMPTY for this character? This wipes every stored fact across all storage layers. This cannot be undone.')) return;
+        const { getAllDatabases, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot } = await import('./database.js');
         const dbs = await getAllDatabases();
         const clearedCats = Object.keys(dbs);
         const clearedFacts = Object.values(dbs).reduce((s, db) => s + (db.facts?.length || 0), 0);
+        // Cancel any armed snapshot up-front so it can't fire mid-loop and re-write a deleted file.
+        cancelPendingSnapshot();
+        // Layer A (IDB) + Layer B (attachment files): deleteDatabase wipes both per category.
         for (const category of clearedCats) {
             await deleteDatabase(category);
         }
-        addDebugLog('pass', 'All databases cleared', {
-            subsystem: 'import', event: 'db.cleared', actor: 'USER', data: { dbCount: clearedCats.length, totalFacts: clearedFacts, categories: clearedCats },
+        // Layer C (dbProfiles snapshot): empty the active + every chat-linked profile so
+        // autoSaveDbProfile reloads an EMPTY profile on the next CHAT_CHANGED instead of resurrecting.
+        const { profilesPruned, factsPruned } = pruneActiveProfile(null);
+        // Belt-and-suspenders: persist the genuinely-empty working store into the active profile too
+        // (allowEmpty bypasses the empty-store guard that normally blocks an empty save).
+        await saveCurrentToActiveProfile(null, { allowEmpty: true });
+        // Force a reconciling durable snapshot NOW: reconcileDeletedAttachments deletes attachment
+        // files for every category no longer live in IDB, so no leftover file can rehydrate.
+        await flushSnapshotNow();
+        addDebugLog('pass', `Reset to empty: cleared ${clearedFacts} facts across ${clearedCats.length} categories + profile pruned`, {
+            subsystem: 'db', event: 'db.cleared', actor: 'USER', reason: 'USER_CLEAR_ALL',
+            data: {
+                dbCount: clearedCats.length, totalFacts: clearedFacts, categories: clearedCats,
+                profilesPruned, factsPrunedFromProfile: factsPruned,
+            },
         });
-        toastr.success('All databases cleared', 'BF Memory');
+        toastr.success('Memory reset to empty (all layers)', 'BF Memory');
         refreshDatabaseView();
     });
 
