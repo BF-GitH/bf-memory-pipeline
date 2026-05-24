@@ -3,6 +3,7 @@
 // Each database is a JSON file stored as a character attachment
 
 import { addDebugLog } from './settings.js';
+import * as host from './host.js';
 
 const DB_PREFIX = 'bf_memory_db_';
 // INFINITE FACTS — NEVER DELETE. We no longer evict/delete facts when a category grows.
@@ -558,8 +559,13 @@ function salienceScore(fact, now) {
     return IMPORTANCE_WEIGHT * (importance / 5) + RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
 }
 
+// Local context accessor — routes through the host seam (host.js). Preserves the
+// original throw-on-missing semantics (callers below deref `context.X` with `?.`,
+// and the few that aren't in a try/catch expect an exception when the host is gone).
 function getContext() {
-    return SillyTavern.getContext();
+    const ctx = host.getCtx();
+    if (!ctx) throw new Error('SillyTavern context unavailable');
+    return ctx;
 }
 
 /**

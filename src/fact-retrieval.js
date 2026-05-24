@@ -4,6 +4,7 @@
 
 import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
+import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
@@ -61,7 +62,7 @@ export function isFactVisible(fact, names = null) {
     let charName = names?.charName;
     let userName = names?.userName;
     if (charName === undefined || userName === undefined) {
-        const ctx = SillyTavern.getContext();
+        const ctx = host.getCtx();
         charName = ctx.characters?.[ctx.characterId]?.name || '';
         userName = ctx.name1 || '';
     }
@@ -923,7 +924,7 @@ export async function searchMemoryForRecall({ query, category, limit } = {}) {
     if (catFilter) candidates = candidates.filter(c => String(c.category).toLowerCase() === catFilter);
 
     // Honor knownBy visibility exactly like normal retrieval (precompute names once).
-    const ctx = (() => { try { return SillyTavern.getContext(); } catch { return null; } })();
+    const ctx = host.getCtx();
     const names = ctx ? {
         charName: ctx.characters?.[ctx.characterId]?.name || '',
         userName: ctx.name1 || '',

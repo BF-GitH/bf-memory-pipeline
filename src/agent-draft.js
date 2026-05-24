@@ -4,10 +4,11 @@
 
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
+import * as host from './host.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_DRAFT_PROMPT)
 function getSettingsSafe() {
-    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+    return host.getExtensionSettings();
 }
 
 export const DEFAULT_DRAFT_PROMPT = `You are a roleplay draft planner. Your job is to:
@@ -68,9 +69,8 @@ export async function runDraftAgent(recentChat, characterInfo, userPersona, prof
     try {
         const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'agent1');
         addDebugLog('info', `Agent 1 LLM reply (${resultStr.length} chars):\n${resultStr}`);
-        const ctx = SillyTavern.getContext();
-        const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
-        const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
+        const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
+        const tokensOut = await host.getTokenCount(resultStr);
         return { ...parseDraftResult(resultStr), tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Agent 1 error: ${error.message || error}`);

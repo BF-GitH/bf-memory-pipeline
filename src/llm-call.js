@@ -4,6 +4,7 @@
 // Falls back to direct fetch or generateQuietPrompt.
 
 import { addDebugLog } from './settings.js';
+import * as host from './host.js';
 
 const LLM_TIMEOUT_MS = 60000; // 60s — bumped from 30s for mobile network tolerance
 
@@ -42,7 +43,7 @@ function withTimeout(promise, ms) {
  */
 function detectCurrentConfig() {
     try {
-        const context = SillyTavern.getContext();
+        const context = host.getCtx();
 
         let source = '';
         let model = '';
@@ -75,11 +76,7 @@ function detectCurrentConfig() {
  * @returns {object|null}
  */
 function getCMRS() {
-    try {
-        return SillyTavern.getContext().ConnectionManagerRequestService || null;
-    } catch {
-        return null;
-    }
+    return host.getCMRS();
 }
 
 /**
@@ -137,7 +134,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
         const systemPromptStable = prevHash !== undefined && prevHash === sysHash;
         lastSystemHashByAgent.set(agent, sysHash);
         let personaName = '';
-        try { personaName = SillyTavern.getContext()?.name1 || ''; } catch { /* best-effort */ }
+        try { personaName = host.getUserPersonaName(); } catch { /* best-effort */ }
         const personaChanged = lastPersonaName !== undefined && lastPersonaName !== personaName;
         lastPersonaName = personaName;
         addDebugLog('debug', `Cache eligibility [${agent}]: systemPromptStable=${systemPromptStable}, ~${sysTokens} sys tokens${personaChanged ? ', persona CHANGED' : ''}`, {
@@ -216,10 +213,9 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
     }
 
     // Priority 3: generateQuietPrompt (includes chat context, but better than nothing)
-    const context = SillyTavern.getContext();
     const fallbackPrompt = `${systemPrompt}\n\n${userPrompt}`;
     const result = await withTimeout(
-        context.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
+        host.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
         LLM_TIMEOUT_MS,
     );
     return typeof result === 'string' ? result : String(result || '');
@@ -233,8 +229,7 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
  * @returns {Promise<string>}
  */
 async function callSTProxy(messages) {
-    const context = SillyTavern.getContext();
-    const headers = context.getRequestHeaders?.();
+    const headers = host.getRequestHeaders();
     if (!headers) {
         throw new Error('Cannot get ST request headers');
     }

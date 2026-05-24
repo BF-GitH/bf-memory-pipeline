@@ -27,6 +27,7 @@
 import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
 import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
+import * as host from './host.js';
 
 // Bound the fact summary fed into the reflection prompt so a huge DB can't blow up cost.
 const MAX_FACT_SUMMARY_CHARS = 4000;
@@ -398,9 +399,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         }
         if (totalMerged > 0) addDebugLog('pass', `[${runId}] Dedupe-janitor merged ${totalMerged} duplicate fact(s) total`);
 
-        const settings = (() => { try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; } })();
-        const ctx = SillyTavern.getContext();
-        const substitute = ctx.substituteParams || ctx.substituteParamsExtended || (s => s);
+        const settings = host.getExtensionSettings();
+        const substitute = host.getSubstituteParams();
 
         const systemPrompt = substitute(settings?.reflectionPrompt || DEFAULT_REFLECT_PROMPT);
 
@@ -433,8 +433,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
         const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'reflection');
-        const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
-        const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
+        const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
+        const tokensOut = await host.getTokenCount(resultStr);
         addDebugLog('info', `[${runId}] Reflection LLM reply (${resultStr.length} chars):\n${resultStr}`);
 
         const parsed = parseReflectResult(resultStr);
@@ -489,7 +489,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             const category = 'Behavior';
             if (!databases[category]) databases[category] = createEmptyDatabase(category);
             const db = databases[category];
-            const charName = ctx.characters?.[ctx.characterId]?.name || '';
+            const charName = host.getCurrentCharacterName();
             for (const obs of parsed.observations) {
                 upsertFact(db, {
                     key: obs.key,

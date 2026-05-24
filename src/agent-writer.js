@@ -3,9 +3,14 @@
 // Receives: draft + retrieved facts + character cards + system prompt
 // Output: injected into the prompt so the main model writes a fact-grounded response
 
+// host.js is dependency-free (imports nothing from the extension), so a STATIC import
+// of it is cycle-safe even though this module dynamically imports settings/fact-retrieval
+// below to dodge their cycles.
+import * as host from './host.js';
+
 // Lazy access to avoid circular dependency (settings imports our DEFAULT_WRITER_FORMAT)
 function getSettingsSafe() {
-    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+    return host.getExtensionSettings();
 }
 
 export const DEFAULT_WRITER_FORMAT = `[Memory Context - established truth for this scene]
@@ -292,30 +297,14 @@ async function recallToolLog(level, message, opts = {}) {
 }
 
 /**
- * Feature-detect SillyTavern's function-tool API. The register/unregister pair lives either
- * directly on the context or under context.ToolManager (ST has exposed both shapes across
- * versions). Returns the resolved { register, unregister } functions, or null when neither
- * exists (caller logs a single fail-level notice and no-ops — NEVER throws).
+ * Feature-detect SillyTavern's function-tool API. Centralized in the host seam
+ * (host.js) so all host coupling lives in one place; this is a behavior-identical
+ * passthrough. Returns the resolved { register, unregister } functions, or null when
+ * neither exists (caller logs a single fail-level notice and no-ops — NEVER throws).
  * @returns {{register: Function, unregister: Function|null}|null}
  */
 function getToolApi() {
-    let ctx;
-    try { ctx = SillyTavern.getContext(); } catch { return null; }
-    if (!ctx) return null;
-    if (typeof ctx.registerFunctionTool === 'function') {
-        return {
-            register: ctx.registerFunctionTool.bind(ctx),
-            unregister: typeof ctx.unregisterFunctionTool === 'function' ? ctx.unregisterFunctionTool.bind(ctx) : null,
-        };
-    }
-    const tm = ctx.ToolManager;
-    if (tm && typeof tm.registerFunctionTool === 'function') {
-        return {
-            register: tm.registerFunctionTool.bind(tm),
-            unregister: typeof tm.unregisterFunctionTool === 'function' ? tm.unregisterFunctionTool.bind(tm) : null,
-        };
-    }
-    return null;
+    return host.getToolApi();
 }
 
 /**

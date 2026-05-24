@@ -13,10 +13,11 @@ import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 import { isFactVisible } from './fact-retrieval.js';
 import { deriveSubject, deriveAspect } from './database.js';
+import * as host from './host.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_FINDER_PROMPT)
 function getSettingsSafe() {
-    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+    return host.getExtensionSettings();
 }
 
 export const DEFAULT_FINDER_PROMPT = `You are a memory fact-finder for a roleplay. You are given:
@@ -85,9 +86,8 @@ export async function runFinderAgent({
 
     addDebugLog('info', `Agent 4 (finder) reply (${resultStr.length} chars):\n${resultStr}`);
 
-    const ctx = SillyTavern.getContext();
-    const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
-    const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
+    const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
+    const tokensOut = await host.getTokenCount(resultStr);
 
     const chosen = parseFinderResult(resultStr, list, maxFacts);
     const formatted = formatChosenFacts(chosen);

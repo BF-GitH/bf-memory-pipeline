@@ -5,10 +5,11 @@
 import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
+import * as host from './host.js';
 
 // Lazy import to avoid circular dependency (settings imports our DEFAULT_MEMORY_PROMPT)
 function getSettingsSafe() {
-    try { return SillyTavern.getContext().extensionSettings?.['bf-memory-pipeline']; } catch { return null; }
+    return host.getExtensionSettings();
 }
 
 export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for ~5 facts on a normal turn, but go higher (up to ~12) when a message genuinely discloses that much. Missing a clearly-stated reveal is worse than one extra fact.
@@ -291,9 +292,8 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     try {
         const resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'agent3');
         addDebugLog('info', `Agent 3 LLM reply (${resultStr.length} chars):\n${resultStr}`);
-        const ctx = SillyTavern.getContext();
-        const tokensIn = await (ctx.getTokenCountAsync?.(systemPrompt + '\n' + userPrompt) ?? 0);
-        const tokensOut = await (ctx.getTokenCountAsync?.(resultStr) ?? 0);
+        const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
+        const tokensOut = await host.getTokenCount(resultStr);
 
         const parsed = parseMemoryUpdateResult(resultStr, messageIndex, userMsgIndex);
 
@@ -329,9 +329,8 @@ const SCRIBE_SCOPED_CAP = 60;
 function scribeSubjects(text) {
     const out = new Set();
     try {
-        const ctx = SillyTavern.getContext();
-        const charName = String(ctx.characters?.[ctx.characterId]?.name || '').trim().toLowerCase();
-        const userName = String(ctx.name1 || '').trim().toLowerCase();
+        const charName = String(host.getCurrentCharacterName()).trim().toLowerCase();
+        const userName = String(host.getUserPersonaName()).trim().toLowerCase();
         if (charName) out.add(charName);
         if (userName) out.add(userName);
     } catch { /* ignore */ }
@@ -376,8 +375,7 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
     // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
-    const ctx = SillyTavern.getContext();
-    const substitute = ctx.substituteParams || ctx.substituteParamsExtended || (s => s);
+    const substitute = host.getSubstituteParams();
     const systemPrompt = substitute(sysPrompt);
 
     // User message: data to analyze
