@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.23.0] - 2026-05-24
+
+### Changed — scale work, part 1: speed fixes + hybrid storage foundation
+First two steps of the rebuild toward unbounded memory. Backward-compatible; falls back to prior behavior if the new storage can't initialize.
+
+**Performance fixes (safe, immediate).** ([src/database.js](src/database.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+- `getAllDatabases()` is now memoized per turn (keyed by character avatar) and invalidated on every write/chat-change — it was being re-fetched + re-parsed ~4-5× per turn.
+- The whole chat is no longer re-serialized every turn just to stamp `bf_mem_processed` — a chat save is triggered only when the flag actually changed.
+- The full chat is no longer tokenized twice per turn for the token stat (the no-trim path reuses the baseline + injection count).
+- The "run on current chat" backfill loads the DB once before the loop (not per message) and yields periodically so it can't freeze the UI.
+
+**Hybrid persistence foundation (durable + fast).** ([src/database.js](src/database.js))
+- Facts now live in a fast **IndexedDB** working store, with the existing SillyTavern character-attachment kept as a **durable, device-independent snapshot/backup** (throttled write + flush on chat-change/unload). On a new device or cleared cache it **rehydrates** IndexedDB from the snapshot; existing attachment DBs are **migrated** into IndexedDB once on first run.
+- **Graceful fallback:** if IndexedDB is unavailable, blocked (private mode), or errors at any point, the extension transparently reverts to attachment-only behavior (zero regression). Every fallback is logged once (`storage.fallback`) so it's visible in the Debug tab.
+- The public storage API and the per-turn cache contract are unchanged — no caller behavior changed this phase. (The fact cap is **not** removed yet; that and indexed-query retrieval come in the next phases on top of this foundation.)
+- **Note:** IndexedDB can't be exercised outside a browser, so this needs real in-browser testing; the fallback keeps it safe if anything misbehaves.
+
 ## [0.22.0] - 2026-05-24
 
 ### Changed — agents renamed, menus reorganized, Scribe prompt reworked
