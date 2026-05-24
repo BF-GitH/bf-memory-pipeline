@@ -206,9 +206,18 @@ export function formatChosenFacts(results) {
     for (const { fact, category } of visible) {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-        let line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
-        if (typeof fact.context === 'string' && fact.context.trim()) {
-            line += ` — ${fact.context.trim()}`;
+        const hasValue = String(fact.value ?? '').trim() !== '';
+        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+        // INJECTION DE-DUPLICATION (mirror of formatFactsForWriter): storage keeps
+        // BOTH value and note, but when a note exists it already carries the fact, so
+        // inject the NOTE IN PLACE OF the value. With no note, inject `key = value`.
+        let line;
+        if (note) {
+            line = `${prefix} ${category}/${fact.key}: ${note}`;
+        } else if (hasValue) {
+            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
+        } else {
+            line = `${prefix} ${category}/${fact.key}`;
         }
         lines.push(line);
     }

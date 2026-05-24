@@ -690,20 +690,17 @@ function formatFactsForWriter(results) {
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
         const hasValue = String(fact.value ?? '').trim() !== '';
         const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
-        // Keep the KEY (Feature #2b) so the writer sees `Category/key = value` and can
-        // tell similar facts apart and use them precisely. VALUE-LESS facts (no `value`,
-        // the note carries the whole fact — value/note no-duplication rule) drop the
-        // `= value` part and surface the note as the fact body instead.
+        // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
+        // only needs one. When a fact HAS a note, the note already carries the
+        // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
+        // showing both would be redundant. With no note, inject `Category/key = value`.
+        // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
         let line;
-        if (hasValue) {
-            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
-            // Feature #3: surface the optional context note for TOP-TIER (primary) facts
-            // only, to bound tokens. Secondary/tertiary lines never carry context.
-            if (tier === 'primary' && note) line += ` — ${note}`;
-        } else if (note) {
-            // No value: the note IS the fact. Show it across all tiers so the meaning
-            // isn't lost (a value-less fact with no note would be empty otherwise).
+        if (note) {
+            // Note replaces the value (it carries the fact). All tiers.
             line = `${prefix} ${category}/${fact.key}: ${note}`;
+        } else if (hasValue) {
+            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
         } else {
             // Degenerate: neither value nor note — keep the key so it's still visible.
             line = `${prefix} ${category}/${fact.key}`;

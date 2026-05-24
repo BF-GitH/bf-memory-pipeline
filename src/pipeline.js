@@ -732,7 +732,14 @@ async function runPipelineInline(data) {
             ? det.facts.map(({ fact, category }) => {
                 const knownBy = (fact.knownBy || []).join(', ');
                 const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
-                return `${prefix} ${category}/${fact.key} = ${fact.value}`;
+                // INJECTION DE-DUPLICATION (mirror of formatFactsForWriter): storage keeps
+                // BOTH value and note, but when a note exists it carries the fact, so inject
+                // the NOTE IN PLACE OF the value. With no note, inject `key = value`.
+                const hasValue = String(fact.value ?? '').trim() !== '';
+                const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+                if (note) return `${prefix} ${category}/${fact.key}: ${note}`;
+                if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}`;
+                return `${prefix} ${category}/${fact.key}`;
             }).join('\n')
             : '(No stored facts available)';
         return det;

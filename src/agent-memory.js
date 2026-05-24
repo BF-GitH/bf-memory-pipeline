@@ -66,7 +66,7 @@ FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 
 #MEM
 + Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | >context note
-+ Category/key_snake_case | aspect:revelation | subj:@<name> | !4 | kind:event | >"verbatim quote or summary"   ← VALUE-LESS form: no \`=\`; the note carries the whole fact
++ Category/key_snake_case = atomic value | aspect:revelation | subj:@<name> | !4 | kind:event | >"verbatim quote or summary"   ← keep the atomic value AND add the note; the system shows the note in place of the value to the Writer
 .
 #WHY <one sentence>
 
@@ -80,15 +80,12 @@ CONTEXT NOTE (optional): append \`| >...\` with a SHORT prose note. Use it for T
   3. A SHORT SUMMARY — when a complex, multi-part scene or an emotionally important beat can't be carried by tags/value alone, summarize it in one or two sentences in the note.
 Most ordinary facts still have NO note. The note is stored separately and never affects keyword search.
 
-VALUE↔NOTE — NEVER DUPLICATE: never put the SAME information in both the value and the note.
-- If the NOTE already carries the fact (a quote or summary that says it all), OMIT the value entirely — including the placeholder \`= true\`. Write just \`+ Category/key | aspect:... | >...note...\` (no \`=\`). The fact is valid with a note and no value.
-- If the VALUE alone says it, add NO note.
+VALUE↔NOTE — ALWAYS WRITE BOTH: always write BOTH the atomic value AND, when warranted, the \`>note\`. Keep the value atomic (1–5 words); put the quote/summary in the note. Do NOT drop the value to avoid duplication — the system automatically shows the note instead of the value when feeding the Writer, so always include both.
+- Most ordinary facts have a value and NO note. When a fact warrants a note (a meaningful quote, a disambiguation, a short summary), still keep the atomic value AND add the note.
 Generic examples:
-  GOOD: \`+ <X>/<subject>_confession | aspect:revelation | >"<full quote>"\`   (value omitted — the quote IS the fact)
-  BAD:  \`+ <X>/<subject>_confession = true | aspect:revelation | >"<full quote>"\`   (\`= true\` duplicates nothing useful — drop it)
-  GOOD: \`+ <X>/<subject>_home | aspect:home | >after the <EVENT> he first took her to his modest city apartment\`   (value omitted — the note contains it)
-  BAD:  \`+ <X>/<subject>_home = modest city apartment | aspect:home | >after the <EVENT> he took her to his modest city apartment\`   (the place is in BOTH — keep ONE)
-When in doubt: if the note repeats the value, delete the value.
+  GOOD: \`+ <X>/<subject>_confession = true | aspect:revelation | >"<full quote>"\`   (atomic value kept; the quote rides the note)
+  GOOD: \`+ <X>/<subject>_home = modest city apartment | aspect:home | >after the <EVENT> he first took her there\`   (atomic value kept; the note adds context)
+Always include the value — the system slims the Writer's context for you.
 
 ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
@@ -210,10 +207,10 @@ Input: [CHAR:{{char}}] "After what you did, I don't trust you anymore." *to {{us
 Input: [CHAR:{{char}}] *Voice cracking.* "I never told anyone this, but I've loved you since the day we met."
 
 #MEM
-+ Events/char_confession | aspect:revelation | subj:{{char}} | with:@{{user}} | @{{char}},{{user}} | #confession,romance | @src:char | !4 | kind:event | >"I never told anyone this, but I've loved you since the day we met."
++ Events/char_confession = love confession | aspect:revelation | subj:{{char}} | with:@{{user}} | @{{char}},{{user}} | #confession,romance | @src:char | !4 | kind:event | >"I never told anyone this, but I've loved you since the day we met."
 + Relationships/char_user_romance = in love | aspect:romance | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #romance | @src:char | !4 | kind:state
 .
-#WHY The confession lives in DIALOGUE — the best signal here. The verbatim line matters emotionally, so it goes in the NOTE and the value is OMITTED entirely (no \`= true\`) — value↔note no-duplication. A separate abstract Relationships fact captures the durable state ("in love") that retrieval keys on.
+#WHY The confession lives in DIALOGUE — the best signal here. The verbatim line matters emotionally, so it goes in the NOTE while the atomic value ("love confession") is ALSO kept — always write both. The system shows the note in place of the value when feeding the Writer. A separate abstract Relationships fact captures the durable state ("in love") that retrieval keys on.
 
 ---
 Input: [CHAR:{{char}}] *Lights a cigarette, takes one drag, stubs it out.*
