@@ -829,7 +829,7 @@ async function loadAllDatabases(avatar) {
     } catch (e) {
         // ANY IDB failure → transparent fallback to the original attachment-only loader.
         console.error('[BFMemory] IDB load failed; falling back to attachments', e);
-        _idbCapable = false; // stop hammering a broken IDB for the rest of the session
+        disableIdb('IDB load failed mid-session'); // stop hammering a broken IDB + log once
         return loadAllDatabasesFromAttachments(avatar);
     }
 }
@@ -1062,7 +1062,7 @@ export async function saveDatabase(db) {
             // IDB write failed mid-session → disable IDB and fall back to attachment-only for the
             // rest of the session so we never silently lose this write.
             console.error('[BFMemory] IDB save failed; falling back to attachment write', e);
-            _idbCapable = false;
+            disableIdb('IDB save failed mid-session');
         }
     }
 
@@ -1150,7 +1150,7 @@ export async function deleteDatabase(category) {
             }
         } catch (e) {
             console.error('[BFMemory] IDB delete failed; removing attachment only', e);
-            _idbCapable = false;
+            disableIdb('IDB delete failed mid-session');
         }
     }
 
