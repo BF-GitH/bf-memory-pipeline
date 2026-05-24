@@ -388,6 +388,11 @@ const LOG_FILE_FLUSH_THROTTLE_MS = 15000; // file write is heavier than metadata
 let lastLogFileFlushAt = 0;               // last successful/attempted file write
 let logFileDirty = false;                 // entries changed since the last file write
 let logFileWriteInFlight = false;         // guard against overlapping async uploads
+// The chatId the in-RAM `debugLog` buffer currently belongs to. Tracked so a CHAT_CHANGED can
+// flush the OUTGOING chat's tail to the OUTGOING chat's file BEFORE the buffer is swapped — by
+// the time CHAT_CHANGED fires, getContext().chatId is already the NEW chat, so flushing to the
+// live chatId would mis-file the old tail. Set whenever reloadDebugLogFromChat resolves a chatId.
+let _logBufferChatId = '';
 // FILE CAP: how many newest entries (incl. verbose) the file retains. Bounds the re-upload
 // size — at ~0.5 KB/entry this is roughly a 1.5–2 MB JSON ceiling. Oldest entries beyond
 // this are dropped (the RAM ring buffer is the smaller MAX_DEBUG_ENTRIES_MEM cap).
@@ -477,13 +482,18 @@ function buildFileEntries() {
  * the throttle. Async + fire-and-forget from addDebugLog; all errors are swallowed inside
  * database.js so the RAM buffer is never at risk.
  * @param {boolean} [force]
+ * @param {string|null} [chatIdOverride] - target this chatId instead of the live one. Used on
+ *   CHAT_CHANGED to file the OUTGOING chat's tail against the OUTGOING chatId (the live chatId
+ *   has already advanced to the new chat by the time the event fires).
  */
-async function flushDebugLogFile(force = false) {
+async function flushDebugLogFile(force = false, chatIdOverride = null) {
     if (!logFileDirty && !force) return;
     if (logFileWriteInFlight) return; // a write is already running; dirty flag stays set
     if (!force && (Date.now() - lastLogFileFlushAt < LOG_FILE_FLUSH_THROTTLE_MS)) return;
-    let chatId = '';
-    try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+    let chatId = chatIdOverride || '';
+    if (!chatId) {
+        try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+    }
     if (!chatId) return; // no chat open — keep entries in RAM until one is
     logFileWriteInFlight = true;
     lastLogFileFlushAt = Date.now();
@@ -580,6 +590,21 @@ function saveDebugLogToMeta() {
  * A token guards against an out-of-order resolve when the user switches chats mid-fetch.
  */
 let debugLogLoadToken = 0;
+
+/**
+ * Flush the OUTGOING chat's debug-log tail to ITS OWN file before the buffer is swapped to a new
+ * chat. Must run on CHAT_CHANGED *before* reloadDebugLogFromChat(): at that point `debugLog` still
+ * holds the old chat's entries and `_logBufferChatId` still names the old chat, but the live
+ * getContext().chatId has already advanced — so we force-flush the full buffer against the tracked
+ * old chatId. Best-effort + never throws. Without this, the last <throttle-window of (esp. verbose)
+ * entries for the chat you're leaving would be lost.
+ */
+async function flushOutgoingChatLog() {
+    const outgoing = _logBufferChatId;
+    if (!outgoing) return;
+    try { await flushDebugLogFile(true, outgoing); } catch { /* best-effort */ }
+}
+
 export function reloadDebugLogFromChat() {
     debugLog = loadDebugLogFromMeta();
     renderDebugLog();
@@ -588,6 +613,9 @@ export function reloadDebugLogFromChat() {
     const myToken = ++debugLogLoadToken;
     let chatId = '';
     try { chatId = getContext().chatId ?? getContext().getCurrentChatId?.() ?? ''; } catch { /* no chat */ }
+    // Remember which chat the RAM buffer now belongs to, so a later CHAT_CHANGED can flush this
+    // chat's tail to this chat's file (see flushOutgoingChatLog).
+    _logBufferChatId = chatId;
     if (!chatId) return;
     (async () => {
         try {
@@ -2880,6 +2908,10 @@ export async function initSettings() {
 
     // --- Auto-save DB profile on chat change (named after current chat) ---
     context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
+        // FIX #59: flush the OUTGOING chat's debug-log tail to its own file BEFORE we swap the
+        // buffer to the new chat — otherwise the last few (esp. verbose) lines of the chat you're
+        // leaving are lost. Targets the tracked old chatId (the live one has already advanced).
+        await flushOutgoingChatLog();
         await autoSaveDbProfile();
         // Reload the persistent debug log AND fact panels from the new chat's metadata
         // so each chat shows its own history (not a stale cross-chat snapshot).
