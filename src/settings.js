@@ -210,6 +210,12 @@ const DEFAULT_SETTINGS = {
     writerFormat: '',
     dbProfiles: {},
     activeDbProfile: '',
+    // Chats the user EXPLICITLY unlinked from every profile. autoSaveDbProfile must NOT
+    // auto-create/re-link a profile for a chat in this set, so an unlink actually STICKS
+    // across CHAT_CHANGED + reload (without it, re-entering the chat silently re-links and
+    // the unlink "does nothing"). Re-linking a chat (Link Current Chat / link to a profile)
+    // removes it from this set. Array of chat IDs; default empty => no detached chats.
+    unlinkedChats: [],
     // USER TAXONOMY OVERLAY (persisted, GLOBAL across chats). Extra Layer-1 categories and
     // Layer-2 leaves the user added from the Database tab, merged ON TOP of the built-in
     // TAXONOMY by database.js (flatVocab/effectiveCategories/groupedTaxonomyMenu). DATA-ONLY +
@@ -312,6 +318,13 @@ function validateSettings(s) {
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
         s.dbProfiles = {};
+    }
+    // Explicitly-unlinked chats (detach set): coerce to a string array so the unlink-stick logic
+    // can read it without defensive branching. Absent/malformed => empty (auto-link unchanged).
+    if (!Array.isArray(s.unlinkedChats)) {
+        s.unlinkedChats = [];
+    } else {
+        s.unlinkedChats = s.unlinkedChats.filter(id => typeof id === 'string' && id);
     }
     // User taxonomy overlay: coerce to the well-formed { categories[], aspects{}, subAreas{} }
     // shape so database.js can read it without defensive branching. Absent/malformed => empty.
@@ -1978,38 +1991,254 @@ async function refreshDatabaseView() {
     });
 }
 
+// Cap the number of fact rows rendered into the (innerHTML-built) view at once so a 10k-fact
+// category can't freeze the UI with a multi-MB DOM write. The user filters or pages past it.
+const FACT_VIEW_PAGE_SIZE = 200;
+
+/**
+ * Build the HTML for the per-fact rows of the single-category viewer. Re-run on every
+ * filter/page change. Each row carries a checkbox (bulk-select), a cold badge when cold,
+ * and per-row Edit/Delete buttons. Only the facts in [0, limit) of the FILTERED set render.
+ * @param {import('./database.js').FactSchema[]} facts - already filtered + ordered
+ * @param {number} limit - max rows to render now (pagination cap)
+ * @param {(f) => boolean} isColdFact
+ * @param {(f) => string} deriveAspect
+ * @returns {string}
+ */
+function renderFactRows(facts, limit, isColdFact, deriveAspect) {
+    const shown = facts.slice(0, limit);
+    return shown.map((fact) => {
+        const cold = (() => { try { return isColdFact(fact); } catch { return false; } })();
+        const aspect = (() => { try { return deriveAspect(fact); } catch { return ''; } })();
+        const importance = Number.isFinite(Number(fact.importance)) ? Number(fact.importance) : 3;
+        const note = fact.context || '';
+        const coldBadge = cold ? ' <span class="bf-mem-custom-chip" title="Cold-tiered: kept but deprioritized by retrieval">cold</span>' : '';
+        const superseded = fact.active === false ? ' <span class="bf-mem-custom-chip" title="Superseded (historical)">old</span>' : '';
+        return `
+            <div class="bf-mem-fact-row" data-key="${escapeHtml(fact.key)}" style="border-bottom:1px solid var(--SmartThemeBorderColor,#444);padding:6px 0;">
+                <div style="display:flex;gap:8px;align-items:flex-start;">
+                    <input type="checkbox" class="bf-mem-fact-check" data-key="${escapeHtml(fact.key)}" style="margin-top:4px;" />
+                    <div style="flex:1 1 auto;min-width:0;">
+                        <div><b>${escapeHtml(fact.key)}</b>${coldBadge}${superseded}
+                            <span class="bf-mem-fact-source"> [${escapeHtml(aspect)} · imp ${importance}]</span></div>
+                        <div class="bf-mem-fact-value">${escapeHtml(fact.value)}</div>
+                        ${note ? `<div class="bf-mem-fact-source">note: ${escapeHtml(note)}</div>` : ''}
+                        ${(fact.knownBy || []).length ? `<div class="bf-mem-fact-source">known by: ${escapeHtml((fact.knownBy || []).join(', '))}</div>` : ''}
+                        ${(fact.tags || []).length ? `<div class="bf-mem-fact-source">tags: ${escapeHtml((fact.tags || []).join(', '))}</div>` : ''}
+                    </div>
+                    <div style="flex:0 0 auto;display:flex;gap:4px;">
+                        <button class="bf-mem-fact-edit menu_button" data-key="${escapeHtml(fact.key)}" title="Edit"><i class="fa-solid fa-pen"></i></button>
+                        <button class="bf-mem-fact-del menu_button redWarningBG" data-key="${escapeHtml(fact.key)}" title="Delete"><i class="fa-solid fa-trash"></i></button>
+                    </div>
+                </div>
+            </div>`;
+    }).join('');
+}
+
+/**
+ * Interactive per-category fact manager: VIEW + FILTER + per-fact EDIT/DELETE + BULK DELETE, with
+ * cold-tier badges and a rendered-row cap for huge categories. Every destructive/edit op goes
+ * through the 3-layer-safe path (working store via removeFact/saveDatabase, PLUS the dbProfiles
+ * snapshot via pruneFactFromProfiles/updateFactInProfiles) so changes can't be resurrected by
+ * autoSaveDbProfile on the next CHAT_CHANGED — the same guarantee as the category-delete in
+ * commit 4e281b7.
+ * @param {string} category
+ * @param {Object<string, import('./database.js').DatabaseSchema>} databases - the withSkeleton map
+ */
 async function viewSingleDatabase(category, databases) {
+    const { isColdFact, deriveAspect } = await import('./database.js');
     const db = databases[category];
     if (!db) return;
-
-    let html = `<div class="bf-mem-db-browser">
-        <h4>${escapeHtml(category)} (${db.facts.length} facts)</h4>
-        <table class="bf-mem-db-table">
-            <tr><th>Key</th><th>Value</th><th>Known By</th><th>Tags</th><th>Relationships</th></tr>`;
-
-    for (const fact of db.facts) {
-        const rels = fact.relationships || {};
-        const relStr = [
-            ...(rels.primary || []).map(r => `P:${r}`),
-            ...(rels.secondary || []).map(r => `S:${r}`),
-            ...(rels.tertiary || []).map(r => `T:${r}`),
-        ].join(', ');
-
-        html += `<tr>
-            <td><b>${escapeHtml(fact.key)}</b></td>
-            <td>${escapeHtml(fact.value)}</td>
-            <td>${escapeHtml((fact.knownBy || []).join(', '))}</td>
-            <td>${escapeHtml((fact.tags || []).join(', '))}</td>
-            <td>${escapeHtml(relStr)}</td>
-        </tr>`;
-    }
-    html += '</table></div>';
-
     await ensurePopup();
-    if (Popup) {
-        const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
-        await popup.show();
+    if (!Popup) {
+        toastr.error('Popup not available', 'BF Memory');
+        return;
     }
+
+    // Working copy of the facts we render (re-read from the live store on every mutation so the
+    // list reflects deletes/edits without reopening). filter + page are popup-local UI state.
+    let allFacts = [...db.facts];
+    let renderLimit = FACT_VIEW_PAGE_SIZE;
+
+    const html = `<div class="bf-mem-db-browser" data-category="${escapeHtml(category)}">
+        <h4>${escapeHtml(category)} — <span id="bf_mem_fact_count">${allFacts.length}</span> facts</h4>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px;">
+            <input type="text" id="bf_mem_fact_filter" class="text_pole" placeholder="Filter by key / value / note…" style="flex:1 1 180px;min-width:140px;" />
+            <label class="checkbox_label" style="flex:0 0 auto;"><input type="checkbox" id="bf_mem_fact_selall" /> <span>Select all (filtered)</span></label>
+            <button id="bf_mem_fact_bulkdel" class="menu_button redWarningBG" style="flex:0 0 auto;"><i class="fa-solid fa-trash"></i> Delete selected</button>
+        </div>
+        <div id="bf_mem_fact_list"></div>
+        <div id="bf_mem_fact_more" style="margin-top:8px;text-align:center;"></div>
+    </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
+    // Show without awaiting so we can wire the live DOM while the popup is open.
+    const shownPromise = popup.show();
+    const root = popup.dlg || popup.content || document;
+    const listEl = root.querySelector('#bf_mem_fact_list');
+    const moreEl = root.querySelector('#bf_mem_fact_more');
+    const filterEl = root.querySelector('#bf_mem_fact_filter');
+    const countEl = root.querySelector('#bf_mem_fact_count');
+    const selAllEl = root.querySelector('#bf_mem_fact_selall');
+
+    // Current filtered set (recomputed by applyFilter), used by render + bulk select.
+    let filtered = allFacts;
+
+    const applyFilter = () => {
+        const q = (filterEl?.value || '').trim().toLowerCase();
+        filtered = !q ? allFacts : allFacts.filter(f => {
+            const hay = `${f.key || ''} ${f.value || ''} ${f.context || ''} ${(f.tags || []).join(' ')} ${(f.knownBy || []).join(' ')}`.toLowerCase();
+            return hay.includes(q);
+        });
+    };
+
+    const render = () => {
+        applyFilter();
+        if (countEl) countEl.textContent = `${filtered.length}${filtered.length !== allFacts.length ? ` / ${allFacts.length}` : ''}`;
+        if (listEl) listEl.innerHTML = filtered.length
+            ? renderFactRows(filtered, renderLimit, isColdFact, deriveAspect)
+            : '<div class="bf-mem-empty">No matching facts.</div>';
+        if (moreEl) {
+            const remaining = Math.max(0, filtered.length - renderLimit);
+            moreEl.innerHTML = remaining > 0
+                ? `<button id="bf_mem_fact_showmore" class="menu_button">Show more (${remaining} hidden)</button>`
+                : '';
+        }
+        if (selAllEl) selAllEl.checked = false;
+        bindRowHandlers();
+    };
+
+    // Re-read the live store and refresh, after a mutation. Keeps the popup authoritative.
+    const reloadFromStore = async () => {
+        const { getAllDatabases } = await import('./database.js');
+        const fresh = await getAllDatabases();
+        allFacts = [...((fresh[category] && fresh[category].facts) || [])];
+        renderLimit = Math.max(FACT_VIEW_PAGE_SIZE, renderLimit); // keep what was paged
+        render();
+        refreshDatabaseView();
+    };
+
+    // Single-fact DELETE through ALL THREE layers (working store + every profile the chat reloads
+    // from) so it can't resurrect. Mirrors the category-delete anti-resurrection contract.
+    const deleteOne = async (key) => {
+        if (!confirm(`Delete fact "${key}" from "${category}"?`)) return;
+        const { getAllDatabases, removeFact, saveDatabase, flushSnapshotNow } = await import('./database.js');
+        const fresh = await getAllDatabases();
+        const liveDb = fresh[category];
+        if (!liveDb) return;
+        removeFact(liveDb, key);                       // Layer A (IDB) + arms Layer B (attachment)
+        await saveDatabase({ ...liveDb, category });
+        const { profilesPruned, factsPruned } = pruneFactFromProfiles(category, key); // Layer C
+        await flushSnapshotNow();                       // reconcile durable attachment now
+        addDebugLog('pass', `Deleted single fact "${key}" from "${category}" (Layer A+B+C)`, {
+            subsystem: 'db', event: 'fact.deleted', actor: 'USER', reason: 'USER_DELETE',
+            data: { category, key, profilesPruned, factsPrunedFromProfile: factsPruned },
+        });
+        await reloadFromStore();
+    };
+
+    // BULK delete the currently-checked rows (or all filtered when "select all" was used) — one
+    // saveDatabase per category, one profile prune per key, one durable flush at the end.
+    const deleteSelected = async () => {
+        const keys = [...root.querySelectorAll('.bf-mem-fact-check:checked')].map(c => c.dataset.key);
+        if (keys.length === 0) { toastr.info('No facts selected', 'BF Memory'); return; }
+        if (!confirm(`Delete ${keys.length} selected fact(s) from "${category}"? This cannot be undone.`)) return;
+        const { getAllDatabases, saveDatabase, flushSnapshotNow } = await import('./database.js');
+        const fresh = await getAllDatabases();
+        const liveDb = fresh[category];
+        if (!liveDb) return;
+        const keySet = new Set(keys);
+        const before = liveDb.facts.length;
+        liveDb.facts = liveDb.facts.filter(f => !keySet.has(f.key));   // Layer A
+        liveDb.updatedAt = Date.now();
+        await saveDatabase({ ...liveDb, category });                   // persist Layer A + arm B
+        let profilesTouched = new Set();
+        for (const key of keys) {                                      // Layer C, per key
+            const { profilesPruned } = pruneFactFromProfiles(category, key);
+            profilesPruned.forEach(p => profilesTouched.add(p));
+        }
+        await flushSnapshotNow();
+        addDebugLog('pass', `Bulk-deleted ${before - liveDb.facts.length} fact(s) from "${category}" (Layer A+B+C)`, {
+            subsystem: 'db', event: 'fact.bulkDeleted', actor: 'USER', reason: 'USER_BULK_DELETE',
+            data: { category, requested: keys.length, removed: before - liveDb.facts.length, profilesPruned: [...profilesTouched] },
+        });
+        toastr.success(`Deleted ${before - liveDb.facts.length} fact(s)`, 'BF Memory');
+        await reloadFromStore();
+    };
+
+    // Per-fact EDIT modal: value + note (always) + aspect + importance. Writes through Layer A+B+C.
+    const editOne = async (key) => {
+        const { getAllDatabases, saveDatabase, deriveAspect: da, flatVocab, flushSnapshotNow } = await import('./database.js');
+        const fresh = await getAllDatabases();
+        const liveDb = fresh[category];
+        const fact = liveDb?.facts.find(f => f.key === key);
+        if (!fact) { toastr.warning('Fact no longer exists', 'BF Memory'); await reloadFromStore(); return; }
+        const vocab = (() => { try { return flatVocab(category); } catch { return []; } })();
+        const curAspect = (() => { try { return da(fact); } catch { return ''; } })();
+        const curImp = Number.isFinite(Number(fact.importance)) ? Number(fact.importance) : 3;
+        const aspectOptions = vocab.map(a => `<option value="${escapeHtml(a)}"${a === curAspect ? ' selected' : ''}>${escapeHtml(a)}</option>`).join('');
+        const impOptions = [1, 2, 3, 4, 5].map(n => `<option value="${n}"${n === curImp ? ' selected' : ''}>${n}</option>`).join('');
+        const editHtml = `<div class="bf-mem-db-browser">
+            <h4>Edit fact: ${escapeHtml(key)}</h4>
+            <div class="bf-mem-field"><label>Value</label>
+                <textarea id="bf_mem_edit_value" class="text_pole" rows="3" style="width:100%;">${escapeHtml(fact.value || '')}</textarea></div>
+            <div class="bf-mem-field" style="margin-top:6px;"><label>Note (context)</label>
+                <textarea id="bf_mem_edit_note" class="text_pole" rows="2" style="width:100%;">${escapeHtml(fact.context || '')}</textarea></div>
+            <div class="bf-mem-field" style="margin-top:6px;display:flex;gap:10px;flex-wrap:wrap;">
+                <div style="flex:1 1 140px;"><label>Aspect</label>
+                    <select id="bf_mem_edit_aspect" class="text_pole" style="width:100%;">${aspectOptions || `<option value="${escapeHtml(curAspect)}" selected>${escapeHtml(curAspect)}</option>`}</select></div>
+                <div style="flex:0 0 90px;"><label>Importance</label>
+                    <select id="bf_mem_edit_imp" class="text_pole" style="width:100%;">${impOptions}</select></div>
+            </div>
+        </div>`;
+        const editPopup = new Popup(editHtml, POPUP_TYPE.TEXT, '', { okButton: 'Save', cancelButton: 'Cancel', wide: true, allowVerticalScrolling: true });
+        const result = await editPopup.show();
+        if (!result) return; // cancelled
+        const eroot = editPopup.dlg || editPopup.content || document;
+        const newValue = eroot.querySelector('#bf_mem_edit_value')?.value ?? fact.value;
+        const newNote = eroot.querySelector('#bf_mem_edit_note')?.value ?? fact.context;
+        const newAspect = eroot.querySelector('#bf_mem_edit_aspect')?.value ?? fact.aspect;
+        const newImp = Number(eroot.querySelector('#bf_mem_edit_imp')?.value) || curImp;
+        const before = { value: fact.value, context: fact.context || '', aspect: fact.aspect || curAspect, importance: curImp };
+
+        // Mutate the live fact in place + persist Layer A/B.
+        fact.value = String(newValue);
+        fact.context = String(newNote || '');
+        if (newAspect) fact.aspect = newAspect;
+        fact.importance = Math.min(5, Math.max(1, Math.round(newImp)));
+        fact.lastUpdated = Date.now();
+        liveDb.updatedAt = Date.now();
+        await saveDatabase({ ...liveDb, category });
+        // Layer C write-through so the edit survives a CHAT_CHANGED reload.
+        const { profilesUpdated } = updateFactInProfiles(category, key, fact);
+        await flushSnapshotNow();
+        addDebugLog('pass', `Edited fact "${key}" in "${category}" (Layer A+B+C)`, {
+            subsystem: 'db', event: 'fact.edited', actor: 'USER', reason: 'USER_EDIT',
+            data: { category, key, profilesUpdated },
+            before, after: { value: fact.value, context: fact.context, aspect: fact.aspect, importance: fact.importance },
+        });
+        toastr.success(`Fact "${key}" updated`, 'BF Memory');
+        await reloadFromStore();
+    };
+
+    function bindRowHandlers() {
+        root.querySelectorAll('.bf-mem-fact-del').forEach(btn =>
+            btn.addEventListener('click', () => deleteOne(btn.dataset.key)));
+        root.querySelectorAll('.bf-mem-fact-edit').forEach(btn =>
+            btn.addEventListener('click', () => editOne(btn.dataset.key)));
+        const showMore = root.querySelector('#bf_mem_fact_showmore');
+        if (showMore) showMore.addEventListener('click', () => { renderLimit += FACT_VIEW_PAGE_SIZE; render(); });
+    }
+
+    filterEl?.addEventListener('input', () => { renderLimit = FACT_VIEW_PAGE_SIZE; render(); });
+    selAllEl?.addEventListener('change', () => {
+        const on = selAllEl.checked;
+        root.querySelectorAll('.bf-mem-fact-check').forEach(c => { c.checked = on; });
+    });
+    root.querySelector('#bf_mem_fact_bulkdel')?.addEventListener('click', () => deleteSelected());
+
+    render();
+    await shownPromise;
 }
 
 async function showAllDatabases() {
@@ -2045,6 +2274,172 @@ async function showAllDatabases() {
         const popup = new Popup(html, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
         await popup.show();
     }
+}
+
+/**
+ * Cross-category live search wired to #bf_mem_db_search. On a non-empty query it hides the
+ * per-category cards and lists matching facts (key/value/note/tags/knownBy substring) grouped by
+ * category, each with an "Open" button into that category's manager (where it can be edited/deleted).
+ * On an empty query it restores the normal card view. Cap the rendered matches so a broad query on
+ * a 10k store can't jank the UI.
+ */
+async function runDatabaseSearch() {
+    const input = document.getElementById('bf_mem_db_search');
+    const resultsEl = document.getElementById('bf_mem_db_search_results');
+    const listEl = document.getElementById('bf_mem_db_list');
+    if (!input || !resultsEl || !listEl) return;
+    const q = (input.value || '').trim().toLowerCase();
+    if (!q) {
+        resultsEl.style.display = 'none';
+        resultsEl.innerHTML = '';
+        listEl.style.display = '';
+        return;
+    }
+    const { getAllDatabases, withSkeleton, isColdFact } = await import('./database.js');
+    const databases = withSkeleton(await getAllDatabases());
+    const MAX_RESULTS = 300;
+    const matches = [];
+    for (const [category, db] of Object.entries(databases)) {
+        for (const fact of (db.facts || [])) {
+            const hay = `${fact.key || ''} ${fact.value || ''} ${fact.context || ''} ${(fact.tags || []).join(' ')} ${(fact.knownBy || []).join(' ')}`.toLowerCase();
+            if (hay.includes(q)) matches.push({ category, fact });
+            if (matches.length >= MAX_RESULTS) break;
+        }
+        if (matches.length >= MAX_RESULTS) break;
+    }
+    listEl.style.display = 'none';
+    resultsEl.style.display = '';
+    if (matches.length === 0) {
+        resultsEl.innerHTML = '<div class="bf-mem-empty">No facts match.</div>';
+        return;
+    }
+    resultsEl.innerHTML = `<div class="bf-mem-hint" style="margin-bottom:6px;">${matches.length}${matches.length >= MAX_RESULTS ? '+' : ''} match(es)${matches.length >= MAX_RESULTS ? ' (showing first ' + MAX_RESULTS + ')' : ''}. Click Open to edit/delete.</div>`
+        + matches.map(({ category, fact }) => {
+            const cold = (() => { try { return isColdFact(fact); } catch { return false; } })();
+            return `<div class="bf-mem-fact-row" style="border-bottom:1px solid var(--SmartThemeBorderColor,#444);padding:6px 0;display:flex;gap:8px;align-items:flex-start;">
+                <div style="flex:1 1 auto;min-width:0;">
+                    <div><span class="bf-mem-fact-source">[${escapeHtml(category)}]</span> <b>${escapeHtml(fact.key)}</b>${cold ? ' <span class="bf-mem-custom-chip" title="Cold-tiered">cold</span>' : ''}</div>
+                    <div class="bf-mem-fact-value">${escapeHtml(fact.value)}</div>
+                </div>
+                <button class="bf-mem-search-open menu_button" data-category="${escapeHtml(category)}" style="flex:0 0 auto;"><i class="fa-solid fa-up-right-from-square"></i> Open</button>
+            </div>`;
+        }).join('');
+    resultsEl.querySelectorAll('.bf-mem-search-open').forEach(btn => {
+        btn.addEventListener('click', () => viewSingleDatabase(btn.dataset.category, databases));
+    });
+}
+
+/**
+ * One-click "Unlink current chat" (main Database tab). Removes the current chat from EVERY profile
+ * it is linked to and detaches it (so autoSaveDbProfile won't auto-relink on the next CHAT_CHANGED)
+ * — the same effective unlink as the Manage popup, surfaced as a single button. Facts in the live
+ * working store are left untouched (unlink != wipe); they just stop being driven by a profile.
+ */
+function unlinkCurrentChat() {
+    const chatId = getCurrentChatId();
+    if (!chatId) { toastr.warning('No chat currently open', 'BF Memory'); return; }
+    const profiles = extensionSettings?.dbProfiles || {};
+    const linkedTo = Object.entries(profiles).filter(([, p]) => (p?.linkedChats || []).includes(chatId)).map(([n]) => n);
+    if (linkedTo.length === 0 && isChatUnlinked(chatId)) {
+        toastr.info('Current chat is already unlinked', 'BF Memory');
+        return;
+    }
+    if (!confirm('Unlink the current chat from its DB profile? It will stop auto-loading/auto-relinking. Your facts stay in the live store.')) return;
+    for (const name of linkedTo) {
+        const p = profiles[name];
+        if (p?.linkedChats) p.linkedChats = p.linkedChats.filter(id => id !== chatId);
+    }
+    // Detach + drop active-profile pointer so the live session honors the unlink immediately.
+    markChatUnlinked(chatId);
+    if (extensionSettings.activeDbProfile && linkedTo.includes(extensionSettings.activeDbProfile)) {
+        extensionSettings.activeDbProfile = '';
+    }
+    lastAutoLoadedChat = '';
+    saveSettings();
+    refreshDbProfileDropdown();
+    refreshLinkedChatsField();
+    addDebugLog('info', `Unlinked current chat ${chatId} from ${linkedTo.length} profile(s) (detached)`, {
+        subsystem: 'settings', event: 'profile.unlinked', actor: 'USER', reason: 'USER_UNLINK_CURRENT',
+        data: { chatId, profiles: linkedTo },
+    });
+    toastr.success('Current chat unlinked', 'BF Memory');
+}
+
+/**
+ * Import databases from an exported JSON blob. Accepts the export shape ({ category: DatabaseSchema })
+ * — i.e. exactly what the Export button produces. Validates the shape, then on user choice either
+ * REPLACES the store (clear-all first) or MERGES (upsert each fact into the live categories). Either
+ * way the result is persisted through Layer A+B (saveDatabase) and Layer C (saveCurrentToActiveProfile)
+ * so it survives a CHAT_CHANGED reload, mirroring the delete/edit anti-resurrection contract.
+ * @param {string} text - raw JSON file contents
+ */
+async function importDatabasesFromJson(text) {
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { throw new Error('not valid JSON'); }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('expected an object of { category: { facts: [...] } }');
+    }
+    // Shape-validate: every value must look like a DatabaseSchema with a facts array.
+    const incoming = {};
+    let incomingFacts = 0;
+    for (const [category, db] of Object.entries(parsed)) {
+        if (!db || typeof db !== 'object' || !Array.isArray(db.facts)) continue;
+        // Keep only well-formed facts (must have a string key + value).
+        const facts = db.facts.filter(f => f && typeof f === 'object' && typeof f.key === 'string' && f.key);
+        incoming[category] = { ...db, category, facts };
+        incomingFacts += facts.length;
+    }
+    const incomingCats = Object.keys(incoming);
+    if (incomingCats.length === 0 || incomingFacts === 0) {
+        throw new Error('no valid databases/facts found in file');
+    }
+
+    // REPLACE (OK) vs MERGE (Cancel) — explicit confirm with the irreversibility called out.
+    const replace = confirm(`Import ${incomingFacts} fact(s) across ${incomingCats.length} categor(ies).\n\nOK = REPLACE the current store with the file (wipes existing facts first).\nCancel = MERGE the file into the current store (keeps existing, adds/updates).`);
+
+    const {
+        getAllDatabases, saveDatabase, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot,
+        upsertFact, createEmptyDatabase,
+    } = await import('./database.js');
+
+    cancelPendingSnapshot();
+
+    if (replace) {
+        // Wipe Layer A+B (every existing category) and Layer C (profile snapshot) first.
+        const existing = await getAllDatabases();
+        for (const category of Object.keys(existing)) await deleteDatabase(category);
+        pruneActiveProfile(null);
+    }
+
+    // Apply the incoming categories.
+    let merged = 0;
+    if (replace) {
+        for (const [category, db] of Object.entries(incoming)) {
+            if (db.facts.length === 0) continue;
+            await saveDatabase({ ...db, category });
+            merged += db.facts.length;
+        }
+    } else {
+        // MERGE: upsert each incoming fact into the live category (dedup/reconcile via upsertFact).
+        const live = await getAllDatabases();
+        for (const [category, db] of Object.entries(incoming)) {
+            if (db.facts.length === 0) continue;
+            const target = live[category] ? { ...live[category], category } : createEmptyDatabase(category);
+            for (const fact of db.facts) { upsertFact(target, fact); merged++; }
+            await saveDatabase(target);
+        }
+    }
+
+    // Persist Layer C from the now-current working store (allowEmpty not needed: store is populated).
+    await saveCurrentToActiveProfile(null, { allowEmpty: true });
+    await flushSnapshotNow();
+
+    addDebugLog('pass', `Imported ${merged} fact(s) across ${incomingCats.length} categor(ies) (${replace ? 'REPLACE' : 'MERGE'})`, {
+        subsystem: 'import', event: 'db.imported', actor: 'USER', reason: replace ? 'REPLACE' : 'MERGE',
+        data: { categories: incomingCats, incomingFacts, applied: merged, mode: replace ? 'replace' : 'merge' },
+    });
+    toastr.success(`Imported ${merged} fact(s) (${replace ? 'replaced' : 'merged'})`, 'BF Memory');
+    refreshDatabaseView();
 }
 
 // --- DB Profiles ---
@@ -2132,12 +2527,55 @@ async function deleteDbProfile(profileName) {
     if (!profileName) return;
     if (!confirm(`Delete saved profile "${profileName}"? This cannot be undone.`)) return;
 
+    const wasActive = extensionSettings.activeDbProfile === profileName;
+    const profile = extensionSettings.dbProfiles?.[profileName];
+    const linkedChats = [...(profile?.linkedChats || [])];
+    const currentChatId = getCurrentChatId();
+
+    // PROFILE-DELETE CLEANUP: if this profile was driving the CURRENT chat, optionally wipe the
+    // working store too — otherwise its facts are orphaned in IDB+attachments and the next
+    // extraction silently writes them into a freshly auto-created profile (data resurrection by a
+    // different name). Offer the choice; deleting the profile alone keeps the live facts.
+    let alsoWipe = false;
+    if (wasActive && currentChatId && linkedChats.includes(currentChatId)) {
+        alsoWipe = confirm(`"${profileName}" is the active profile for THIS chat. Also clear its facts from this chat's working store?\n\nOK = delete profile AND wipe this chat's facts.\nCancel = delete profile only (facts stay in the live store).`);
+    }
+
     delete extensionSettings.dbProfiles[profileName];
-    if (extensionSettings.activeDbProfile === profileName) {
+    if (wasActive) {
         extensionSettings.activeDbProfile = '';
+        lastAutoLoadedChat = '';
+    }
+    // Drop any detach markers for chats that were linked ONLY to this (now-gone) profile so they
+    // are not stranded as permanently un-auto-linkable.
+    if (Array.isArray(extensionSettings.unlinkedChats)) {
+        extensionSettings.unlinkedChats = extensionSettings.unlinkedChats.filter(id => !!findProfileForChat(id));
     }
     saveSettings();
+
+    if (alsoWipe) {
+        try {
+            const { getAllDatabases, deleteDatabase, flushSnapshotNow, cancelPendingSnapshot } = await import('./database.js');
+            cancelPendingSnapshot();
+            const dbs = await getAllDatabases();
+            for (const category of Object.keys(dbs)) await deleteDatabase(category);
+            await flushSnapshotNow();
+            // The chat now has no profile and an empty store — treat as explicitly detached so it
+            // doesn't immediately auto-create a fresh profile and re-seed.
+            markChatUnlinked(currentChatId);
+            saveSettings();
+            refreshDatabaseView();
+        } catch (err) {
+            addDebugLog('fail', `Profile-delete working-store wipe failed: ${err.message || err}`);
+        }
+    }
+
     refreshDbProfileDropdown();
+    refreshLinkedChatsField();
+    addDebugLog('info', `DB profile deleted: "${profileName}"${alsoWipe ? ' (+ working store wiped)' : ''}`, {
+        subsystem: 'settings', event: 'profile.deleted', actor: 'USER', reason: 'USER_DELETE',
+        data: { profileName, wasActive, linkedChatCount: linkedChats.length, wipedWorkingStore: alsoWipe },
+    });
     toastr.success(`Deleted profile "${profileName}"`, 'BF Memory');
 }
 
@@ -2188,6 +2626,8 @@ function linkChatToProfile(profileName, chatId) {
     if (!profile.linkedChats.includes(chatId)) {
         profile.linkedChats.push(chatId);
     }
+    // An explicit link clears any prior user-detach so auto-link is re-enabled for this chat.
+    clearChatUnlinked(chatId);
     saveSettings();
 }
 
@@ -2291,6 +2731,147 @@ function pruneActiveProfile(category = null) {
     }
     if (profilesPruned.length > 0) saveSettings();
     return { profilesPruned, factsPruned };
+}
+
+/**
+ * Build the same target profile set pruneActiveProfile uses (the active profile + every profile
+ * linked to the current chat). Factored out so the single-fact prune/edit write-through below can
+ * touch EXACTLY the profiles that autoSaveDbProfile could reload from, guaranteeing a per-fact
+ * delete/edit can never be resurrected (same 3-layer guarantee as commit 4e281b7's category delete).
+ * @returns {string[]} profile names to touch
+ */
+function profilesLinkedToCurrentChat() {
+    const profiles = extensionSettings?.dbProfiles;
+    if (!profiles || typeof profiles !== 'object') return [];
+    const targets = new Set();
+    const active = extensionSettings?.activeDbProfile;
+    if (active && profiles[active]) targets.add(active);
+    const chatId = getCurrentChatId();
+    if (chatId) {
+        for (const [name, profile] of Object.entries(profiles)) {
+            if ((profile?.linkedChats || []).includes(chatId)) targets.add(name);
+        }
+    }
+    return [...targets];
+}
+
+/**
+ * Prune a SINGLE fact (by category + key) from Layer C (the dbProfiles snapshot) so a per-fact
+ * delete STICKS and cannot be resurrected by autoSaveDbProfile on the next CHAT_CHANGED. This is
+ * the single-fact counterpart to pruneActiveProfile(category) — it removes only the one fact from
+ * every profile the current chat could reload from (active + chat-linked), leaving every other fact
+ * in those categories intact. Mirrors the working-store removeFact() so the two layers stay in sync.
+ *
+ * @param {string} category - the fact's owning category
+ * @param {string} key - the fact key to remove
+ * @returns {{ profilesPruned: string[], factsPruned: number }}
+ */
+function pruneFactFromProfiles(category, key) {
+    const profiles = extensionSettings?.dbProfiles;
+    if (!profiles || !category || !key) return { profilesPruned: [], factsPruned: 0 };
+    const profilesPruned = [];
+    let factsPruned = 0;
+    for (const name of profilesLinkedToCurrentChat()) {
+        const profile = profiles[name];
+        const db = profile?.databases?.[category];
+        if (!db || !Array.isArray(db.facts)) continue;
+        const before = db.facts.length;
+        db.facts = db.facts.filter(f => f && f.key !== key);
+        const removed = before - db.facts.length;
+        if (removed > 0) {
+            factsPruned += removed;
+            db.updatedAt = Date.now();
+            profile.savedAt = Date.now();
+            profilesPruned.push(name);
+        }
+    }
+    if (profilesPruned.length > 0) saveSettings();
+    return { profilesPruned, factsPruned };
+}
+
+/**
+ * Write an EDITED fact through to Layer C (the dbProfiles snapshot) so an edit STICKS and the next
+ * CHAT_CHANGED reloads the NEW value, not the pre-edit one. Replaces the matching fact (by key) in
+ * every active+chat-linked profile's copy of the category. Mirrors the working-store edit so the
+ * two layers stay in sync (same anti-resurrection guarantee as the delete paths).
+ *
+ * @param {string} category - the fact's owning category
+ * @param {string} key - the fact key to update
+ * @param {import('./database.js').FactSchema} updatedFact - the new fact object (already mutated)
+ * @returns {{ profilesUpdated: string[] }}
+ */
+function updateFactInProfiles(category, key, updatedFact) {
+    const profiles = extensionSettings?.dbProfiles;
+    if (!profiles || !category || !key || !updatedFact) return { profilesUpdated: [] };
+    const profilesUpdated = [];
+    for (const name of profilesLinkedToCurrentChat()) {
+        const profile = profiles[name];
+        const db = profile?.databases?.[category];
+        if (!db || !Array.isArray(db.facts)) continue;
+        const idx = db.facts.findIndex(f => f && f.key === key);
+        if (idx < 0) continue;
+        // Deep-clone so the profile snapshot is independent of the live working-store object.
+        db.facts[idx] = JSON.parse(JSON.stringify(updatedFact));
+        db.updatedAt = Date.now();
+        profile.savedAt = Date.now();
+        profilesUpdated.push(name);
+    }
+    if (profilesUpdated.length > 0) saveSettings();
+    return { profilesUpdated };
+}
+
+/**
+ * Record that the user EXPLICITLY unlinked a chat from every profile, so autoSaveDbProfile will NOT
+ * auto-create/re-link a profile for it on the next CHAT_CHANGED. Without this, re-entering the chat
+ * silently re-links (autoSaveDbProfile's auto-create path) and the unlink appears to "do nothing".
+ * Persisted in extensionSettings.unlinkedChats so the detach survives a reload.
+ * @param {string} chatId
+ */
+function markChatUnlinked(chatId) {
+    if (!chatId) return;
+    if (!Array.isArray(extensionSettings.unlinkedChats)) extensionSettings.unlinkedChats = [];
+    if (!extensionSettings.unlinkedChats.includes(chatId)) {
+        extensionSettings.unlinkedChats.push(chatId);
+    }
+}
+
+/** Re-allow auto-linking for a chat (called whenever the user explicitly links it). */
+function clearChatUnlinked(chatId) {
+    if (!chatId || !Array.isArray(extensionSettings.unlinkedChats)) return;
+    extensionSettings.unlinkedChats = extensionSettings.unlinkedChats.filter(id => id !== chatId);
+}
+
+/** True when the user explicitly detached this chat and we must NOT auto-link it. */
+function isChatUnlinked(chatId) {
+    return !!chatId && Array.isArray(extensionSettings?.unlinkedChats) && extensionSettings.unlinkedChats.includes(chatId);
+}
+
+/**
+ * Make an unlink actually TAKE EFFECT for the live session. When the chat just unlinked is the
+ * CURRENT chat, this: (1) records the detach (so autoSaveDbProfile won't auto-relink on re-entry),
+ * (2) clears activeDbProfile if it pointed at the now-unlinked profile, and (3) resets
+ * lastAutoLoadedChat so a subsequent explicit re-link can reload. Without this, unlinking only
+ * edited the linkedChats array while the active profile + working store stayed put and the chat
+ * auto-relinked on the next CHAT_CHANGED — i.e. unlink "did nothing". No-op for a non-current chat
+ * (that chat will simply not auto-load this profile next time it is opened).
+ * @param {string} unlinkedChatId - the chat id just removed from the profile
+ * @param {string} profileName - the profile it was removed from
+ */
+function detachCurrentChatIfNeeded(unlinkedChatId, profileName) {
+    const currentChatId = getCurrentChatId();
+    if (!unlinkedChatId || unlinkedChatId !== currentChatId) return;
+    // The current chat no longer belongs to ANY profile -> stop auto-relinking it.
+    if (!findProfileForChat(currentChatId)) {
+        markChatUnlinked(currentChatId);
+    }
+    if (extensionSettings.activeDbProfile === profileName) {
+        extensionSettings.activeDbProfile = '';
+    }
+    lastAutoLoadedChat = '';
+    addDebugLog('info', `Unlinked current chat ${currentChatId} from profile "${profileName}" (detached: no auto-relink)`, {
+        subsystem: 'settings', event: 'profile.unlinked', actor: 'USER', reason: 'USER_UNLINK',
+        data: { chatId: currentChatId, profileName, stillLinkedElsewhere: !!findProfileForChat(currentChatId) },
+    });
 }
 
 /**
@@ -2494,6 +3075,27 @@ async function autoSaveDbProfile() {
         // Check if this chat has a linked profile
         let profileToLoad = findProfileForChat(chatId);
 
+        // RESPECT EXPLICIT UNLINK: if the user detached THIS chat from every profile (via the
+        // Manage popup / "Unlink current chat" button), do NOT auto-create or re-link a profile
+        // for it. Without this the auto-create path below silently re-links on re-entry and the
+        // unlink appears to "do nothing". The chat runs with whatever is in the working store and
+        // no profile is reloaded over it. (Explicitly linking the chat again clears this flag.)
+        if (!profileToLoad && isChatUnlinked(chatId)) {
+            // Make sure we are not still pointing at a now-detached active profile.
+            if (extensionSettings.activeDbProfile && !findProfileForChat(chatId)) {
+                extensionSettings.activeDbProfile = '';
+                saveSettings();
+                refreshDbProfileDropdown();
+                refreshLinkedChatsField();
+            }
+            addDebugLog('info', `Auto-link suppressed: chat ${chatId} was explicitly unlinked by user`, {
+                subsystem: 'settings', event: 'profile.autolinkSuppressed', actor: 'USER', reason: 'EXPLICIT_UNLINK',
+                data: { chatId },
+            });
+            lastAutoLoadedChat = chatId;
+            return;
+        }
+
         // If no linked profile exists, create one named after the chat/character
         if (!profileToLoad && chatLabel) {
             // Only auto-create if we're entering a chat for the first time
@@ -2626,6 +3228,7 @@ async function showLinkedChatsPopup() {
             const idx = profile.linkedChats.indexOf(chatId);
             if (idx >= 0) {
                 profile.linkedChats.splice(idx, 1);
+                detachCurrentChatIfNeeded(chatId, profileName);
                 saveSettings();
                 refreshLinkedChatsField();
                 refreshDbProfileDropdown();
@@ -2654,6 +3257,10 @@ async function showLinkedChatsPopup() {
             }
         }
         profile.linkedChats.push(chatId);
+        // An explicit (re-)link re-enables auto-link for this chat and makes it the active profile.
+        clearChatUnlinked(chatId);
+        extensionSettings.activeDbProfile = profileName;
+        lastAutoLoadedChat = '';
         saveSettings();
         refreshLinkedChatsField();
         refreshDbProfileDropdown();
@@ -3090,6 +3697,15 @@ export async function initSettings() {
     $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
     $('#bf_mem_browse_db').on('click', () => showAllDatabases());
 
+    // Cross-category live search: filters the whole store by key/value/note substring. Hides the
+    // per-category cards while a query is active and shows matching facts grouped by category, each
+    // with an "Open" link into that category's manager (where it can be edited/deleted).
+    $('#bf_mem_db_search').on('input', () => runDatabaseSearch());
+
+    // Unlink the CURRENT chat from its profile (one-click, on the main tab). Detaches so it won't
+    // auto-relink on the next CHAT_CHANGED — makes unlink actually stick.
+    $('#bf_mem_db_unlink_current').on('click', () => unlinkCurrentChat());
+
     // Add-label (user taxonomy overlay) controls.
     $('#bf_mem_addleaf_btn').on('click', () => {
         addUserLeaf(
@@ -3120,6 +3736,23 @@ export async function initSettings() {
             subsystem: 'import', event: 'db.exported', actor: 'USER', data: { dbCount, totalFacts },
         });
         toastr.success('Databases exported', 'BF Memory');
+    });
+
+    // IMPORT: file-picker -> validate JSON shape -> merge or replace -> persist Layer A+B+C.
+    $('#bf_mem_import_db').on('click', () => $('#bf_mem_import_file').trigger('click'));
+    $('#bf_mem_import_file').on('change', async function () {
+        const file = this.files && this.files[0];
+        this.value = ''; // reset so re-picking the same file fires change again
+        if (!file) return;
+        try {
+            const text = await file.text();
+            await importDatabasesFromJson(text);
+        } catch (err) {
+            addDebugLog('fail', `DB import failed: ${err.message || err}`, {
+                subsystem: 'import', event: 'db.importFailed', actor: 'USER', reason: 'ERROR', data: { error: String(err.message || err) },
+            });
+            toastr.error(`Import failed: ${err.message || err}`, 'BF Memory');
+        }
     });
 
     $('#bf_mem_clear_db').on('click', async () => {

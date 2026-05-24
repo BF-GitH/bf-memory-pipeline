@@ -456,8 +456,11 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                 <button id="bf_mem_db_linked_manage" class="menu_button" title="Manage linked chats">
                                     <i class="fa-solid fa-pen-to-square"></i> Manage
                                 </button>
+                                <button id="bf_mem_db_unlink_current" class="menu_button" title="Unlink the current chat from its profile (stops auto-relink)">
+                                    <i class="fa-solid fa-link-slash"></i> Unlink current
+                                </button>
                             </div>
-                            <small class="bf-mem-hint">Chats auto-link when opened. Click Manage to add/remove links.</small>
+                            <small class="bf-mem-hint">Chats auto-link when opened. Manage to add/remove links. "Unlink current" detaches this chat so it won't auto-relink.</small>
                         </div>
                     </div>
                 </div>
@@ -495,6 +498,10 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                     </div>
                     <div class="bf-mem-section-body">
                         <div id="bf_mem_db_stats" class="bf-mem-db-stats">Loading...</div>
+                        <div class="bf-mem-field" style="margin:6px 0;">
+                            <input type="text" id="bf_mem_db_search" class="text_pole" placeholder="Search facts across all categories (key / value / note)…" style="width:100%;" />
+                        </div>
+                        <div id="bf_mem_db_search_results" class="bf-mem-fact-list" style="display:none;"></div>
                         <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
 
                         <!-- Add your own taxonomy labels (user overlay, global across chats) -->
@@ -547,6 +554,10 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <button id="bf_mem_export_db" class="menu_button">
                                 <i class="fa-solid fa-download"></i> Export
                             </button>
+                            <button id="bf_mem_import_db" class="menu_button">
+                                <i class="fa-solid fa-upload"></i> Import
+                            </button>
+                            <input type="file" id="bf_mem_import_file" accept="application/json,.json" style="display:none;" />
                             <button id="bf_mem_clear_db" class="menu_button redWarningBG">
                                 <i class="fa-solid fa-trash"></i> Clear All
                             </button>
