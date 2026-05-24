@@ -2624,6 +2624,51 @@ function findProfileForChat(chatId) {
     return null;
 }
 
+/**
+ * Strip ST's " - Branch #N" suffix from a branched chat's id to recover the PARENT chat id.
+ * ST names a branch "<parent chat id> - Branch #N" (see isBranchChat). Returns the parent id, or
+ * the original id when no branch suffix is present. Used only by the branch-inherit resolution.
+ * @param {string} chatId
+ * @returns {string}
+ */
+function parentChatIdOfBranch(chatId) {
+    if (typeof chatId !== 'string') return chatId;
+    // Remove a trailing " - Branch #N" (and any nested " - Branch #M - Branch #N" chain).
+    let id = chatId;
+    let prev;
+    do {
+        prev = id;
+        id = id.replace(/\s*-\s*Branch\s*#\s*\d+\s*$/i, '');
+    } while (id !== prev);
+    return id;
+}
+
+/**
+ * BRANCH INHERIT (data-safety): resolve the profile a BRANCH chat should inherit from its parent.
+ * A branch gets a brand-new chatId that is in no profile's linkedChats, so findProfileForChat()
+ * returns null and the auto-create path would mint an EMPTY skeleton profile — diverging the branch
+ * from the parent's accumulated memory. Default behavior is INHERIT: resolve the branch to the SAME
+ * profile the parent uses (the avatar-keyed working store already holds the parent's facts; we just
+ * must not mis-resolve to an empty profile). We try, in order: the parent chatId's linked profile,
+ * then the character-named profile (the conventional auto-create name). Returns the profile name or
+ * null when no parent profile exists yet.
+ * @param {string} chatId - the branch chat id
+ * @returns {string|null}
+ */
+function resolveBranchParentProfile(chatId) {
+    if (!chatId || !extensionSettings?.dbProfiles) return null;
+    const parentId = parentChatIdOfBranch(chatId);
+    if (parentId && parentId !== chatId) {
+        const byParent = findProfileForChat(parentId);
+        if (byParent) return byParent;
+    }
+    // Fall back to the conventional character-named profile (getCurrentChatLabel defaults to the
+    // character name, which is what the parent's first chat auto-created).
+    const charName = getContext()?.characters?.[getContext()?.characterId]?.name || '';
+    if (charName && extensionSettings.dbProfiles[charName]) return charName;
+    return null;
+}
+
 /** Link a chat to a profile */
 function linkChatToProfile(profileName, chatId) {
     if (!profileName || !chatId) return;
@@ -3135,6 +3180,26 @@ async function autoSaveDbProfile() {
             return;
         }
 
+        // BRANCH INHERIT (data-safety, default = INHERIT): a branched chat has a brand-new chatId
+        // that is in no profile's linkedChats, so findProfileForChat() above returned null. Rather
+        // than auto-creating an EMPTY skeleton profile (which would diverge the branch from the
+        // parent's accumulated memory and, via the old destructive load, blank the shared
+        // avatar-keyed working store), resolve the branch to the PARENT's existing profile and link
+        // this branch id to it. The avatar store already holds the parent's facts; inheriting the
+        // parent profile means the load block re-applies the parent's facts (not an empty skeleton).
+        if (!profileToLoad && isBranch) {
+            const parentProfile = resolveBranchParentProfile(chatId);
+            if (parentProfile) {
+                linkChatToProfile(parentProfile, chatId);
+                profileToLoad = parentProfile;
+                linkState = 'inherited-branch';
+                addDebugLog('info', `Branch inherited parent DB profile "${parentProfile}" for chat ${chatId}`, {
+                    subsystem: 'db', event: 'db.connect', actor: 'SYSTEM', reason: 'BRANCH_INHERIT',
+                    data: { chatId, resolvedProfile: parentProfile, parentChatId: parentChatIdOfBranch(chatId), isBranch: true },
+                });
+            }
+        }
+
         // If no linked profile exists, create one named after the chat/character
         if (!profileToLoad && chatLabel) {
             // Only auto-create if we're entering a chat for the first time
@@ -3173,18 +3238,41 @@ async function autoSaveDbProfile() {
             const profile = extensionSettings.dbProfiles[profileToLoad];
             const { getAllDatabases, deleteDatabase, saveDatabase } = await import('./database.js');
 
-            // Clear existing
-            const existing = await getAllDatabases();
-            for (const category of Object.keys(existing)) {
-                await deleteDatabase(category);
-            }
+            // DATA-SAFETY FIX (non-destructive empty-profile load): count the facts the resolved
+            // profile would actually install. A freshly auto-created / skeleton profile carries ZERO
+            // facts — and the OLD code unconditionally delete-all'd every live category (wiping the
+            // shared avatar-keyed IDB record AND its durable attachment files) and then re-wrote only
+            // the profile's NON-empty categories. For an empty profile that BLANKED the working store
+            // → retrieval saw 0 facts → extraction minted fresh DBs → the stamp race rehydrated stale
+            // data back. Opening a chat must NEVER blank existing memory.
+            const profileFactCount = Object.values(profile.databases || {})
+                .reduce((n, db) => n + ((db && Array.isArray(db.facts)) ? db.facts.length : 0), 0);
 
-            // Load saved. Skip EMPTY (factless) categories: the Layer-1 skeleton is seeded in
-            // memory and shown via withSkeleton — persisting empty categories as attachments
-            // would spam the backend with empty uploads (write-on-first-fact instead).
-            for (const [category, db] of Object.entries(profile.databases || {})) {
-                if (!db || !Array.isArray(db.facts) || db.facts.length === 0) continue;
-                await saveDatabase({ ...db, category });
+            if (profileFactCount === 0) {
+                // EMPTY PROFILE → do NOT clear. Leave the avatar-keyed working store INTACT; the
+                // empty Layer-1 skeleton is layered UNDER it via withSkeleton at the menu/Database
+                // tab. This makes a fresh branch / empty-profile chat inherit whatever the shared
+                // avatar store already holds instead of being wiped to empty.
+                const live = await getAllDatabases();
+                const liveFacts = Object.values(live || {})
+                    .reduce((n, db) => n + ((db?.facts || []).length), 0);
+                addDebugLog('info', `Auto-load SKIPPED clear: profile "${profileToLoad}" has 0 facts — kept live store (${liveFacts} facts)`, {
+                    subsystem: 'db', event: 'db.connect', actor: 'SYSTEM', reason: 'NON_DESTRUCTIVE_EMPTY_PROFILE',
+                    data: { chatId, resolvedProfile: profileToLoad, decision: 'KEEP_LIVE_STORE', profileFactCount, liveFacts, isBranch },
+                });
+            } else {
+                // POPULATED PROFILE → install its facts. Clear existing first (the profile is the
+                // authoritative copy for this chat), then re-write its NON-empty categories. Skip
+                // EMPTY (factless) categories: the Layer-1 skeleton is seeded in memory and shown via
+                // withSkeleton — persisting empty categories as attachments would spam the backend.
+                const existing = await getAllDatabases();
+                for (const category of Object.keys(existing)) {
+                    await deleteDatabase(category);
+                }
+                for (const [category, db] of Object.entries(profile.databases || {})) {
+                    if (!db || !Array.isArray(db.facts) || db.facts.length === 0) continue;
+                    await saveDatabase({ ...db, category });
+                }
             }
 
             extensionSettings.activeDbProfile = profileToLoad;
@@ -4080,6 +4168,30 @@ export async function initSettings() {
         // buffer to the new chat — otherwise the last few (esp. verbose) lines of the chat you're
         // leaving are lost. Targets the tracked old chatId (the live one has already advanced).
         await flushOutgoingChatLog();
+
+        // DATA-SAFETY FIX (coordinated CHAT_CHANGED): flush the durable IDB→attachment snapshot for
+        // the OUTGOING character's working store BEFORE autoSaveDbProfile clears/reloads it. This is
+        // a SINGLE awaited sequence so the outgoing chat's tail facts are persisted before any clear
+        // runs (the prior un-awaited flushSnapshotNow() in pipeline.js raced the clear and could
+        // snapshot an already-emptied store / capture the wrong chat's facts). For a same-character
+        // chat-switch/branch the live avatar == the outgoing avatar, so flushing the live avatar
+        // pins the correct store. reconcileDeletes:FALSE so a transiently-empty working store cannot
+        // delete durable backup files — only a USER-destructive op may prune attachments.
+        try {
+            const { flushSnapshotNow, invalidateDatabaseCache } = await import('./database.js');
+            const outgoingAvatar = getContext()?.characters?.[getContext()?.characterId]?.avatar || null;
+            await flushSnapshotNow({ avatar: outgoingAvatar, reconcileDeletes: false });
+            // Drop the per-turn cache (now partitioned by avatar+chatId) so the autoload + the new
+            // chat's first read re-fetch fresh and cannot serve the outgoing chat's cached map.
+            invalidateDatabaseCache();
+            addDebugLog('debug', `Coordinated flush before autoload (outgoing avatar pinned)`, {
+                subsystem: 'db', event: 'chat.switch', actor: 'SYSTEM', reason: 'COORDINATED_FLUSH',
+                data: { from: fromChatId || null, to: toChatId || null, avatar: outgoingAvatar || null },
+            });
+        } catch (e) {
+            console.error('[BFMemory] coordinated chat-switch flush failed', e);
+        }
+
         await autoSaveDbProfile();
         // Reload the persistent debug log AND fact panels from the new chat's metadata
         // so each chat shows its own history (not a stale cross-chat snapshot).
@@ -4125,8 +4237,9 @@ export async function initSettings() {
         // newest facts reach the backend before reload. beforeunload can't reliably AWAIT the
         // async upload, so the throttled cadence (every ~15s) remains the real guarantee; this
         // is a final nudge. Fire-and-forget + self-guarded (never throws). Imported lazily to
-        // avoid a static settings.js→database.js cycle.
-        import('./database.js').then(m => m.flushSnapshotNow?.()).catch(() => {});
+        // avoid a static settings.js→database.js cycle. reconcileDeletes:FALSE — a non-user
+        // teardown flush must never DELETE durable backup files (only a USER clear/delete prunes).
+        import('./database.js').then(m => m.flushSnapshotNow?.({ reconcileDeletes: false })).catch(() => {});
     });
 
     // Note: removed MESSAGE_RECEIVED → saveCurrentToActiveProfile() handler.

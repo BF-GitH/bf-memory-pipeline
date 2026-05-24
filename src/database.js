@@ -1016,6 +1016,22 @@ function getCharacterAvatar() {
     return context.characters?.[context.characterId]?.avatar || null;
 }
 
+/**
+ * Current chat id (the unique chat filename), or '' when none. Used ONLY to partition the
+ * per-turn getAllDatabases() cache so a same-character chat-switch (where the avatar is
+ * unchanged) cannot serve the previous chat's cached fact map. Storage itself stays
+ * avatar-keyed; this is a cache-validity discriminator, never a storage key.
+ * @returns {string}
+ */
+function getCurrentChatIdSafe() {
+    try {
+        const ctx = host.getCtx();
+        return ctx?.getCurrentChatId?.() || ctx?.chatId || '';
+    } catch {
+        return '';
+    }
+}
+
 // =============================================================================
 // HYBRID PERSISTENCE LAYER (IndexedDB working store + attachment durable snapshot)
 // =============================================================================
@@ -1235,9 +1251,16 @@ function scheduleSnapshot(avatar) {
  * Single-flight + best-effort: clears the dirty flag up-front so writes during the (slow) upload
  * re-mark it for the next pass. NEVER throws into callers.
  * @param {string} avatar
+ * @param {{ reconcileDeletes?: boolean }} [options]
+ * @param {boolean} [options.reconcileDeletes=true] - when true (default: USER-destructive flush
+ *   cadence), remove durable attachment files for categories no longer live in IDB. When FALSE
+ *   (chat-switch / beforeunload flush) we DO NOT delete durable files — a transiently-empty
+ *   working store (e.g. mid chat-switch, before the new chat's facts load) must never escalate
+ *   recoverable staleness into PERMANENT backup destruction. Only an emptied-by-WRITE category is
+ *   ever reconciled away.
  * @returns {Promise<void>}
  */
-async function snapshotAvatar(avatar) {
+async function snapshotAvatar(avatar, { reconcileDeletes = true } = {}) {
     if (!avatar || !idbAvailable()) return;
     if (_snapshotInFlight) { _snapshotDirty.add(avatar); return; } // coalesce; retry next tick
     if (!_snapshotDirty.has(avatar)) return;
@@ -1269,10 +1292,20 @@ async function snapshotAvatar(avatar) {
         // facts in IDB (emptied by clear/supersession or never re-written). Without this, an
         // emptied category's old attachment survives and can rehydrate the working store. We match
         // on the canonical `bf_memory_db_<slug>.json` shape and compare against the live slug set.
-        const reconciled = await reconcileDeletedAttachments(avatar, liveCategories);
+        //
+        // DATA-SAFETY FIX (coordinated CHAT_CHANGED): reconcile is SKIPPED when reconcileDeletes is
+        // false (a chat-switch / beforeunload flush). A chat-switch can transiently empty the shared
+        // avatar working store (e.g. before the incoming chat's facts load); deleting durable backup
+        // files in that window would turn recoverable staleness into PERMANENT loss with nothing left
+        // to rehydrate from. Durable file removal happens only on a USER-destructive op (which calls
+        // deleteDatabase — that removes the file inline — and/or flushes with reconcileDeletes:true).
+        let reconciled = 0;
+        if (reconcileDeletes) {
+            reconciled = await reconcileDeletedAttachments(avatar, liveCategories);
+        }
         addDebugLog('debug', 'Durable snapshot written (IDB → attachments)', {
             subsystem: 'db', event: 'db.snapshot',
-            data: { updatedAt: stamp, liveCategories: liveCategories.size, attachmentsRemoved: reconciled },
+            data: { updatedAt: stamp, liveCategories: liveCategories.size, attachmentsRemoved: reconciled, reconcileDeletes },
         });
     } catch (e) {
         _snapshotDirty.add(avatar); // re-mark so a later cadence retries; never propagate
@@ -1344,19 +1377,27 @@ export function cancelPendingSnapshot(avatar) {
 }
 
 /**
- * Force an immediate durable snapshot of the CURRENT character's IDB state to attachments.
+ * Force an immediate durable snapshot of a character's IDB state to attachments.
  * Exported so the orchestrator can flush on a meaningful boundary (CHAT_CHANGED / beforeunload).
  * Best-effort: no-op in attachment-only mode (writes are already durable). Never throws.
+ *
+ * @param {{ avatar?: string, reconcileDeletes?: boolean }} [options]
+ * @param {string} [options.avatar] - PIN a specific avatar to flush (the OUTGOING character on a
+ *   coordinated chat-switch). Defaults to getCharacterAvatar() (the live character) for all the
+ *   existing same-character call sites where the avatar is unchanged.
+ * @param {boolean} [options.reconcileDeletes=true] - pass FALSE on a chat-switch/beforeunload flush
+ *   so a transiently-empty working store can NOT delete durable backup files (see snapshotAvatar).
+ *   USER-destructive flushes keep the default (true) so a real clear/delete still prunes leftovers.
  * @returns {Promise<void>}
  */
-export async function flushSnapshotNow() {
+export async function flushSnapshotNow({ avatar: pinnedAvatar, reconcileDeletes = true } = {}) {
     try {
         if (!idbAvailable()) return;
-        const avatar = getCharacterAvatar();
+        const avatar = pinnedAvatar || getCharacterAvatar();
         if (!avatar) return;
         if (_snapshotTimers.has(avatar)) { clearTimeout(_snapshotTimers.get(avatar)); _snapshotTimers.delete(avatar); }
         _snapshotDirty.add(avatar); // ensure snapshotAvatar runs even if no timer was armed
-        await snapshotAvatar(avatar);
+        await snapshotAvatar(avatar, { reconcileDeletes });
     } catch (e) {
         console.error('[BFMemory] flushSnapshotNow failed', e);
     }
@@ -1384,6 +1425,7 @@ export async function flushSnapshotNow() {
 // never serve a mutated-but-unsaved map across a write boundary.
 let _dbCache = null;          // resolved map (Object<string, DatabaseSchema>)
 let _dbCacheAvatar = null;    // avatar the cached map belongs to
+let _dbCacheChatId = null;    // chatId the cached map belongs to (same-character chat-switch guard)
 let _dbCachePromise = null;   // in-flight load promise (deduped concurrent callers)
 
 /**
@@ -1394,6 +1436,7 @@ let _dbCachePromise = null;   // in-flight load promise (deduped concurrent call
 export function invalidateDatabaseCache() {
     _dbCache = null;
     _dbCacheAvatar = null;
+    _dbCacheChatId = null;
     _dbCachePromise = null;
     // The per-turn in-memory fact index is derived from the cached map, so it must be dropped
     // on the SAME invalidation boundary (write / chat-change) — otherwise an indexed query
@@ -1409,24 +1452,31 @@ export function invalidateDatabaseCache() {
 export async function getAllDatabases() {
     const avatar = getCharacterAvatar();
     if (!avatar) return {};
+    // Partition the cache by (avatar, chatId) as well: a same-character chat-switch keeps the
+    // avatar unchanged, so without the chatId discriminator the avatar-only validity check would
+    // serve the PREVIOUS chat's cached map to the new chat's first turn (stale fact set). Storage
+    // remains avatar-keyed — this only governs cache validity / the in-flight commit guard.
+    const chatId = getCurrentChatIdSafe();
 
-    // Serve the cache only when it belongs to the CURRENT character (a character switch
-    // without a CHAT_CHANGED must still never leak another character's facts).
-    if (_dbCache && _dbCacheAvatar === avatar) return _dbCache;
+    // Serve the cache only when it belongs to the CURRENT character AND chat (a character OR a
+    // same-character chat switch must never leak another context's facts).
+    if (_dbCache && _dbCacheAvatar === avatar && _dbCacheChatId === chatId) return _dbCache;
     // Share an in-flight load so concurrent callers in the same turn don't each re-fetch.
-    if (_dbCachePromise && _dbCacheAvatar === avatar) return _dbCachePromise;
+    if (_dbCachePromise && _dbCacheAvatar === avatar && _dbCacheChatId === chatId) return _dbCachePromise;
 
     _dbCacheAvatar = avatar;
+    _dbCacheChatId = chatId;
     _dbCachePromise = (async () => {
         try {
             const result = await loadAllDatabases(avatar);
-            // Only commit to the cache if the avatar hasn't changed under us mid-load and
-            // the cache wasn't invalidated (a write during the fetch nulls _dbCacheAvatar).
-            if (_dbCacheAvatar === avatar) _dbCache = result;
+            // Only commit to the cache if neither the avatar NOR the chatId changed under us mid-load
+            // and the cache wasn't invalidated (a write/switch during the fetch nulls the keys). This
+            // stops a load started under chat A from committing under chat B (same character).
+            if (_dbCacheAvatar === avatar && _dbCacheChatId === chatId) _dbCache = result;
             return result;
         } finally {
             // Clear the in-flight marker only if it's still ours.
-            if (_dbCacheAvatar === avatar) _dbCachePromise = null;
+            if (_dbCacheAvatar === avatar && _dbCacheChatId === chatId) _dbCachePromise = null;
         }
     })();
     return _dbCachePromise;
@@ -1981,11 +2031,39 @@ async function loadAllDatabases(avatar) {
 
         // CASE B — REHYDRATE: the attachment snapshot is strictly NEWER than IDB (another device,
         // or local IDB empty/stale). Adopt the snapshot into IDB and serve it.
+        //
+        // Strict `>` is required: on an EQUAL stamp the IDB working store is authoritative and we
+        // fall through to CASE C (a clean flush makes attachStamp == idbStamp, so a no-op rehydrate
+        // must never fire). The version stamp is now the logical data version (attachmentSnapshotStamp
+        // no longer folds in file upload time), so `attachStamp > idbStamp` should only be true for a
+        // genuinely newer snapshot.
         if (attachHasData && attachStamp > idbStamp) {
+            // CLOBBER GUARD (data-safety): even when the stamp says the attachment is newer, REFUSE
+            // to replace a POPULATED live working store with attachment data that holds FEWER total
+            // facts. A rehydrate must never SHRINK the live fact set — that is the signature of a
+            // stale/partial snapshot (e.g. a sibling chat's older flush, or a snapshot captured mid
+            // clear) winning the version compare and resurrecting old/empty state over fresh work.
+            // The invariant: a rehydrate may only ADD or REPLACE-WITH-MORE, never reduce. When in
+            // doubt we KEEP the live data (fall through to CASE C → serve IDB).
+            const factsBefore = countFacts(idbDatabases);
+            const factsAfter = countFacts(attachMap);
+            if (idbHasData && factsBefore > 0 && factsAfter < factsBefore) {
+                addDebugLog('info', 'Rehydrate refused: attachment snapshot would SHRINK live facts (clobber guard)', {
+                    subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'CLOBBER_GUARD',
+                    data: {
+                        attachStamp, idbStamp, avatar, decision: 'KEEP_IDB',
+                        // before = live IDB (kept); after = the smaller attachment set we refused.
+                        categoriesBefore: countCats(idbDatabases), factsBefore,
+                        categoriesAfter: countCats(attachMap), factsAfter,
+                    },
+                });
+                return rec.databases; // keep the richer live working store; do NOT clobber
+            }
             await idbPutDatabases(avatar, attachMap, attachStamp);
             addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
-                subsystem: 'db', event: 'db.rehydrated', data: {
-                    attachStamp, idbStamp, avatar,
+                subsystem: 'db', event: 'db.rehydrated', actor: 'SYSTEM', reason: 'NEWER_SNAPSHOT',
+                data: {
+                    attachStamp, idbStamp, avatar, decision: 'ADOPT_ATTACHMENT',
                     // before = IDB state being overwritten; after = attachment data rehydrated in.
                     // before > after means an OLD snapshot clobbered newer working data.
                     categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
@@ -2008,29 +2086,49 @@ async function loadAllDatabases(avatar) {
 }
 
 /**
- * Compute the snapshot "version" stamp for an avatar's attachment files. Prefers the max
- * `updatedAt` stamped into the parsed DBs (written by snapshotAvatar); falls back to the max
- * attachment `created` time on the file metadata (covers legacy files with no stamp). Returns 0
- * when there are no DB attachments. Used by the rehydrate version-compare in loadAllDatabases.
+ * Compute the snapshot "version" stamp for an avatar's attachment files. This is the LOGICAL
+ * data version, NOT a file-landing time.
+ *
+ * DATA-SAFETY FIX (version stamp): we use ONLY the max embedded `db.updatedAt` (the value baked
+ * into the payload by snapshotAvatar at the moment the DATA changed). We deliberately do NOT fold
+ * in the attachment file `created` time — that is set to `Date.now()` at UPLOAD COMPLETION, which
+ * on the throttled snapshot path is up to SNAPSHOT_THROTTLE_MS (15s) AFTER the data was actually
+ * made. Folding `created` in let a snapshot of OLD data that merely finished uploading recently
+ * win a `>` compare and clobber the FRESH IDB working store (the observed 15,569ms ≈ throttle gap).
+ *
+ * After a clean flush, snapshotAvatar stamps the payload `updatedAt` == the IDB record's
+ * `updatedAt`, so `attachStamp === idbStamp` and the rehydrate (CASE B) cannot spuriously fire.
+ *
+ * LEGACY FALLBACK: `created` is consulted ONLY for genuinely stampless legacy files (none of the
+ * parsed DBs carried an embedded `updatedAt`). Even then it can only RAISE a still-zero stamp; it
+ * can never exceed a real embedded data version. Returns 0 when there are no DB attachments.
  * @param {string} avatar
  * @param {Object<string, DatabaseSchema>} parsedMap - already-parsed attachment DB map
  * @returns {number}
  */
 function attachmentSnapshotStamp(avatar, parsedMap) {
     let max = 0;
+    let sawEmbeddedStamp = false;
     for (const db of Object.values(parsedMap || {})) {
         const u = Number(db?.updatedAt) || 0;
+        if (u > 0) sawEmbeddedStamp = true;
         if (u > max) max = u;
     }
-    try {
-        const context = getContext();
-        const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
-        for (const a of attachments) {
-            if (!a.name?.startsWith(DB_PREFIX)) continue;
-            const c = Number(a.created) || 0;
-            if (c > max) max = c;
-        }
-    } catch { /* ignore */ }
+    // LEGACY ONLY: if NO parsed DB carried an embedded logical `updatedAt`, fall back to the
+    // file `created` time so a truly stampless legacy snapshot can still migrate/rehydrate once.
+    // We never mix `created` with a real embedded stamp — the upload-completion time is a landing
+    // time, not a data version, and mixing it is exactly the bug that clobbered fresh data.
+    if (!sawEmbeddedStamp) {
+        try {
+            const context = getContext();
+            const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
+            for (const a of attachments) {
+                if (!a.name?.startsWith(DB_PREFIX)) continue;
+                const c = Number(a.created) || 0;
+                if (c > max) max = c;
+            }
+        } catch { /* ignore */ }
+    }
     return max;
 }
 
@@ -2272,7 +2370,12 @@ async function saveDatabaseToAttachment(avatar, db) {
         url: fileUrl,
         size: content.length,
         name: fileName,
-        created: Date.now(),
+        // DATA-SAFETY FIX (version stamp): stamp the file metadata `created` with the payload's
+        // LOGICAL data version (`db.updatedAt`) rather than the upload-completion wall-clock, so
+        // file metadata matches the data it carries. The version compare (attachmentSnapshotStamp)
+        // reads the embedded `db.updatedAt` and only consults `created` for stampless legacy files,
+        // but keeping them consistent prevents any path from resurrecting the old drift.
+        created: Number(db?.updatedAt) || Date.now(),
     });
 
     // Save settings immediately (not debounced) to prevent data loss on page close

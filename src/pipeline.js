@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPic
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow, markFactsUsed, applyBufferedFactUsage } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
@@ -1576,14 +1576,16 @@ export function initPipeline() {
 
     // Reset on chat change
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
-        // HYBRID PERSISTENCE: force the durable IDB→attachment snapshot to flush at this
-        // meaningful boundary so a chat switch can't strand un-snapshotted fact writes in the
-        // throttle window. Best-effort + self-guarded; no-op in attachment-only mode. We flush
-        // BEFORE invalidating the cache (flush reads IDB directly, not the cache, so order is
-        // immaterial — but doing it first keeps intent clear).
-        flushSnapshotNow();
-        // Per-turn getAllDatabases() cache: a chat (and possibly character) switch means
-        // the cached fact map no longer applies — drop it so the new chat re-reads fresh.
+        // DATA-SAFETY FIX (coordinated CHAT_CHANGED): the durable IDB→attachment flush is NO LONGER
+        // fired here. It used to run UN-AWAITED (`flushSnapshotNow()`) and raced the settings.js
+        // handler's `await autoSaveDbProfile()` which clears/reloads the shared avatar working store
+        // — the fire-and-forget flush could capture the wrong chat's facts or snapshot an already
+        // emptied store, and its reconcile could DELETE durable backup files for transiently-empty
+        // categories. The flush now lives inside the settings.js CHAT_CHANGED handler as a single
+        // AWAITED sequence (pinned outgoing avatar, reconcileDeletes:false) that runs BEFORE the
+        // autoload clear. Here we only drop the per-turn cache so this handler can't serve a stale
+        // (pre-switch) map; the cache is partitioned by (avatar, chatId), so a same-character switch
+        // is invalidated too.
         invalidateDatabaseCache();
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
