@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.22.0] - 2026-05-24
+
+### Changed — agents renamed, menus reorganized, Scribe prompt reworked
+A clarity + usability pass across the whole UI and the memory-extraction prompt.
+
+**Agents renamed (UI labels only; internal keys unchanged).** Agent 1 → **Drafter**, Agent 2 → **Writer**, Agent 3 → **Scribe** (writes facts to memory), Agent 4 → **Librarian** (fetches facts for the Writer). Settings tabs reordered chronologically — **Drafter → Librarian → Writer → Scribe** → General → Database → Last Generated → Last Inserted → Tokens → Debug — and the Librarian got its **own tab** (the finder toggle / connection profile / prompt moved there from the Writer tab). ([templates/settings.html](templates/settings.html), [src/settings.js](src/settings.js))
+
+**Scribe (memory) prompt reworked.** Now explicitly instructed to **read the whole message including dialogue** (dialogue is the best signal for character growth + relationships); the `>note` field is used for a **verbatim quote OR a short summary** when atomic tags can't carry the moment; uncertain one-offs are **recorded to `Unsorted`/misc** (with `conf:low`) instead of skipped, and the reflection pass gained a **re-evaluation step** that later promotes recurring misc facts to a proper aspect or drops confirmed one-offs. The per-message character limit on the Drafter's view was **removed** (it reads full messages now). ([src/agent-memory.js](src/agent-memory.js), [src/agent-reflect.js](src/agent-reflect.js), [src/pipeline.js](src/pipeline.js))
+
+**Value↔note: store both, slim at injection.** The Scribe always writes BOTH the atomic value and (when warranted) the note — full fidelity in the DB. The **Writer injection now shows the note in place of the value** when a fact has one (the note already contains the gist), avoiding value+note duplication in the Writer's context. Applies across all three injection formatters. ([src/agent-memory.js](src/agent-memory.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-finder.js](src/agent-finder.js), [src/pipeline.js](src/pipeline.js))
+
+**Menu cleanup.** Removed the inert secondary/tertiary chance sliders (dead since deterministic retrieval), the "story so far" checkbox, and the "use separate profiles" toggle (per-agent connection profiles are now always active via [src/profiler.js](src/profiler.js)). The Librarian context slider was replaced with an explanation (it always reads the last 2 messages). The Scribe tab was reordered (prompt up top, re-evaluation fields at the bottom). ([templates/settings.html](templates/settings.html), [src/settings.js](src/settings.js), [src/profiler.js](src/profiler.js))
+
+**Prompt transparency.** Each agent's prompt editor now has a read-only **"What actually gets sent (assembly order)"** box showing how the final prompt is built (system prompt + the auto-injected character card / persona / Memory Menu / recent chat / facts / scene card / draft), accurate to the actual `build*Prompt` / `buildWriterInjection` code. ([templates/settings.html](templates/settings.html), [style.css](style.css))
+
+**Verbose log persisted to its own file.** The full debug log (including verbose) is now written to a dedicated per-chat attachment file (`bf_mem_debuglog_<chat>.json`, capped ~4000 entries, throttled 15s + on unload, reloaded on chat open) — so verbose history survives reload **without** bloating the chat `.jsonl` (a small non-verbose slice still lives in chat metadata for instant paint). ([src/settings.js](src/settings.js), [src/database.js](src/database.js))
+
 ## [0.21.0] - 2026-05-24
 
 ### Added — comprehensive debug logging + queryable Debug tab (Phase 8)
