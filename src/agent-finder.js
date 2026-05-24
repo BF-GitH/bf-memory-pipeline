@@ -208,12 +208,15 @@ export function formatChosenFacts(results) {
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
         const hasValue = String(fact.value ?? '').trim() !== '';
         const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+        // Episodic-memory feature (mirror of formatFactsForWriter): append a `moment`'s short
+        // emotional `tone` compactly so the beat reads with its feeling, e.g. `Events/key: <note> (tense)`.
+        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
         // INJECTION DE-DUPLICATION (mirror of formatFactsForWriter): storage keeps
         // BOTH value and note, but when a note exists it already carries the fact, so
         // inject the NOTE IN PLACE OF the value. With no note, inject `key = value`.
         let line;
         if (note) {
-            line = `${prefix} ${category}/${fact.key}: ${note}`;
+            line = `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
         } else if (hasValue) {
             line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
         } else {

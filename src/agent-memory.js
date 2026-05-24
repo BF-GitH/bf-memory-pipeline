@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, getMemoryIndex, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
+import { getAllDatabases, getMemoryIndex, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -67,6 +67,7 @@ FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 #MEM
 + Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | >context note
 + Category/key_snake_case = atomic value | aspect:revelation | subj:@<name> | !4 | kind:event | >"verbatim quote or summary"   ← keep the atomic value AND add the note; the system shows the note in place of the value to the Writer
++ Events/key_snake_case = atomic value | aspect:milestone | scope:event | with:@<name> | at:<PLACE> | !4 | kind:moment | tone:tender | >who + where + what happened + why it mattered   ← an EPISODIC SCENE MOMENT (see MOMENTS below)
 .
 #WHY <one sentence>
 
@@ -89,7 +90,9 @@ Always include the value — the system slims the Writer's context for you.
 
 ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
-IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
+IMPORTANCE + KIND (MANDATORY — put both on EVERY fact): append \`| !N\` where N is 1-5 (how foundational: 5 = core identity like a name/species/age, 4 = important, 3 = ordinary, 2 = minor, 1 = trivial/passing) AND \`| kind:trait|state|event|moment\` (trait = durable identity/personality; state = current/transient mood, goal, or location; event = something that happened; moment = a SIGNIFICANT episodic scene beat remembered with feeling, see MOMENTS). These protect foundational facts from eviction and rank what's retrieved. Quick rule: a name/species/origin is \`!5 kind:trait\`; a current mood/location is \`!1-2 kind:state\`; a thing that happened is \`kind:event\`. Example: \`+ People/user_name = <NAME> | aspect:identity | subj:{{user}} | !5 | kind:trait\`. Do NOT omit them.
+
+MOMENTS (episodic — only for SIGNIFICANT beats): when a genuinely significant emotional/relational SCENE MOMENT occurs — a first (first kiss, first meeting), a turning point, a charged exchange — ALSO record it as a \`kind:moment\` fact filed under \`Events\`. Put the full narrative beat in the NOTE (\`>who + where + what + why it mattered\`) and add a SHORT \`| tone:<word>\` (an emotional label like tender/tense/bittersweet — a few words max). Still write the atomic value too (the existing write-BOTH rule). Moments decay slower than ordinary events and stay recallable. This is for REAL beats ONLY — never every line or routine action — so the store doesn't flood. Example: \`+ Events/first_kiss = first kiss | aspect:milestone | scope:event | with:@<name> | at:the docks | !4 | kind:moment | tone:tender,hesitant | >their first kiss — on the docks at night, right after the fight; the moment the tension finally broke\`.
 
 ASPECT (recommended): append \`| aspect:<value>\` choosing the MOST SPECIFIC Layer-2 sub-bucket from the FIXED menu for the fact's category (see FILING above). E.g. a name/species is \`People\` + \`aspect:identity\`; a current mood is \`People\` + \`aspect:mood\`; a phobia is \`People\` + \`aspect:fears\`; a room's decor is \`Places\` + \`aspect:feature\`. Omit only when genuinely unsure (a default is used). NEVER use an aspect that isn't in that category's menu.
 
@@ -564,7 +567,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let track = '';     // Feature #4: optional sequence track name (`track:<name>`)
         let ord = null;     // Feature #4: optional explicit step number (auto-assigned if absent)
         let importance = null; // Salience feature: optional 1-5 (`!N` marker)
-        let kind = '';         // Salience feature: optional trait|state|event (`kind:` marker)
+        let kind = '';         // Salience feature: optional trait|state|event|moment (`kind:` marker)
         let supersedes = false; // Supersession feature: optional `~` marker (replaces prior value)
         let aliases = [];      // Layer A (alias retrieval): optional alt names/nicknames (`aka:` marker)
         let subject = '';      // Subject axis (feature): optional who/what the fact is about (`subj:` marker)
@@ -573,6 +576,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         let scope = '';        // Scope (feature): optional character|place|event (`scope:` marker)
         let involved = [];     // Involved (feature): optional participants/entities IN the fact (`with:` marker)
         let location = '';     // Location-link (feature): optional WHERE an event happened (`at:` marker)
+        let tone = '';         // Episodic-memory (feature): optional short emotional descriptor for a `moment` (`tone:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -595,9 +599,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
                 continue;
             }
 
-            // kind:<trait|state|event> — OPTIONAL fact kind (salience feature). Anything
-            // else is ignored and falls back to the default kind at storage time.
-            const kindMatch = seg.match(/^kind\s*:\s*(trait|state|event)\b/i);
+            // kind:<trait|state|event|moment> — OPTIONAL fact kind (salience feature). `moment`
+            // is an episodic scene beat (slow-decaying, append-only). Anything else is ignored
+            // and falls back to the default kind at storage time.
+            const kindMatch = seg.match(/^kind\s*:\s*(trait|state|event|moment)\b/i);
             if (kindMatch) {
                 kind = kindMatch[1].toLowerCase();
                 continue;
@@ -667,6 +672,16 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
             const atMatch = seg.match(/^at\s*:\s*(.+)$/i);
             if (atMatch) {
                 location = atMatch[1].trim();
+                continue;
+            }
+
+            // tone:<short emotional descriptor> — OPTIONAL emotional label for a `moment`-kind
+            // fact (episodic-memory feature), e.g. "tender", "tense", "bittersweet". `tone:` does
+            // NOT collide with the existing grammar (the only other `t`-prefixed marker is
+            // `track:`, matched by its own regex). Hard-clamped downstream (see normalizeTone).
+            const toneMatch = seg.match(/^tone\s*:\s*(.+)$/i);
+            if (toneMatch) {
+                tone = toneMatch[1].trim();
                 continue;
             }
 
@@ -838,6 +853,10 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         if (about) update.about = about;
         // Location-link (feature): attach the event's where-link when the writer gave `at:`.
         if (location) update.location = location;
+        // Episodic-memory (feature): attach the moment's short emotional `tone`, clamped, when
+        // given. Only set when non-empty so non-moment facts stay lean (back-compat).
+        const resolvedTone = normalizeTone(tone);
+        if (resolvedTone) update.tone = resolvedTone;
         // Provenance (feature): confidence when stated; validAt defaults to the source
         // message index (when the fact became true). Both kept optional/back-compat.
         if (confidence !== null && confidence !== '') update.confidence = confidence;
@@ -861,7 +880,7 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
  * toward the slow-decaying `trait` so an inferred fact is never aggressively evicted.
  * @param {string} category
  * @param {string} track - non-empty when the fact is a sequence step
- * @returns {('trait'|'state'|'event')}
+ * @returns {('trait'|'state'|'event'|'moment')}
  */
 function inferKindFromCategory(category, track, aspect) {
     if (track) return 'event';
@@ -892,6 +911,7 @@ function inferImportance(category, kind, key, aspect) {
     if (cat === 'people' && (asp === 'identity' || asp === 'background')) return 4;
     if (kind === 'state') return 2;            // current mood/location fades fast
     if (kind === 'event') return 2;            // a single occurrence is usually minor
+    if (kind === 'moment') return 4;           // a significant episodic beat — foundational-ish
     return 3;                                  // ordinary default
 }
 
@@ -1083,6 +1103,17 @@ async function applyUpdates(updates, existingDatabases) {
         if (update.about) factToWrite.about = update.about;
         // Location-link (feature): forward the event's where-link when present.
         if (update.location) factToWrite.location = update.location;
+        // Episodic-memory (feature): forward the moment's short emotional `tone` when present
+        // (clamped at parse time + defensively in upsertFact).
+        if (update.tone) factToWrite.tone = update.tone;
+        // Episodic-memory (feature): make episodic captures inspectable — log when a `moment`-kind
+        // fact is written (debug level), with key + tone + location so the beat is auditable.
+        if (update.kind === 'moment') {
+            addDebugLog('debug', `Moment captured: [${category}] ${update.key}${update.tone ? ` (${update.tone})` : ''}`, {
+                subsystem: 'agent3', event: 'fact.moment',
+                data: { category, key: update.key, tone: update.tone || '', location: update.location || '' },
+            });
+        }
         if (update.confidence !== undefined && update.confidence !== null && update.confidence !== '') {
             factToWrite.confidence = update.confidence;
         }

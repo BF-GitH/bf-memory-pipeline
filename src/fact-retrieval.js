@@ -431,7 +431,10 @@ function resolveExactKeys(databases, requests) {
  */
 const RETRIEVAL_IMPORTANCE_WEIGHT = 0.65;
 const RETRIEVAL_RECENCY_WEIGHT = 0.35;
-const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
+// Mirrors database.js HALF_LIFE_DAYS so keep-score and slot-rank decay identically. `moment`
+// (episodic scene beat) is emotionally sticky: decays far slower than a transient state(3) or a
+// plain event(7) but well short of a foundational trait(90), so significant beats stay recallable.
+const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
 // COLD DEPRIORITIZATION (infinite-facts feature). A cold-tiered fact is still FINDABLE (it
 // remains in db.facts and passes through every match path unchanged), but when overflow tiers
 // are capped we want HOT facts to fill the limited slots FIRST. A large fixed penalty pushes
@@ -705,6 +708,9 @@ export function formatFactsForWriter(results) {
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
         const hasValue = String(fact.value ?? '').trim() !== '';
         const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
+        // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
+        // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
+        const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
         // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
         // only needs one. When a fact HAS a note, the note already carries the
         // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
@@ -713,7 +719,7 @@ export function formatFactsForWriter(results) {
         let line;
         if (note) {
             // Note replaces the value (it carries the fact). All tiers.
-            line = `${prefix} ${category}/${fact.key}: ${note}`;
+            line = `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
         } else if (hasValue) {
             line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
         } else {

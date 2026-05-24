@@ -21,10 +21,13 @@ const HOT_SET_SIZE = 50;
 const COLD_TIER_PROTECT_IMPORTANCE = 5;
 
 // Salience defaults (importance/kind feature). Applied when a fact lacks the field so
-// older facts behave sensibly. importance is 1-5 (3 = neutral), kind is trait/state/event.
+// older facts behave sensibly. importance is 1-5 (3 = neutral), kind is trait/state/event/moment.
 export const DEFAULT_IMPORTANCE = 3;
 export const DEFAULT_KIND = 'trait';
-const VALID_KINDS = new Set(['trait', 'state', 'event']);
+// `moment` = an EPISODIC scene beat (a first, a turning point, a charged exchange) remembered
+// WITH its emotional tone in the note — emotionally sticky, append-only like `event` (NEVER
+// supersedes). Distinct from `event` so it can decay slower (see HALF_LIFE_DAYS).
+const VALID_KINDS = new Set(['trait', 'state', 'event', 'moment']);
 
 // Salience-aware COLD-TIERING tuning (saveDatabase). A fact's keep-score blends normalized
 // importance with a recency term, and `kind` sets how fast recency decays:
@@ -35,8 +38,12 @@ const VALID_KINDS = new Set(['trait', 'state', 'event']);
 // cold-tiered first; the fact is never removed.
 const IMPORTANCE_WEIGHT = 0.65;
 const RECENCY_WEIGHT = 0.35;
-// Half-lives in days (recency term = 0.5 ** (ageDays / halfLife)).
-const HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
+// Half-lives in days (recency term = 0.5 ** (ageDays / halfLife)). `moment` is episodic and
+// emotionally sticky — it decays MUCH slower than a transient state (3) or a plain event (7)
+// but still well short of a foundational trait (90). 30 days: roughly a month of recency
+// protection so a significant scene beat (a first, a turning point) stays recallable long after
+// the moment passed, without becoming near-permanent the way identity traits are.
+const HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
 
 // USE-IT-OR-LOSE-IT (use-driven salience). A fact that actually gets injected into the
 // Writer's context is "used" — we bump useCount + lastUsedAt (see markFactsUsed). Usage feeds
@@ -91,13 +98,30 @@ export function clampImportance(v) {
 }
 
 /**
- * Normalize a kind to one of trait|state|event, defaulting when absent/invalid.
+ * Normalize a kind to one of trait|state|event|moment, defaulting when absent/invalid.
  * @param {*} v
- * @returns {('trait'|'state'|'event')}
+ * @returns {('trait'|'state'|'event'|'moment')}
  */
 export function normalizeKind(v) {
     const k = String(v || '').trim().toLowerCase();
     return VALID_KINDS.has(k) ? k : DEFAULT_KIND;
+}
+
+// Max length of a `tone` descriptor (episodic-memory feature). A tone is a SHORT emotional
+// label ("tender", "tense", "bittersweet") — clamp hard so it can't grow into prose (that
+// belongs in the note/`context`).
+const TONE_MAX_LEN = 40;
+
+/**
+ * Normalize an optional `tone` (episodic-memory feature): a short emotional descriptor for a
+ * `moment`-kind fact. Collapses whitespace and hard-clamps to TONE_MAX_LEN chars. Returns ''
+ * for absent/blank input so callers can omit the field (lean / back-compat).
+ * @param {*} v
+ * @returns {string} clamped tone, or '' when absent/blank
+ */
+export function normalizeTone(v) {
+    const t = String(v ?? '').replace(/\s+/g, ' ').trim();
+    return t ? t.slice(0, TONE_MAX_LEN) : '';
 }
 
 // =============================================================================
@@ -2110,6 +2134,10 @@ function normalizeSalienceFields(fact) {
     // Preserve any incoming non-zero values (e.g. a fact rehydrated/imported with prior usage).
     out.useCount = Math.max(0, Math.floor(Number(fact?.useCount) || 0));
     out.lastUsedAt = Math.max(0, Math.floor(Number(fact?.lastUsedAt) || 0));
+    // Episodic-memory feature: clamp the optional `tone` on creation (only when provided, so a
+    // fact without one stays lean — mirrors how `location` is only attached when present).
+    const tone = normalizeTone(fact?.tone);
+    if (tone) out.tone = tone;
     return out;
 }
 
@@ -2142,6 +2170,13 @@ function mergeSalience(existing, incoming) {
     const exUsedAt = Math.max(0, Math.floor(Number(existing?.lastUsedAt) || 0));
     const incUsedAt = Math.max(0, Math.floor(Number(incoming?.lastUsedAt) || 0));
     out.lastUsedAt = Math.max(exUsedAt, incUsedAt);
+    // Episodic-memory feature: carry the optional `tone` forward — PREFER the incoming (clamped)
+    // when a re-mention restates it, else keep the existing. Mirrors how a small optional string
+    // field is handled; only set when one of them has a value so the field stays lean.
+    const incTone = normalizeTone(incoming?.tone);
+    const exTone = normalizeTone(existing?.tone);
+    if (incTone) out.tone = incTone;
+    else if (exTone) out.tone = exTone;
     return out;
 }
 
@@ -2940,10 +2975,13 @@ export async function deleteDebugLogFile(chatId) {
  *   How foundational/poignant the fact is (5 = core identity, 1 = trivial transient).
  *   Default 3 when absent (see DEFAULT_IMPORTANCE). Drives salience-aware eviction and
  *   retrieval ordering. Absent on facts from older versions (backward-compatible).
- * @property {('trait'|'state'|'event')} [kind] - OPTIONAL fact kind. `trait` = durable
+ * @property {('trait'|'state'|'event'|'moment')} [kind] - OPTIONAL fact kind. `trait` = durable
  *   (age, name, personality); `state` = current/transient (mood, current goal/location);
- *   `event` = something that happened (often a track step). Default 'trait' when absent
- *   (see DEFAULT_KIND). Modulates how fast a fact decays during eviction.
+ *   `event` = something that happened (often a track step); `moment` = an EPISODIC scene beat
+ *   (a first, a turning point, a charged exchange) remembered WITH its emotional tone — like an
+ *   event but emotionally sticky (slower decay; see HALF_LIFE_DAYS) and append-only (NEVER
+ *   supersedes). Default 'trait' when absent (see DEFAULT_KIND). Modulates how fast a fact
+ *   decays during cold-tiering/retrieval.
  * @property {boolean} [active] - OPTIONAL temporal-validity flag (supersession feature).
  *   ABSENT or `true` => currently valid (the default for every fact ever written). Set to
  *   `false` when a later write supersedes this fact's value (a `state` that changed). A
@@ -2991,6 +3029,11 @@ export async function deleteDebugLogFile(chatId) {
  * @property {string} [location] - OPTIONAL where-link for an event (location-link feature): a
  *   place key/subject naming WHERE the fact happened. Emitted by Agent 3 via the `at:` marker on
  *   events. Pairs with `involved` (who) for place⇄event⇄people retrieval. Absent on older facts.
+ * @property {string} [tone] - OPTIONAL short emotional descriptor for a `moment`-kind fact
+ *   (episodic-memory feature), e.g. "tender", "tense", "bittersweet". Emitted by Agent 3 via the
+ *   `tone:` marker; normalized + hard-clamped to <=40 chars (see normalizeTone). Surfaced
+ *   compactly to the Writer alongside the note so a moment reads with its feeling. Absent on
+ *   ordinary facts and on facts from older versions (backward-compatible).
  * @property {boolean} [cold] - OPTIONAL hot/cold tier flag (infinite-facts feature). ABSENT or
  *   `false` => HOT (the default for every fact ever written). Set to `true` by coldTierOverflow
  *   when a category's active hot non-sequence facts exceed HOT_SET_SIZE — the LOWEST-salience
