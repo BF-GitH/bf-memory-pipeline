@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPic
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
@@ -31,12 +31,28 @@ let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETI
 let pipelineCancelled = false; // set true when user clicks Stop / disables mid-run; checked before DB writes
 // FINDER BUDGET (latency fix). The Stage-2 finder (Agent 4) is the slowest, least-bounded agent
 // and used to be awaited UNCONDITIONALLY on the reply-blocking path (a 64s finder = a 64s stall).
-// We now RACE it against this tight budget: if it doesn't finish in time we use the ALREADY-
-// COMPUTED deterministic retrieval for THIS turn and proceed. The finder result, if it ever
-// arrives, is dropped for this turn (and an in-flight LLM call is left to the wall-clock budget /
-// cancel hook to bound). So a slow/failing model degrades to "use the deterministic facts this
-// turn" — never a 75s stall — while a fast model still gets the finder's refined pick.
-const FINDER_BUDGET_MS = 6000; // 6s max the reply may wait on the finder before falling back
+// We RACE it against a tight, SETTING-BACKED budget (settings.finderBudgetMs, default 3500ms; see
+// DEFAULT_FINDER_BUDGET_MS): if it doesn't finish in time we (a) ABORT the in-flight finder LLM
+// call via a finder-scoped AbortController so it stops burning tokens, and (b) use the ALREADY-
+// COMPUTED deterministic retrieval for THIS turn. So a slow/failing model degrades to "use the
+// deterministic facts this turn" — never a long stall — while a fast model still gets the finder's
+// refined pick. The abort is scoped to the finder ONLY (its own signal), never the concurrent
+// Agent-1 call.
+const DEFAULT_FINDER_BUDGET_MS = 3500; // fallback when settings.finderBudgetMs is unset
+function getFinderBudgetMs(settings) {
+    const v = Number(settings?.finderBudgetMs);
+    return Number.isFinite(v) && v >= 1000 ? Math.floor(v) : DEFAULT_FINDER_BUDGET_MS;
+}
+// ADAPTIVE CIRCUIT BREAKER (the "don't guarantee a budget-long wait every turn" half). On a model
+// that is CONSISTENTLY slower than the budget, blocking the reply for the full budget EVERY turn —
+// only to discard the finder and fall back — is a guaranteed per-turn latency tax for no benefit.
+// We track how many CONSECUTIVE turns the finder blew the budget; once it reaches the trip count we
+// STOP blocking on the finder (still launch it fire-and-forget so its result can warm nothing this
+// turn, but the reply does NOT wait) until a finder beats the budget again, which resets the breaker.
+const FINDER_BREAKER_TRIP = 2;    // consecutive over-budget turns before we stop blocking
+const FINDER_BREAKER_PROBE = 5;   // while tripped, re-test (probe) the finder once every N turns
+let finderOverBudgetStreak = 0;   // reset on any finder that beats the budget (or finder disabled)
+let finderTrippedTurns = 0;       // turns elapsed while the breaker is open (drives the probe cadence)
 let groupSkipToastShown = false; // show-once toast when skipping group chats
 let runRecordedInput = false; // true once setRunTokens fired this generation cycle; gates main-output attribution so swipes don't desync the counters
 // Reflection / consolidation: count successful pipeline runs (Agent 3 committed facts).
@@ -159,6 +175,63 @@ function filterCandidatesByFocus(candidates, focus) {
         for (const p of involved) if (focusSet.has(p)) return true;
         return false; // character-scoped fact about ONLY non-focus characters -> drop
     });
+}
+
+// ANCHOR ASPECTS: the durable / current-state / relationship leaves that a Writer must always
+// respect for a present character to stay in continuity (a name dropped breaks the scene). The
+// finder, told to "be selective", routinely omits these even though they're load-bearing — so we
+// GUARANTEE a few per present character deterministically (from the bySubject index) alongside the
+// finder's picks. Matched against deriveAspect() leaves; kept small and identity/state/relationship.
+const ANCHOR_ASPECTS = new Set([
+    'identity', 'name', 'status', 'species', 'age', 'gender', 'pronouns', 'titles',
+    'current_location', 'mood', 'goal', 'health',
+    'trust', 'romance', 'relationship', 'rapport', 'tension',
+]);
+
+/**
+ * Guarantee the in-focus characters' key anchors (identity / current-state / active relationship)
+ * are injected even if the finder misses them. Pulls from the per-turn bySubject index (already
+ * active-only) for each focus character, ranks by anchor-aspect priority then importance, and
+ * returns up to `perChar` `{fact, category, tier:'primary'}` entries per character, EXCLUDING any
+ * already chosen (so we never double-inject). Deterministic, no LLM, cheap (indexed by subject).
+ * @param {{bySubject: Map}} index - per-turn memory index
+ * @param {string[]} focus - focus character names from Agent 1's #Focus
+ * @param {number} perChar - max anchors to guarantee per present character (0 disables)
+ * @param {Set<string>} alreadyChosen - ids (`category:key`, lowercased) already selected
+ * @returns {Array<{fact: Object, category: string, tier: string}>}
+ */
+function collectAnchorFacts(index, focus, perChar, alreadyChosen) {
+    if (!index || !index.bySubject || !perChar || perChar < 1) return [];
+    const names = (focus || []).map(f => String(f || '').trim().toLowerCase()).filter(Boolean);
+    if (names.length === 0) return [];
+    const out = [];
+    const seen = new Set(alreadyChosen || []);
+    for (const name of new Set(names)) {
+        const bucket = index.bySubject.get(name) || [];
+        // Keep only visible anchor-aspect facts not already chosen.
+        const anchors = [];
+        for (const entry of bucket) {
+            const { fact, category } = entry;
+            if (!isFactVisible(fact)) continue;
+            const aspect = deriveAspect(fact);
+            if (!ANCHOR_ASPECTS.has(aspect)) continue;
+            const id = `${String(category).toLowerCase()}:${String(fact.key).toLowerCase()}`;
+            if (seen.has(id)) continue;
+            anchors.push({ entry, aspect, id, importance: Number(fact.importance) || 0 });
+        }
+        // Identity/state first (anchor-aspect order in ANCHOR_ASPECTS ≈ priority), then importance.
+        const order = [...ANCHOR_ASPECTS];
+        anchors.sort((a, b) =>
+            (order.indexOf(a.aspect) - order.indexOf(b.aspect)) || (b.importance - a.importance));
+        let added = 0;
+        for (const a of anchors) {
+            if (added >= perChar) break;
+            seen.add(a.id);
+            out.push({ fact: a.entry.fact, category: a.entry.category, tier: 'primary' });
+            added++;
+        }
+    }
+    return out;
 }
 
 /**
@@ -847,57 +920,99 @@ async function runPipelineInline(data) {
         const { candidates } = capFinderCandidates(candidatesVisible);
         addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) (from ${candidatesVisible.length} visible) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion, cold-excluded + capped)`);
         const finderProfileId = getAgent4ProfileId(settings);
+        const finderBudgetMs = getFinderBudgetMs(settings);
+        const finderTarget = Math.max(0, Number(settings?.finderTargetFacts) || 0);
         const finderStart = Date.now();
-        // OFF THE BLOCKING PATH: race the finder against FINDER_BUDGET_MS. The deterministic
-        // retrieval (already-computable, no LLM) is the instant fallback the reply uses if the
-        // finder doesn't beat the budget. The finder Promise is NOT awaited beyond the budget —
-        // a slow/failing model can never stall the reply past FINDER_BUDGET_MS. An in-flight
-        // finder LLM call is bounded by llm-call's own wall-clock budget / cancel hook.
+        // ADAPTIVE CIRCUIT BREAKER: if the finder blew the budget the last FINDER_BREAKER_TRIP turns
+        // in a row, it is consistently slower than the budget on this connection — blocking the reply
+        // for the full budget every turn only to discard it is a pure latency tax. While the breaker
+        // is OPEN we SKIP the finder entirely (no LLM call → zero token burn, ~0ms wait) and use the
+        // deterministic facts, EXCEPT on a periodic PROBE turn (every FINDER_BREAKER_PROBE turns) that
+        // re-tests whether the model has gotten fast enough — a probe that beats the budget RESETS the
+        // breaker. So a consistently-slow model costs the full budget for at most FINDER_BREAKER_TRIP
+        // turns, then ~0 thereafter (one probe every N turns), instead of a guaranteed per-turn tax.
+        const breakerOpen = finderOverBudgetStreak >= FINDER_BREAKER_TRIP;
+        // Probe on every Nth open turn (the 5th, 10th, …) — NOT the first, so a tripped breaker
+        // actually saves the budget wait before re-testing.
+        const isProbe = breakerOpen && ((finderTrippedTurns + 1) % FINDER_BREAKER_PROBE === 0);
+        // FINDER ABORT SCOPE: a dedicated controller so a budget timeout aborts ONLY the finder LLM
+        // call (stops burning tokens) and never the concurrent Agent-1 call.
+        const finderAbort = new AbortController();
+        // OFF THE BLOCKING PATH: race the finder against the budget. The deterministic retrieval
+        // (already-computable, no LLM) is the instant fallback the reply uses if the finder doesn't
+        // beat the budget. On budget expiry we ABORT the in-flight finder so it stops billing.
         try {
-            const finderP = runFinderAgent({
-                candidates,
-                draft: draftResult.draft,
-                recentChat: formattedChat,
-                characterInfo,
-                userPersona,
-                profileId: finderProfileId,
-            });
-            const BUDGET = Symbol('finder-budget');
-            let budgetTimer;
-            const budgetP = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve(BUDGET), FINDER_BUDGET_MS); });
-            const raced = await Promise.race([finderP, budgetP]).finally(() => clearTimeout(budgetTimer));
-            // Time the reply ACTUALLY waited on Stage-2 — measured around the budget RACE, so it
-            // captures the budget-fallback case (capped at ~FINDER_BUDGET_MS) as well as a finder
-            // that beat the budget. NOT just the finder LLM time. Observability only.
-            stageMs.finderMs = Date.now() - finderStart;
-
-            if (raced === BUDGET) {
-                // Budget exceeded → use the deterministic facts THIS turn; drop the finder result.
-                addDebugLog('info', `STAGE 2 finder exceeded ${FINDER_BUDGET_MS / 1000}s budget — using deterministic retrieval for this turn`, {
-                    subsystem: 'finder', event: 'finder.budget', reason: 'BUDGET_EXCEEDED',
-                    data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: FINDER_BUDGET_MS, candidateCount: candidates.length, fallback: 'deterministic' },
+            if (breakerOpen && !isProbe) {
+                // SKIP entirely: do not launch the finder at all (no tokens, no wait). Advance the
+                // tripped-turn counter so a probe fires on schedule, and use deterministic facts.
+                finderTrippedTurns++;
+                stageMs.finderMs = Date.now() - finderStart; // ~0ms — we did not block
+                addDebugLog('info', `STAGE 2 finder circuit-breaker OPEN (over budget ${finderOverBudgetStreak}x in a row) — skipping finder this turn (no LLM call), using deterministic retrieval; next probe in ${FINDER_BREAKER_PROBE - (finderTrippedTurns % FINDER_BREAKER_PROBE)} turn(s)`, {
+                    subsystem: 'finder', event: 'finder.budget', reason: 'CIRCUIT_BREAKER_OPEN',
+                    data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, overBudgetStreak: finderOverBudgetStreak, candidateCount: candidates.length, fallback: 'deterministic', blocked: false, finderLaunched: false },
                 });
-                // Avoid an unhandled rejection on the dropped finder promise (e.g. it later aborts).
-                finderP.catch(() => {});
             } else {
-                const finder = raced;
-                // Use finder results when it succeeded AND chose something. Empty/error => fall back.
-                if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
-                    const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
-                    retrieval = {
-                        facts,
-                        formatted: finder.formatted || formatChosenFacts(finder.facts),
-                        stats: { primary: facts.length, secondary: 0, tertiary: 0 },
-                    };
-                    addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
-                        subsystem: 'finder', event: 'finder.run',
-                        data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length },
+                if (isProbe) {
+                    finderTrippedTurns++; // count this probe turn so the cadence keeps advancing
+                    addDebugLog('info', `STAGE 2 finder PROBE turn (breaker open) — re-testing finder speed against the ${finderBudgetMs / 1000}s budget`, {
+                        subsystem: 'finder', event: 'finder.budget', reason: 'CIRCUIT_BREAKER_PROBE',
+                        data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, overBudgetStreak: finderOverBudgetStreak },
                     });
+                }
+                const finderP = runFinderAgent({
+                    candidates,
+                    draft: draftResult.draft,
+                    recentChat: formattedChat,
+                    characterInfo,
+                    userPersona,
+                    profileId: finderProfileId,
+                    targetFacts: finderTarget,
+                    signal: finderAbort.signal,
+                });
+                const BUDGET = Symbol('finder-budget');
+                let budgetTimer;
+                const budgetP = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve(BUDGET), finderBudgetMs); });
+                const raced = await Promise.race([finderP, budgetP]).finally(() => clearTimeout(budgetTimer));
+                // Time the reply ACTUALLY waited on Stage-2 — measured around the budget RACE, so it
+                // captures the budget-fallback case (capped at ~finderBudgetMs) as well as a finder
+                // that beat the budget. NOT just the finder LLM time. Observability only.
+                stageMs.finderMs = Date.now() - finderStart;
+
+                if (raced === BUDGET) {
+                    // Budget exceeded → ABORT the in-flight finder (stops token burn), use the
+                    // deterministic facts THIS turn, and advance the over-budget streak (may trip
+                    // the breaker so we stop blocking on subsequent slow turns).
+                    finderOverBudgetStreak++;
+                    finderAbort.abort(new DOMException(`Finder exceeded ${finderBudgetMs}ms budget`, 'AbortError'));
+                    addDebugLog('info', `STAGE 2 finder exceeded ${finderBudgetMs / 1000}s budget — aborted in-flight call, using deterministic retrieval for this turn (over-budget streak ${finderOverBudgetStreak})`, {
+                        subsystem: 'finder', event: 'finder.budget', reason: 'BUDGET_EXCEEDED',
+                        data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: finderBudgetMs, candidateCount: candidates.length, fallback: 'deterministic', aborted: true, overBudgetStreak: finderOverBudgetStreak },
+                    });
+                    // Avoid an unhandled rejection on the dropped/aborted finder promise.
+                    finderP.catch(() => {});
                 } else {
-                    addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
-                        subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
-                        data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
-                    });
+                    // The finder beat the budget → RESET the breaker (connection is fast enough now).
+                    finderOverBudgetStreak = 0;
+                    finderTrippedTurns = 0;
+                    const finder = raced;
+                    // Use finder results when it succeeded AND chose something. Empty/error => fall back.
+                    if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
+                        const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
+                        retrieval = {
+                            facts,
+                            formatted: finder.formatted || formatChosenFacts(finder.facts),
+                            stats: { primary: facts.length, secondary: 0, tertiary: 0 },
+                        };
+                        addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
+                            subsystem: 'finder', event: 'finder.run',
+                            data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length, targetFacts: finderTarget },
+                        });
+                    } else {
+                        addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
+                            subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
+                            data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
+                        });
+                    }
                 }
             }
         } catch (finderErr) {
@@ -909,6 +1024,7 @@ async function runPipelineInline(data) {
             });
         }
     } else {
+        finderOverBudgetStreak = 0; finderTrippedTurns = 0; // finder off → keep the breaker reset so re-enabling starts clean
         addDebugLog('info', 'Finder agent disabled (useFinderAgent=false) — using deterministic retrieval', {
             subsystem: 'finder', event: 'finder.run', reason: 'FINDER_DISABLED',
             data: { agent: 'finder', fired: false, fallback: 'deterministic' },
@@ -921,6 +1037,31 @@ async function runPipelineInline(data) {
         const detStart = Date.now();
         retrieval = await buildDeterministicRetrieval();
         stageMs.deterministicMs = Date.now() - detStart; // observability: fallback build wall-clock
+    }
+
+    // GUARANTEED PRESENT-CHARACTER ANCHORS (injection composition fix). Whichever path produced
+    // `retrieval` (finder OR deterministic), ensure each in-focus character's key anchors
+    // (identity / current-state / active relationship) are present even if the finder/retrieval
+    // missed them — a Writer that forgets a present character's name or relationship breaks
+    // continuity. Pulled deterministically from the bySubject index (no LLM, cheap) and merged
+    // in WITHOUT removing any chosen fact; only NEW anchors are appended.
+    if (settings.finderAnchorsPerCharacter > 0 && Array.isArray(draftResult.focus) && draftResult.focus.length) {
+        const chosenIds = new Set(retrieval.facts.map(({ fact, category }) => `${String(category).toLowerCase()}:${String(fact.key).toLowerCase()}`));
+        const anchors = collectAnchorFacts(index, draftResult.focus, settings.finderAnchorsPerCharacter, chosenIds);
+        if (anchors.length) {
+            retrieval.facts = retrieval.facts.concat(anchors);
+            retrieval.stats = {
+                ...retrieval.stats,
+                primary: (retrieval.stats.primary || 0) + anchors.length,
+            };
+            // Re-render the formatted block from the merged set so the injected anchors actually
+            // reach the Writer (the formatted string, not just the facts array, is what's injected).
+            retrieval.formatted = formatChosenFacts(retrieval.facts);
+            addDebugLog('info', `Injected ${anchors.length} guaranteed present-character anchor fact(s) (focus: ${draftResult.focus.join(', ')})`, {
+                subsystem: 'finder', event: 'finder.anchors',
+                data: { added: anchors.length, perCharacter: settings.finderAnchorsPerCharacter, focus: draftResult.focus, totalAfter: retrieval.facts.length },
+            });
+        }
     }
 
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);

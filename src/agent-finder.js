@@ -25,7 +25,7 @@ export const DEFAULT_FINDER_PROMPT = `You are a memory fact-finder for a rolepla
 2. The recent chat.
 3. A CANDIDATE LIST of stored facts, each on its own line as: \`Category/key = value\`.
 
-Your ONLY job is to choose the SUBSET of candidate facts that genuinely matter for writing the NEXT reply consistently — the facts a writer must respect right now. Be selective: pick what is relevant to the current moment, people present, and active threads. Do NOT invent facts. Do NOT rewrite values.
+Your job is to choose the facts that genuinely matter for writing the NEXT reply consistently — the facts a writer must respect right now. PREFER RECALL OVER OMISSION: including a relevant fact is cheap; dropping a load-bearing one breaks continuity. Aim for a useful SET (typically ~12 when the candidate list supports it), not the bare minimum. Do NOT pad with irrelevant facts, but never omit an identity / current-state / active-relationship anchor for any character present in the scene. Do NOT invent facts. Do NOT rewrite values.
 
 OUTPUT FORMAT (follow EXACTLY):
 #Facts:
@@ -33,8 +33,9 @@ OUTPUT FORMAT (follow EXACTLY):
 
 RULES:
 - Output ONLY \`Category/key\` identifiers that appear in the candidate list, one per line.
+- ALWAYS include each present character's identity, current state, and active relationships — these anchors are load-bearing even when not just mentioned.
 - Prefer facts about who/what is present in the scene and any active goal or open thread.
-- Include identity/relationship anchors for present characters even if not just mentioned.
+- Aim for the TARGET range you are given; lean toward the upper end when the candidates support it, rather than returning a tight handful.
 - Skip facts about people/places not relevant to the current moment.
 - Stay within the limit you are given; if over, keep the most load-bearing facts.`;
 
@@ -50,6 +51,10 @@ RULES:
  * @param {string} [args.userPersona]
  * @param {string|null} [args.profileId] - connection profile (defaults handled by caller)
  * @param {number} [args.maxFacts] - hard cap on returned facts (size bound)
+ * @param {number} [args.targetFacts] - SOFT target the prompt aims for (a floor, not a cap) so the
+ *   finder returns a useful set (~12) instead of a tight 5–7. Clamped below maxFacts.
+ * @param {AbortSignal} [args.signal] - caller-scoped abort (the budget timer). When it fires, the
+ *   in-flight finder LLM call aborts and stops burning tokens — only THIS call, not Agent 1.
  * @returns {Promise<FinderResult>}
  */
 export async function runFinderAgent({
@@ -60,6 +65,8 @@ export async function runFinderAgent({
     userPersona = '',
     profileId = null,
     maxFacts = 24,
+    targetFacts = 0,
+    signal = null,
 }) {
     const list = Array.isArray(candidates) ? candidates : [];
     // Empty candidate set: nothing to find. Treat as a clean empty result (not an error) so
@@ -68,12 +75,12 @@ export async function runFinderAgent({
         return { facts: [], formatted: '(No stored facts available)', raw: '', empty: true, tokensIn: 0, tokensOut: 0 };
     }
 
-    const { systemPrompt, userPrompt } = buildFinderPrompt({ candidates: list, draft, recentChat, characterInfo, userPersona, maxFacts });
-    addDebugLog('info', `Agent 4 (finder) prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars, ${list.length} candidates`);
+    const { systemPrompt, userPrompt } = buildFinderPrompt({ candidates: list, draft, recentChat, characterInfo, userPersona, maxFacts, targetFacts });
+    addDebugLog('info', `Agent 4 (finder) prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars, ${list.length} candidates, target=${targetFacts || 'n/a'}, max=${maxFacts}`);
 
     let resultStr = '';
     try {
-        resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'finder');
+        resultStr = await callAgentLLM(systemPrompt, userPrompt, profileId, 'finder', signal);
     } catch (error) {
         addDebugLog('fail', `Agent 4 (finder) LLM error: ${error.message || error}`);
         return { facts: [], formatted: '', raw: '', error: error.message || String(error), tokensIn: 0, tokensOut: 0 };
@@ -100,7 +107,7 @@ export async function runFinderAgent({
  * (with aliases folded into the value-line as a hint, mirroring how retrieval treats them
  * as match-only — but here the finder benefits from seeing them to bridge paraphrase).
  */
-function buildFinderPrompt({ candidates, draft, recentChat, characterInfo, userPersona, maxFacts }) {
+function buildFinderPrompt({ candidates, draft, recentChat, characterInfo, userPersona, maxFacts, targetFacts = 0 }) {
     const sysPrompt = getSettingsSafe()?.finderPrompt || DEFAULT_FINDER_PROMPT;
     const systemPrompt = sysPrompt;
 
@@ -116,7 +123,15 @@ function buildFinderPrompt({ candidates, draft, recentChat, characterInfo, userP
     if (draft && draft.trim()) dataParts.push(`## Scene Direction (draft of next reply)\n${draft.trim()}`);
     dataParts.push(`## Recent Chat\n${recentChat}`);
     dataParts.push(`## Candidate Facts (choose from these, by Category/key)\n${candidateLines.join('\n')}`);
-    dataParts.push(`\nChoose AT MOST ${maxFacts} facts. Output ONLY the #Facts: section listing the chosen Category/key identifiers.`);
+    // TARGET RANGE (floor + ceiling), not a bare ceiling. A soft floor counters the "be selective"
+    // bias that returned 5–7 of 40+ candidates; the cap still hard-bounds the injection. When the
+    // candidate pool is smaller than the target, aim for "as many as are relevant" up to the pool.
+    if (targetFacts && targetFacts > 0 && candidates.length > 0) {
+        const floor = Math.min(targetFacts, candidates.length);
+        dataParts.push(`\nChoose the relevant facts — aim for about ${floor}${floor < maxFacts ? `–${maxFacts}` : ''} (prefer including a relevant fact over omitting it), and AT MOST ${maxFacts}. Always include every present character's identity/current-state/relationship anchors. Output ONLY the #Facts: section listing the chosen Category/key identifiers.`);
+    } else {
+        dataParts.push(`\nChoose AT MOST ${maxFacts} facts. Output ONLY the #Facts: section listing the chosen Category/key identifiers.`);
+    }
 
     return { systemPrompt, userPrompt: dataParts.join('\n\n') };
 }

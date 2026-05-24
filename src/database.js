@@ -3710,6 +3710,55 @@ export function groupedTaxonomyMenu() {
 }
 
 /**
+ * COMPACT (families-only) view of the taxonomy for the SCRIBE drill: every Layer-1 category and
+ * its SUB-AREA names ONLY — NOT the ~940 individual leaves. Renders one line per category:
+ * `Category: SubArea, SubArea, …` (~77 sub-area names total vs. ~940 leaves), shrinking the
+ * inlined Scribe menu from ~3.1K tokens to a few hundred. This is the menu the Scribe SEES; it
+ * does NOT need to see every leaf to file correctly, because write-time `normalizeAspect` /
+ * `findExistingLeaf` already SNAP an emitted aspect to a real leaf (or the category/sub-area
+ * default), and the user-add / AI-expand overlay still operates on the full vocab. The Scribe is
+ * instructed to pick the most specific leaf it knows within the chosen category ▸ sub-area; the
+ * snapping layer is the authority on validity. Overlay sub-areas are appended (a flat "Custom"
+ * bucket for overlay leaves without a declared sub-area, matching groupedTaxonomyMenu).
+ * Pure / no DB needed (the vocab is a code constant). Never empty.
+ * @returns {string} Multi-line families-only menu (one line per category). Never empty.
+ */
+export function groupedTaxonomySubAreas() {
+    const overlay = getTaxonomyOverlay();
+    const lines = [];
+    for (const cat of effectiveCategories()) {
+        const node = TAXONOMY[cat];
+        const subAreas = [];
+        // Built-in sub-area names (order preserved); skipped for an overlay-only category.
+        if (node) {
+            for (const subArea of Object.keys(node)) subAreas.push(subArea);
+        }
+        // OVERLAY sub-areas for this category: any declared sub-area name plus a flat "Custom"
+        // bucket when there are overlay leaves with no declared sub-area (mirrors groupedTaxonomyMenu).
+        const extra = Array.isArray(overlay.aspects[cat]) ? overlay.aspects[cat] : [];
+        if (extra.length) {
+            const declared = (overlay.subAreas[cat] && typeof overlay.subAreas[cat] === 'object') ? overlay.subAreas[cat] : {};
+            const declaredLeaves = new Set();
+            for (const [subArea, leaves] of Object.entries(declared)) {
+                if (!subAreas.includes(subArea)) subAreas.push(subArea);
+                for (const l of (Array.isArray(leaves) ? leaves : [])) {
+                    const leaf = String(l || '').trim().toLowerCase();
+                    if (leaf) declaredLeaves.add(leaf);
+                }
+            }
+            const builtinLeaves = node ? new Set(Object.values(node).flat()) : new Set();
+            const hasUndeclared = extra.some((raw) => {
+                const leaf = String(raw || '').trim().toLowerCase();
+                return leaf && !builtinLeaves.has(leaf) && !declaredLeaves.has(leaf);
+            });
+            if (hasUndeclared && !subAreas.includes('Custom')) subAreas.push('Custom');
+        }
+        if (subAreas.length) lines.push(`${cat}: ${subAreas.join(', ')}`);
+    }
+    return lines.join('\n');
+}
+
+/**
  * STAGE 2 input — collect the FULL active facts living under the branches Agent 1 picked,
  * PLUS (always, unconditionally) every active fact in the Unsorted catch-all. 3-LAYER MODEL:
  * a branch is a `Category` (all aspects in it) or `Category/aspect` (just that Layer-2 aspect,

@@ -203,6 +203,19 @@ const DEFAULT_SETTINGS = {
     // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
     // (or on any finder error/empty), the pipeline falls back to deterministic retrieveFacts.
     useFinderAgent: true,
+    // FINDER LATENCY BUDGET (ms). Max wall-clock the reply-blocking path may wait on the Stage-2
+    // finder before falling back to the (already-computed) deterministic retrieval. On expiry the
+    // in-flight finder LLM call is ABORTED (stops burning tokens). Lowered from the original 6000
+    // to 3500 so a slow model adds at most ~3.5s, not ~6s, per turn. See the adaptive circuit
+    // breaker in pipeline.js: after the finder blows the budget repeatedly it stops blocking at all.
+    finderBudgetMs: 3500,
+    // FINDER TARGET (soft floor): the finder aims for ~this many facts (a floor, not the hard cap)
+    // so it returns a useful set instead of a tight 5–7. The hard ceiling stays the finder maxFacts.
+    finderTargetFacts: 12,
+    // GUARANTEED ANCHORS: how many key anchor facts (identity / current-state / active relationship)
+    // per present character to always inject alongside the finder's picks, so the in-focus
+    // character's anchors surface even if the finder misses them. 0 disables.
+    finderAnchorsPerCharacter: 3,
     // Optional system-prompt override for Agent 4. Empty => DEFAULT_FINDER_PROMPT.
     finderPrompt: '',
     draftPrompt: '',
@@ -306,6 +319,10 @@ function validateSettings(s) {
     // fold it onto the canonical key so downstream code only reads agent4Profile.
     if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
     if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = true;
+    // Finder latency/target/anchor knobs (clamped to sane bounds; defaults match DEFAULT_SETTINGS).
+    s.finderBudgetMs = Math.floor(clamp(s.finderBudgetMs, 1000, 15000, 3500));
+    s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
+    s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
     // Auto-linking defaults ON (free + deterministic): absent/invalid => true (back-compat).

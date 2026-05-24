@@ -209,9 +209,14 @@ async function callViaCMRS(profileId, messages, signal) {
  * @param {string|null} [profileId=null] - Optional connection profile ID.
  *   When provided, uses ConnectionManagerRequestService (no UI/DOM switching needed).
  *   This is safe to call during mid-generation because it doesn't touch the active profile.
+ * @param {string} [agent='unknown'] - agent tag for cache-eligibility logging
+ * @param {AbortSignal} [externalSignal] - optional CALLER-OWNED signal scoped to THIS call only
+ *   (e.g. the finder's budget timer). When it aborts, only this call's controller aborts — the
+ *   global cancelInFlightLLM() still reaches it too. This is how the pipeline cancels a
+ *   timed-out finder WITHOUT aborting a concurrent Agent-1 call (which has no such signal).
  * @returns {Promise<string>} The LLM response text
  */
-export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown') {
+export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, agent = 'unknown', externalSignal = null) {
     // Up to 2 attempts. Retry on:
     // - Empty response (providers like Deepseek intermittently return empty)
     // - Network errors (mobile users hit ERR_NETWORK_CHANGED on WiFi↔cellular switch)
@@ -239,6 +244,18 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
     // disables/stops mid-run. Registered so the pipeline's cancel hook can reach it.
     const callCtrl = new AbortController();
     _activeControllers.add(callCtrl);
+    // CALLER-SCOPED ABORT: cascade an optional external signal (e.g. the finder budget timer)
+    // into this call's controller, so a timed-out finder aborts ONLY its own LLM call and stops
+    // burning tokens — without touching a concurrent agent call that owns no such signal.
+    let onExternalAbort = null;
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            callCtrl.abort(externalSignal.reason || new DOMException('Aborted by caller signal', 'AbortError'));
+        } else {
+            onExternalAbort = () => callCtrl.abort(externalSignal.reason || new DOMException('Aborted by caller signal', 'AbortError'));
+            externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+        }
+    }
     const deadline = Date.now() + LLM_WALLCLOCK_BUDGET_MS;
     const budgetTimer = setTimeout(
         () => callCtrl.abort(new DOMException(`LLM wall-clock budget ${LLM_WALLCLOCK_BUDGET_MS / 1000}s exceeded`, 'TimeoutError')),
@@ -279,6 +296,7 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
         }
     } finally {
         clearTimeout(budgetTimer);
+        if (externalSignal && onExternalAbort) externalSignal.removeEventListener?.('abort', onExternalAbort);
         _activeControllers.delete(callCtrl);
     }
 
