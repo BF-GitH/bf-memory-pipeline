@@ -695,7 +695,7 @@ export function expandLinks(databases, results, alreadyFound) {
  * @param {Array} results - Filtered retrieval results
  * @returns {string}
  */
-function formatFactsForWriter(results) {
+export function formatFactsForWriter(results) {
     if (results.length === 0) return '(No stored facts available)';
 
     const lines = [];
@@ -855,6 +855,87 @@ export async function explainFactRetrieval(key, keywords = []) {
         subsystem: 'retrieval', event: 'retrieval.explain', reason, data: detail,
     });
     return { found: !!match, reason, detail };
+}
+
+/**
+ * Default / hard ceiling on how many facts a single Writer recall tool call may return.
+ * The default keeps one pulled answer compact; the hard max bounds even an explicit big
+ * `limit` so one tool call can never blow the main model's context.
+ */
+const RECALL_DEFAULT_LIMIT = 20;
+const RECALL_MAX_LIMIT = 40;
+
+/**
+ * PULL-DETAIL recall for the Writer's `search_memory` tool (Feature: infinite reach).
+ * READ-ONLY, DETERMINISTIC, ZERO-API: reuses the SAME machinery as the normal push path —
+ * `getAllDatabases` + `getMemoryIndex` + `searchFactsIndexed` for keyword hits, the exact
+ * `Category/key` identity resolver for a handle the Writer copied back from the pushed gist,
+ * `isFactVisible` for knownBy visibility, the cold-deprioritized `retrievalSalience` ranking,
+ * and `formatFactsForWriter` so the returned lines MATCH the pushed gist style
+ * (`Category/key: note` or `Category/key = value`). Never writes, never deletes, never calls
+ * an LLM. Hard-capped so a single tool call can't flood the context.
+ *
+ * @param {Object} params
+ * @param {string} params.query - free-text keyword query (required); MAY be a `Category/key`
+ *   handle, in which case the exact record is resolved by identity in addition to keyword match.
+ * @param {string} [params.category] - optional category filter (case-insensitive); only facts
+ *   in this Layer-1 category are returned.
+ * @param {number} [params.limit] - optional result cap (clamped 1..RECALL_MAX_LIMIT).
+ * @returns {Promise<{text: string, count: number}>} a compact formatted string (or a clear
+ *   "no matches" message) plus the admitted fact count.
+ */
+export async function searchMemoryForRecall({ query, category, limit } = {}) {
+    const q = String(query ?? '').trim();
+    const catFilter = String(category ?? '').trim().toLowerCase();
+    const cap = Math.min(RECALL_MAX_LIMIT, Math.max(1, Math.floor(Number(limit)) || RECALL_DEFAULT_LIMIT));
+
+    if (!q) {
+        return { text: 'No query provided. Pass a keyword query (or a Category/key handle) to search memory.', count: 0 };
+    }
+
+    const databases = await getAllDatabases();
+    if (Object.keys(databases).length === 0) {
+        return { text: 'No stored memory yet — nothing to search.', count: 0 };
+    }
+    const index = await getMemoryIndex();
+
+    // Collect candidates by identity (exact Category/key handle) AND by keyword, deduped.
+    const byId = new Map(); // `category:key` -> { fact, category }
+    const add = (r) => { if (r && r.fact) byId.set(`${r.category}:${r.fact.key}`, { fact: r.fact, category: r.category }); };
+
+    // EXACT-HANDLE lookup: the pushed gist shows `Category/key` handles, so the Writer may pass
+    // one back to pull the full record. resolveExactKeys validates against the real store (a
+    // hallucinated handle matches nothing), is active-only, and is case/punctuation tolerant.
+    if (q.indexOf('/') >= 0) {
+        for (const r of resolveExactKeys(databases, [q])) add(r);
+    }
+    // KEYWORD search over the prebuilt index (same matcher as the push path).
+    for (const r of searchFactsIndexed(index, databases, [q])) add(r);
+
+    // Optional category filter (case-insensitive, on the stored category name).
+    let candidates = [...byId.values()];
+    if (catFilter) candidates = candidates.filter(c => String(c.category).toLowerCase() === catFilter);
+
+    // Honor knownBy visibility exactly like normal retrieval (precompute names once).
+    const ctx = (() => { try { return SillyTavern.getContext(); } catch { return null; } })();
+    const names = ctx ? {
+        charName: ctx.characters?.[ctx.characterId]?.name || '',
+        userName: ctx.name1 || '',
+    } : null;
+    candidates = candidates.filter(c => isFactVisible(c.fact, names));
+
+    // DETERMINISTIC salience ranking (cold facts deprioritized) — same scorer the push path
+    // uses to fill scarce slots — then hard-cap.
+    const now = Date.now();
+    candidates.sort((a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+    const capped = candidates.slice(0, cap);
+
+    // Reuse the push formatter so the recalled lines look identical to the injected gist.
+    const text = capped.length
+        ? formatFactsForWriter(capped.map(c => ({ fact: c.fact, category: c.category, tier: 'primary' })))
+        : `No stored facts match "${q}"${catFilter ? ` in category "${category}"` : ''}.`;
+
+    return { text, count: capped.length };
 }
 
 /**

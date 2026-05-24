@@ -14,6 +14,11 @@ jQuery(async () => {
         const { initMessageIcons } = await import('./src/message-icon.js');
         initMessageIcons();
 
+        // Register the optional Writer recall tool (search_memory) when its setting is on.
+        // Default-OFF; idempotent; no-ops if ST's function-tool API is unavailable.
+        const { syncWriterRecallTool } = await import('./src/agent-writer.js');
+        syncWriterRecallTool();
+
         console.log('[BFMemory] Extension loaded successfully');
     } catch (error) {
         console.error('[BFMemory] Failed to load extension:', error);

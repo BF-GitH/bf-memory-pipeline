@@ -62,13 +62,14 @@ let currentRunId = null;
 const LOG_LEVELS = new Set(['fail', 'pass', 'info', 'debug', 'verbose']);
 const LOG_SUBSYSTEMS = new Set([
     'pipeline', 'agent1', 'agent3', 'finder', 'retrieval', 'db',
-    'entity', 'reflection', 'settings', 'import', 'cache',
+    'entity', 'reflection', 'settings', 'import', 'cache', 'writer',
 ]);
 // DISPLAY-only aliases for subsystem machine keys (the keys themselves are stable,
 // for back-compat with persisted log entries + the filter dropdown values).
 const SUBSYSTEM_DISPLAY = {
     agent1: 'Drafter',
     agent2: 'Writer',
+    writer: 'Writer',
     agent3: 'Scribe',
     agent4: 'Librarian',
     finder: 'Librarian',
@@ -116,6 +117,13 @@ const DEFAULT_SETTINGS = {
     // shrink the prompt and rely on facts to replace older history. Reversible: just
     // change the slider back to 0.
     agent2ContextMessages: 0,
+    // Writer recall tool (pull-detail / "infinite reach"). When ON, registers an optional
+    // `search_memory` function-tool the MAIN model can call mid-generation to fetch a stored
+    // fact that WASN'T pushed into its context. Default OFF so existing users and non-tool-
+    // calling models are completely unaffected. Requires a tool-calling-capable main model;
+    // only active on the main generation path (ST's tool loop never runs on the quiet/agent
+    // paths). READ-ONLY: the tool never writes or deletes.
+    enableWriterRecallTool: false,
     reviewInterval: 10,
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
@@ -258,6 +266,7 @@ function validateSettings(s) {
     // fold it onto the canonical key so downstream code only reads agent4Profile.
     if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
     if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = true;
+    if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
     if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
@@ -2280,6 +2289,18 @@ export async function initSettings() {
         extensionSettings.agent2ContextMessages = val;
         $('#bf_mem_agent2_context_val').text(val);
         saveSettings();
+    });
+
+    // Writer recall tool toggle (pull-detail / "infinite reach"). Default OFF. Toggling it
+    // register/unregisters the optional search_memory function-tool via syncWriterRecallTool().
+    $('#bf_mem_recall_tool_enabled').prop('checked', extensionSettings.enableWriterRecallTool === true).on('change', function () {
+        const before = extensionSettings.enableWriterRecallTool === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableWriterRecallTool = next;
+        addDebugLog('info', `Writer recall tool ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableWriterRecallTool' }, before, after: !!next });
+        saveSettings();
+        // Re-sync registration to the new state (cycle-safe lazy import).
+        import('./agent-writer.js').then(m => m.syncWriterRecallTool?.()).catch(() => {});
     });
 
     // Review interval slider

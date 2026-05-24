@@ -179,3 +179,195 @@ function injectIntoMessages(messages, injection) {
     console.log('[BFMemory] Memory context injected into prompt');
     return true;
 }
+
+// =============================================================================
+// WRITER RECALL TOOL — optional `search_memory` function-tool (pull-detail / "infinite reach")
+// =============================================================================
+//
+// The pipeline PUSHES a compact gist of the most-salient facts into the Writer's prompt every
+// turn. This tool is the PULL half: when the Writer (the MAIN model) needs a fact that was NOT
+// pushed, it calls search_memory to fetch it on demand. SillyTavern's tool-calling loop only
+// runs on the MAIN generation path (not the background/quiet agent paths), so the Writer is the
+// only legitimate place to expose a tool.
+//
+// Gated behind the default-OFF `enableWriterRecallTool` setting. READ-ONLY + DETERMINISTIC +
+// ZERO-API: the action delegates to searchMemoryForRecall (fact-retrieval.js), which reuses the
+// exact same retrieval/visibility/ranking/format machinery as the push path. Registration is
+// idempotent (guarded by _recallToolRegistered); unregistered cleanly when toggled off.
+//
+// IMPORTS are LAZY (dynamic import inside the action / logging helpers) to avoid a static import
+// cycle — settings.js statically imports DEFAULT_WRITER_FORMAT from THIS module.
+// =============================================================================
+
+const RECALL_TOOL_NAME = 'search_memory';
+// Module-level guard so register/unregister stay idempotent across init + toggle re-runs.
+let _recallToolRegistered = false;
+let _recallToolApiUnavailableLogged = false; // fail-level "API missing" notice fires once
+
+/**
+ * Best-effort debug log that never throws (settings.js is imported lazily to dodge the
+ * agent-writer <-> settings import cycle). A runId may not exist inside ST's generation loop —
+ * we log without one; absence is never an error.
+ * @param {string} level
+ * @param {string} message
+ * @param {object} [opts]
+ */
+async function recallToolLog(level, message, opts = {}) {
+    try {
+        const { addDebugLog } = await import('./settings.js');
+        addDebugLog(level, message, opts);
+    } catch { /* logging must never break the tool */ }
+}
+
+/**
+ * Feature-detect SillyTavern's function-tool API. The register/unregister pair lives either
+ * directly on the context or under context.ToolManager (ST has exposed both shapes across
+ * versions). Returns the resolved { register, unregister } functions, or null when neither
+ * exists (caller logs a single fail-level notice and no-ops — NEVER throws).
+ * @returns {{register: Function, unregister: Function|null}|null}
+ */
+function getToolApi() {
+    let ctx;
+    try { ctx = SillyTavern.getContext(); } catch { return null; }
+    if (!ctx) return null;
+    if (typeof ctx.registerFunctionTool === 'function') {
+        return {
+            register: ctx.registerFunctionTool.bind(ctx),
+            unregister: typeof ctx.unregisterFunctionTool === 'function' ? ctx.unregisterFunctionTool.bind(ctx) : null,
+        };
+    }
+    const tm = ctx.ToolManager;
+    if (tm && typeof tm.registerFunctionTool === 'function') {
+        return {
+            register: tm.registerFunctionTool.bind(tm),
+            unregister: typeof tm.unregisterFunctionTool === 'function' ? tm.unregisterFunctionTool.bind(tm) : null,
+        };
+    }
+    return null;
+}
+
+/**
+ * Read the enableWriterRecallTool setting (lazily, cycle-safe). Default OFF.
+ * @returns {boolean}
+ */
+function recallToolEnabled() {
+    const s = getSettingsSafe();
+    return !!(s && s.enableWriterRecallTool === true);
+}
+
+/**
+ * The tool action: search long-term memory for facts not already in the Writer's context.
+ * READ-ONLY, deterministic, zero-API. Returns a STRING (the ST tool contract). Logs each
+ * invocation at debug level with query/category/result-count metadata (NOT full fact bodies).
+ * Never throws — returns a safe error string on any failure.
+ * @param {{query?: string, category?: string, limit?: number}} args
+ * @returns {Promise<string>}
+ */
+async function searchMemoryAction({ query, category, limit } = {}) {
+    try {
+        const { searchMemoryForRecall } = await import('./fact-retrieval.js');
+        const { text, count } = await searchMemoryForRecall({ query, category, limit });
+        await recallToolLog('debug', `Writer recall: search_memory "${String(query ?? '').slice(0, 80)}" → ${count} fact(s)`, {
+            subsystem: 'writer', event: 'tool.search_memory',
+            data: { query: String(query ?? '').slice(0, 120), category: category || null, resultCount: count },
+        });
+        return text;
+    } catch (e) {
+        await recallToolLog('fail', `Writer recall: search_memory failed — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.search_memory', reason: 'RECALL_ERROR',
+        });
+        return 'Memory search failed.';
+    }
+}
+
+/**
+ * Register the optional `search_memory` Writer recall tool. Idempotent (guarded by
+ * _recallToolRegistered). No-op + single fail-level log when the ST tool API is unavailable.
+ * Never throws. Call on init (when enabled) and whenever the setting is toggled on.
+ */
+export function registerWriterRecallTool() {
+    if (_recallToolRegistered) return;
+    const api = getToolApi();
+    if (!api) {
+        if (!_recallToolApiUnavailableLogged) {
+            _recallToolApiUnavailableLogged = true;
+            void recallToolLog('fail', 'Writer recall: SillyTavern function-tool API unavailable — search_memory not registered', {
+                subsystem: 'writer', event: 'tool.unregistered', reason: 'TOOL_API_UNAVAILABLE',
+            });
+        }
+        return;
+    }
+    try {
+        api.register({
+            name: RECALL_TOOL_NAME,
+            displayName: 'Search Memory',
+            description: 'Search long-term memory for stored facts that are NOT already in your context. '
+                + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
+                + '(as shown in the established-facts list) to pull that full record. Read-only.',
+            parameters: {
+                $schema: 'http://json-schema.org/draft-04/schema#',
+                type: 'object',
+                properties: {
+                    query: {
+                        type: 'string',
+                        description: 'Keyword(s) to search for, or an exact "Category/key" handle to pull one record.',
+                    },
+                    category: {
+                        type: 'string',
+                        description: 'Optional category to restrict the search to (e.g. People, Places, Events).',
+                    },
+                    limit: {
+                        type: 'integer',
+                        description: 'Optional max number of facts to return (default 20).',
+                    },
+                },
+                required: ['query'],
+            },
+            action: searchMemoryAction,
+            formatMessage: ({ query } = {}) => `Searching memory for "${String(query ?? '').slice(0, 80)}"…`,
+            shouldRegister: () => recallToolEnabled(),
+            stealth: false,
+        });
+        _recallToolRegistered = true;
+        void recallToolLog('info', 'Writer recall: search_memory tool registered', {
+            subsystem: 'writer', event: 'tool.registered',
+        });
+    } catch (e) {
+        void recallToolLog('fail', `Writer recall: failed to register search_memory — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.unregistered', reason: 'REGISTER_FAILED',
+        });
+    }
+}
+
+/**
+ * Unregister the `search_memory` tool. Idempotent. If ST exposes no unregister fn we rely on
+ * the tool's own shouldRegister() returning false to keep it inert. Never throws.
+ */
+export function unregisterWriterRecallTool() {
+    if (!_recallToolRegistered) return;
+    const api = getToolApi();
+    try {
+        if (api && typeof api.unregister === 'function') {
+            api.unregister(RECALL_TOOL_NAME);
+        }
+        // Whether or not an unregister fn exists, drop our guard: shouldRegister() (which reads
+        // the now-off setting) keeps the tool inert even if it lingers in ST's registry.
+        _recallToolRegistered = false;
+        void recallToolLog('info', 'Writer recall: search_memory tool unregistered', {
+            subsystem: 'writer', event: 'tool.unregistered',
+        });
+    } catch (e) {
+        void recallToolLog('fail', `Writer recall: failed to unregister search_memory — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.unregistered', reason: 'UNREGISTER_FAILED',
+        });
+    }
+}
+
+/**
+ * Sync the recall tool's registration to the current setting. Register when enabled, unregister
+ * when not. Safe to call on init and on every settings change. Never throws.
+ */
+export function syncWriterRecallTool() {
+    if (recallToolEnabled()) registerWriterRecallTool();
+    else unregisterWriterRecallTool();
+}
