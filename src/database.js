@@ -465,20 +465,41 @@ const SNAPSHOT_SCHEMA_VERSION = 1;
 // Capability probe result is memoized: 'unknown' until first checked, then true/false.
 let _idbCapable = 'unknown';
 let _idbConnPromise = null; // shared open() promise (one connection for the page lifetime)
+let _idbFallbackLogged = false; // so the fallback notice fires once per session, not per call
+
+/**
+ * Disable IndexedDB for the session and log the fallback ONCE (debug-logging standing rule),
+ * so the user can SEE in the Debug tab that the extension is running on durable attachments
+ * only (private mode / blocked / hard IDB error) instead of silently degrading.
+ * @param {string} reason
+ */
+function disableIdb(reason) {
+    _idbCapable = false;
+    if (_idbFallbackLogged) return;
+    _idbFallbackLogged = true;
+    try {
+        addDebugLog('info', `IndexedDB unavailable — using durable attachments only (${reason})`, {
+            subsystem: 'db', event: 'storage.fallback', reason: 'IDB_UNAVAILABLE', data: { why: reason },
+        });
+    } catch { /* logging must never break storage */ }
+}
 
 /**
  * One-time capability probe: is IndexedDB usable here? False when the global is absent or
  * throws on access (some locked-down contexts). The real open() below also try/catches and
- * sets _idbCapable=false on hard failures, so this is a fast pre-filter, not the only guard.
+ * disables IDB on hard failures, so this is a fast pre-filter, not the only guard.
  * @returns {boolean}
  */
 function idbAvailable() {
     if (_idbCapable !== 'unknown') return _idbCapable;
+    let ok;
     try {
-        _idbCapable = (typeof indexedDB !== 'undefined' && indexedDB !== null);
+        ok = (typeof indexedDB !== 'undefined' && indexedDB !== null);
     } catch {
-        _idbCapable = false;
+        ok = false;
     }
+    if (!ok) { disableIdb('indexedDB global unavailable'); }
+    else { _idbCapable = true; }
     return _idbCapable;
 }
 
@@ -496,7 +517,7 @@ function openIdb() {
         try {
             req = indexedDB.open(IDB_NAME, IDB_VERSION);
         } catch (e) {
-            _idbCapable = false; // hard-disable for the session
+            disableIdb('open() threw'); // hard-disable for the session + log once
             reject(e);
             return;
         }
@@ -518,7 +539,7 @@ function openIdb() {
             db.onversionchange = () => { try { db.close(); } catch { /* ignore */ } _idbConnPromise = null; };
             resolve(db);
         };
-        req.onerror = () => { _idbCapable = false; reject(req.error || new Error('IDB open error')); };
+        req.onerror = () => { disableIdb('open error'); reject(req.error || new Error('IDB open error')); };
         req.onblocked = () => { reject(new Error('IDB open blocked')); };
     }).catch((e) => {
         // Reset so a later attempt can retry, but the memoized capability flag (set on hard
