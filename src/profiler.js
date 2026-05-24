@@ -42,7 +42,8 @@ export function getCurrentProfileId() {
  * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
  */
 export function getAgent1ProfileId(settings) {
-    if (!settings?.useMemoryProfile) return null;
+    // Per-agent profiles are ALWAYS active (the useMemoryProfile gate was removed in the
+    // v0.21.x menu cleanup). A blank agent1Profile still falls back to the current connection.
     if (!settings?.agent1Profile) return null;
 
     // Verify the profile still exists
@@ -63,7 +64,7 @@ export function getAgent1ProfileId(settings) {
  * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
  */
 export function getAgent3ProfileId(settings) {
-    if (!settings?.useMemoryProfile) return null;
+    // Per-agent profiles are ALWAYS active (useMemoryProfile gate removed). Blank => current.
     if (!settings?.agent3Profile) return null;
 
     // Verify the profile still exists
@@ -86,7 +87,7 @@ export function getAgent3ProfileId(settings) {
  * @returns {string|null} Profile ID to pass to callAgentLLM, or null to use current
  */
 export function getAgent4ProfileId(settings) {
-    if (!settings?.useMemoryProfile) return null;
+    // Per-agent profiles are ALWAYS active (useMemoryProfile gate removed).
     // Dedicated finder profile wins when set and still present.
     const dedicated = settings?.agent4Profile || settings?.finderProfile || '';
     if (dedicated) {

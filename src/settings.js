@@ -325,9 +325,7 @@ export function updateStatus(status, message = '') {
     if (text && message) {
         text.textContent = message;
     } else if (text) {
-        text.textContent = extensionSettings?.enabled
-            ? `Active${extensionSettings.useMemoryProfile ? ' (separate profile)' : ''}`
-            : 'Disabled';
+        text.textContent = extensionSettings?.enabled ? 'Active' : 'Disabled';
     }
 }
 
@@ -2106,13 +2104,9 @@ export async function initSettings() {
         saveSettings();
     });
 
-    $('#bf_mem_use_profile').prop('checked', extensionSettings.useMemoryProfile).on('change', function () {
-        extensionSettings.useMemoryProfile = $(this).prop('checked');
-        // Note: profile dropdowns now live in the per-agent tabs (always visible).
-        // This flag still gates whether the agents USE those profiles
-        // (see getAgent1ProfileId / getAgent3ProfileId in profiler.js).
-        saveSettings();
-    });
+    // "Use separate profiles" toggle REMOVED (v0.21.x menu cleanup): per-agent profiles are
+    // now ALWAYS active. The useMemoryProfile key is kept (default true) for back-compat;
+    // profiler.js no longer gates on it (getAgent1/3/4ProfileId always honor configured profiles).
 
     reloadProfiles();
     $('#bf_mem_agent1_profile').val(extensionSettings.agent1Profile || '').on('change', function () {
@@ -2191,25 +2185,9 @@ export async function initSettings() {
         saveSettings();
     });
 
-    // Secondary chance
-    $('#bf_mem_secondary').val(extensionSettings.secondaryChance);
-    $('#bf_mem_secondary_val').text(`${extensionSettings.secondaryChance}%`);
-    $('#bf_mem_secondary').on('input', function () {
-        const val = parseInt($(this).val());
-        extensionSettings.secondaryChance = val;
-        $('#bf_mem_secondary_val').text(`${val}%`);
-        saveSettings();
-    });
-
-    // Tertiary chance
-    $('#bf_mem_tertiary').val(extensionSettings.tertiaryChance);
-    $('#bf_mem_tertiary_val').text(`${extensionSettings.tertiaryChance}%`);
-    $('#bf_mem_tertiary').on('input', function () {
-        const val = parseInt($(this).val());
-        extensionSettings.tertiaryChance = val;
-        $('#bf_mem_tertiary_val').text(`${val}%`);
-        saveSettings();
-    });
+    // Secondary/Tertiary fact-chance sliders REMOVED (v0.21.x menu cleanup): retrieval became
+    // deterministic, so these gated nothing. The settings keys (secondaryChance/tertiaryChance)
+    // are retained inert in DEFAULT_SETTINGS/validateSettings for back-compat only.
 
     // Depth-dice sliders (Feature #4). Stored as 0..1 floats; UI shows percent.
     [1, 2, 3, 4].forEach(n => {
@@ -2246,10 +2224,9 @@ export async function initSettings() {
         extensionSettings.reflectionEnabled = $(this).prop('checked');
         saveSettings();
     });
-    $('#bf_mem_reflection_inject').prop('checked', extensionSettings.reflectionInject).on('change', function () {
-        extensionSettings.reflectionInject = $(this).prop('checked');
-        saveSettings();
-    });
+    // "Inject story so far" checkbox REMOVED (v0.21.x menu cleanup): the summary is no longer
+    // injected into the writer under any setting. reflectionInject key is kept (default false)
+    // in DEFAULT_SETTINGS/validateSettings for back-compat only.
     $('#bf_mem_reflection_interval').val(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval_val').text(extensionSettings.reflectionInterval);
     $('#bf_mem_reflection_interval').on('input', function () {

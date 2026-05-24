@@ -95,6 +95,7 @@
                             <span>Use the Librarian agent (STAGE 2 retrieval)</span>
                         </label>
                         <small class="bf-mem-hint">After the Drafter picks branches from the memory menu, the Librarian reads the full facts under those branches and chooses the relevant subset to inject for the Writer. Off (or on any error) falls back to deterministic keyword retrieval.</small>
+                        <small class="bf-mem-hint">The Librarian always reads the last 2 messages plus the Drafter's branch picks — no context-window setting needed.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Librarian Profile</label>
                             <div class="bf-mem-profile-row">
@@ -133,22 +134,6 @@
                             <label>Context Limit (trim chat) <span class="bf-mem-val" id="bf_mem_agent2_context_val">0</span></label>
                             <input type="range" id="bf_mem_agent2_context" min="0" max="50" step="1" value="0" />
                             <small class="bf-mem-hint">Default 0 = off (main model sees full chat as ST sends it). Set &gt; 0 to HIDE older messages — the main model only sees the last N chat messages + your injected facts. Cleaner focus, lower token cost, but the facts must be good enough to replace the hidden history.</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-dice"></i> Fact Retrieval</div>
-                    <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Controls which stored facts get injected into the writer's prompt.</small>
-                        <div class="bf-mem-field">
-                            <label>Secondary Fact Chance <span class="bf-mem-val" id="bf_mem_secondary_val">50%</span></label>
-                            <input type="range" id="bf_mem_secondary" min="0" max="100" step="5" value="50" />
-                            <small class="bf-mem-hint">Related but not directly requested (e.g. at restaurant -> food preferences)</small>
-                        </div>
-                        <div class="bf-mem-field">
-                            <label>Tertiary Fact Chance <span class="bf-mem-val" id="bf_mem_tertiary_val">15%</span></label>
-                            <input type="range" id="bf_mem_tertiary" min="0" max="100" step="5" value="15" />
-                            <small class="bf-mem-hint">Distant thematic connections (e.g. topic mentioned -> old memory)</small>
                         </div>
                     </div>
                 </div>
@@ -206,6 +191,18 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Scribe Prompt
+                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-sliders"></i> Context &amp; Review</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
@@ -217,32 +214,6 @@
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
                             <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
                             <small class="bf-mem-hint">Messages between fact-review popups (review of the Scribe's extracted facts).</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-lightbulb"></i> Reflection / Consolidation</div>
-                    <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_reflection_enabled" />
-                            <span>Enable periodic reflection pass</span>
-                        </label>
-                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing the Scribe's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label>Reflection Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
-                            <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
-                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
-                        </div>
-                        <label class="checkbox_label" style="margin-top:8px;">
-                            <input type="checkbox" id="bf_mem_reflection_inject" />
-                            <span>Inject "story so far" into the writer prompt (deprecated — no effect)</span>
-                        </label>
-                        <small class="bf-mem-hint">DEPRECATED: the rolling summary is no longer injected into the writer under any setting. The summary is still kept for the live panel below and observations are still written. This toggle is inert and kept only for back-compat.</small>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label>Current Reflection (live)</label>
-                            <div id="bf_mem_reflection_view" class="bf-mem-fact-list">
-                                <div class="bf-mem-summary-empty">No reflection yet. It is generated periodically once the pipeline has run several turns.</div>
-                            </div>
                         </div>
                     </div>
                 </div>
@@ -273,27 +244,36 @@
                     </div>
                 </div>
                 <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Scribe Prompt
-                        <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
-                            <i class="fa-solid fa-undo"></i>
-                        </button>
-                    </div>
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-lightbulb"></i> Re-evaluation / Reflection</div>
                     <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_reflection_enabled" />
+                            <span>Enable periodic reflection pass</span>
+                        </label>
+                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing the Scribe's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Re-evaluation Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
+                            <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
+                            <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
+                        </div>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Current Reflection (live)</label>
+                            <div id="bf_mem_reflection_view" class="bf-mem-fact-list">
+                                <div class="bf-mem-summary-empty">No reflection yet. It is generated periodically once the pipeline has run several turns.</div>
+                            </div>
+                        </div>
                     </div>
                 </div>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Reflection Prompt
+                        <i class="fa-solid fa-pen"></i> Re-evaluation Prompt
                         <button id="bf_mem_reset_reflection_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
                             <i class="fa-solid fa-undo"></i>
                         </button>
                     </div>
                     <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_reflection_prompt" class="bf-mem-textarea" rows="10" placeholder="Reflection / consolidation system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells the reflection pass how to write the "story so far" summary and synthesize observations.</small>
+                        <textarea id="bf_mem_reflection_prompt" class="bf-mem-textarea" rows="10" placeholder="Re-evaluation / consolidation system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the reflection pass how to synthesize observations during periodic re-evaluation.</small>
                     </div>
                 </div>
             </div>
@@ -303,11 +283,7 @@
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profiles</div>
                     <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_use_profile" />
-                            <span>Use separate profiles for the Drafter + Scribe</span>
-                        </label>
-                        <small class="bf-mem-hint">When off, all agents use your default/active connection profile. When on, set each agent's profile in its own tab.</small>
+                        <small class="bf-mem-hint">Each agent can use its own connection profile — set them per agent in the Drafter, Scribe, and Librarian tabs. Leave a profile blank to fall back to your default/active profile. The Writer always uses your default/active profile.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
