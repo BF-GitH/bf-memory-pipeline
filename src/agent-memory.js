@@ -1114,7 +1114,7 @@ function isReservedUserToken(token) {
  * substituteParams), catching BOTH the tagged (`subj:{{char}}`) and untagged (bare `char_*` key)
  * cases. Idempotent and conservative:
  *   - Only the reserved generic prefix is rewritten — a key that already starts with a real name
- *     (`fiona_*`) is left untouched (no double-prefix, no rename).
+ *     (`<name>_*`) is left untouched (no double-prefix, no rename).
  *   - The same resolved name is applied to BOTH the stored subject AND the key prefix.
  *   - The source SPEAKER of the message being extracted is preferred when known (a USER message →
  *     the persona name; a CHAR/group-member message → that author's name), falling back to the
@@ -1161,7 +1161,7 @@ function resolveGenericNames(update, names) {
 
     // Apply to the key prefix: rewrite ONLY the leading generic token, preserving the rest of the
     // key (`char_physical_state` → `<name>_physical_state`). A key with no generic prefix is left
-    // alone (so an already-real-name key like `fiona_*` is never double-prefixed/renamed).
+    // alone (so an already-real-name key like `<name>_*` is never double-prefixed/renamed).
     if (keyRole) {
         const us = key.indexOf('_');
         const tail = us > 0 ? key.slice(us + 1) : '';

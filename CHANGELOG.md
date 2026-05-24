@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.28.0] - 2026-05-24
+
+### Fixed — facts now belong to the right character (was a data-loss bug) + a faster loop
+A 3-agent diagnosis traced several symptoms to one hub bug and a self-inflicted latency tax.
+
+**The hub bug: facts were stored under a generic `"char"` label, not the actual character.** The character name (`{{char}}`) was filled into the note-taker's *instructions* but **never into its saved output**, so facts were stored as `char_*` / subject `"char"`. Consequences, all now fixed:
+- Retrieval filters by the real character name, found nothing stored under it, and **dropped the character's own facts** before they could be injected → that was the real "too few facts injected" (not a cap).
+- The merge logic, seeing everything under `"char"` with similar keys, **collapsed distinct facts** (a location overwrote a physical state; "soaked jeans" overwrote "soaked hoodie").
+- **Worst — group chats / NPCs:** every character became `"char"`, so one character's facts **overwrote another's in place** (silent data loss).
+Now every fact resolves to the real character/speaker name (per-character key namespacing), so two characters can never collide; the focus filter matches; and `dedupeDatabase` can't cross-collapse characters. ([src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js), [src/pipeline.js](src/pipeline.js))
+
+**Merge matcher no longer collapses distinct facts.** Numbered items (`_1`/`_2`) stay separate, and `physical_location` ≠ `physical_state` (the matcher only drops known version-qualifier tokens, not the distinguishing one). Legitimate same-key state changes (e.g. standing→sitting) still supersede. ([src/database.js](src/database.js))
+
+**Better injection (right facts, not just more).** The finder now gets a ~12 *target* instead of only a ceiling, and each present character's key anchors (identity / current state / relationships) are guaranteed into the injected set via the subject index.
+
+**Faster loop.** The finder no longer blocks the reply ~6s every turn on a slow model: budget cut to 3.5s, the in-flight call is **cancelled on timeout** (no wasted tokens), and an adaptive breaker stops waiting on it after repeated slowness (re-probing periodically). The note-taker's taxonomy menu shrank **~93% (~3,100 → ~230 tokens per extraction)** by showing families instead of all ~940 leaves (write-time snapping still files to a real leaf), and its system prompt is byte-stable/cacheable again. New (default-safe) settings: `finderBudgetMs`, `finderTargetFacts`, `finderAnchorsPerCharacter`. ([src/pipeline.js](src/pipeline.js), [src/agent-finder.js](src/agent-finder.js), [src/agent-memory.js](src/agent-memory.js), [src/llm-call.js](src/llm-call.js), [src/database.js](src/database.js), [src/settings.js](src/settings.js))
+
+### Added — per-stage timing observability
+The run summary now carries a per-stage `stages` breakdown and a `pipeline.timing` event (Agent 1 / finder / inject / Agent 3 / snapshot durations + the Scribe prompt size), so a slow turn pinpoints its own bottleneck. ([src/pipeline.js](src/pipeline.js), [src/agent-memory.js](src/agent-memory.js))
+
 ## [0.27.0] - 2026-05-24
 
 ### Fixed — CRITICAL: memory could be silently overwritten on chat-switch / branch
