@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.24.0] - 2026-05-24
+
+### Added — scale work, part 2: infinite facts, recall, summaries, episodic memory, auto-linking
+The rest of the rebuild toward unbounded memory (the "1–9" batch), built on the 0.23.0 storage foundation. All additive; the two new injection/tool features are **default-OFF** so existing behavior is unchanged until you opt in. Needs in-browser testing for the IndexedDB- and tool-calling-dependent paths.
+
+**1 · Never throw memories away (uncap + cold tier).** The ~50-per-category hot cap no longer **deletes** overflow — the lowest-salience facts are marked `cold` (kept on disk, still queryable, just deprioritized) and **resurface** the moment they're re-mentioned or directly matched. Nothing is ever evicted. ([src/database.js](src/database.js))
+
+**2 · Indexed retrieval + scoped Scribe dedup.** A per-turn in-memory index (`byCatAspect` / `bySubject` / `byToken` / `aspectCounts`) replaces the several O(all-facts) scans the hot paths each did, so retrieval stays fast at tens of thousands of facts. The Scribe's duplicate check now looks at a **scoped candidate set** instead of dumping the whole DB into its prompt. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-memory.js](src/agent-memory.js), [src/pipeline.js](src/pipeline.js))
+
+**4 · Use-it-or-lose-it.** Facts that actually get injected into the Writer's context are **strengthened** (a `useCount` + `lastUsedAt` refresh feeds salience), so frequently-used facts stay hot and win scarce slots; untouched facts decay and drift cold (never deleted). Bumps persist via the existing post-reply save. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/pipeline.js](src/pipeline.js))
+
+**5 · Writer recall tool (pull-detail) — default OFF.** Optional `search_memory` function-tool exposed on the main Writer path: when the Writer needs a fact that wasn't pushed, it can fetch it on demand (deterministic, zero-API, read-only, hard-capped). Enable in the Writer tab; requires a tool-calling-capable main model. ([src/agent-writer.js](src/agent-writer.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [index.js](index.js))
+
+**6 · Summary pyramid + multi-pass — injection default OFF.** The reflection pass now also maintains a short **per-shelf** (category/aspect) summary rolling up into the existing whole-story summary, folded into the one reflection LLM call and cost-bounded (only changed buckets, capped per pass). An optional **"Big Picture"** block injects the story + scene-relevant shelf summaries above the facts (token-capped); the Writer drills into specifics via the recall tool. ([src/agent-reflect.js](src/agent-reflect.js), [src/agent-writer.js](src/agent-writer.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+**8 · Episodic scene memory.** New `moment` fact kind for significant emotional/relational beats (slower decay than ordinary events — 30-day half-life), with an optional short `tone` field surfaced compactly to the Writer. The Scribe records genuine turning points as a narrative beat in the note (who + where + why it mattered), not just dry `key = value`. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-finder.js](src/agent-finder.js), [src/agent-memory.js](src/agent-memory.js))
+
+**9 · Automatic associative linking.** A freshly-written fact deterministically auto-links (zero-API) to related existing facts by shared subject / location / `involved` members / lexical token overlap, recorded into `relationships` (unioned, never clobbered, hard-capped). Retrieval's existing link-following then surfaces the connections. ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+**Never-delete compliance.** The reflection janitor's re-evaluation **DROP** verdict now **cold-tiers** the fact instead of deleting it (the only remaining automated `removeFact` is a category *relocation* during PROMOTE, which preserves the fact). ([src/agent-reflect.js](src/agent-reflect.js), [src/database.js](src/database.js))
+
+*(Items 3 and 7 — scoped dedup and the speed fixes — shipped in this batch and 0.23.0 respectively.)*
+
 ## [0.23.0] - 2026-05-24
 
 ### Changed — scale work, part 1: speed fixes + hybrid storage foundation
