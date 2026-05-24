@@ -64,6 +64,18 @@ const LOG_SUBSYSTEMS = new Set([
     'pipeline', 'agent1', 'agent3', 'finder', 'retrieval', 'db',
     'entity', 'reflection', 'settings', 'import', 'cache',
 ]);
+// DISPLAY-only aliases for subsystem machine keys (the keys themselves are stable,
+// for back-compat with persisted log entries + the filter dropdown values).
+const SUBSYSTEM_DISPLAY = {
+    agent1: 'Drafter',
+    agent2: 'Writer',
+    agent3: 'Scribe',
+    agent4: 'Librarian',
+    finder: 'Librarian',
+};
+function subsystemLabel(key) {
+    return SUBSYSTEM_DISPLAY[key] || key;
+}
 let lastGenerated = { runId: null, timestamp: null, updates: [] };
 let lastInserted = { runId: null, timestamp: null, updates: [] };
 let lastRunTokens = null; // {baselineInput, actualInput, agent1Input, agent1Output, agent3Input, agent3Output, mainOutput, ts, approx}
@@ -613,8 +625,8 @@ function formatRunSummary(runId, summaryEntry) {
     if (d.agents) {
         const mark = (s) => s === 'ok' ? '✓' : s === 'failed' ? '✗' : s === 'skipped' ? '–' : '?';
         const ag = [];
-        if (d.agents.agent1) ag.push(`A1${mark(d.agents.agent1)}`);
-        if (d.agents.agent3) ag.push(`A3${mark(d.agents.agent3)}`);
+        if (d.agents.agent1) ag.push(`Drafter${mark(d.agents.agent1)}`);
+        if (d.agents.agent3) ag.push(`Scribe${mark(d.agents.agent3)}`);
         if (ag.length) parts.push(ag.join(' '));
     }
     if (d.facts) {
@@ -636,7 +648,7 @@ function formatRunSummary(runId, summaryEntry) {
 function renderEntryHtml(entry) {
     const level = entry.level || entry.type || 'info';
     const meta = [];
-    if (entry.subsystem && entry.subsystem !== 'settings') meta.push(escapeHtml(entry.subsystem));
+    if (entry.subsystem && entry.subsystem !== 'settings') meta.push(escapeHtml(subsystemLabel(entry.subsystem)));
     const metaHtml = meta.length ? `<span class="bf-mem-log-sub">${meta.join(' ')}</span> ` : '';
     return `
         <div class="bf-mem-debug-entry ${escapeHtml(level)}" data-event="${escapeHtml(entry.event || '')}" data-run="${escapeHtml(entry.runId || '')}">
@@ -802,15 +814,15 @@ function renderFactList(containerId, data, opts = {}) {
 
 function renderGenerated() {
     renderFactList('bf_mem_generated_list', lastGenerated, {
-        emptyMsg: 'No pipeline runs yet. Send a message to see what Agent 3 extracts.',
-        zeroMsg: 'Last run extracted 0 facts (Agent 3 found nothing worth storing).',
+        emptyMsg: 'No pipeline runs yet. Send a message to see what the Scribe extracts.',
+        zeroMsg: 'Last run extracted 0 facts (the Scribe found nothing worth storing).',
     });
 }
 
 function renderInserted() {
     renderFactList('bf_mem_inserted_list', lastInserted, {
         emptyMsg: 'No pipeline runs yet.',
-        zeroMsg: 'Nothing to insert (Agent 3 returned no facts, or run was cancelled).',
+        zeroMsg: 'Nothing to insert (the Scribe returned no facts, or run was cancelled).',
     });
 }
 
@@ -1192,7 +1204,7 @@ function renderTokens() {
     if (banner) {
         banner.style.display = trimOff ? 'block' : 'none';
         banner.textContent = trimOff
-            ? 'Agent 2 trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls below are pure overhead (the tradeoff for memory recall). Turn on "Agent 2 Context Limit" in the Pipeline tab to save input tokens.'
+            ? 'Writer trim is OFF — the main model sees the full chat, so there are no input savings. The agent calls below are pure overhead (the tradeoff for memory recall). Turn on "Context Limit" in the Writer tab to save input tokens.'
             : '';
     }
 
@@ -1205,8 +1217,8 @@ function renderTokens() {
             <tbody>
                 <tr><td>Baseline (full chat)</td><td>${fmt(L.baselineInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
                 <tr><td>— Main model</td><td>${fmt(L.actualInput)}</td><td>${fmt(L.mainOutput)}</td></tr>
-                <tr><td>— Agent 1 (Draft)</td><td>${fmt(L.agent1Input)}</td><td>${fmt(L.agent1Output)}</td></tr>
-                <tr><td>— Agent 3 (Memory)</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
+                <tr><td>— Drafter</td><td>${fmt(L.agent1Input)}</td><td>${fmt(L.agent1Output)}</td></tr>
+                <tr><td>— Scribe</td><td>${fmt(L.agent3Input)}</td><td>${fmt(L.agent3Output)}</td></tr>
                 <tr><td><b>Extension total</b></td><td><b>${fmt(extIn)}</b></td><td><b>${fmt(extOut)}</b></td></tr>
                 <tr><td><b>NET vs baseline</b></td><td class="${netInClass}">${netInStr}</td><td class="bf-mem-tok-cost">+${fmt(netOut)}</td></tr>
             </tbody>
@@ -2368,7 +2380,7 @@ export async function initSettings() {
         $('#bf_mem_finder_prompt').val(DEFAULT_FINDER_PROMPT);
         addDebugLog('info', 'Finder prompt reset to default', { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'finderPrompt', isDefault: true } });
         saveSettings();
-        toastr.info('Fact finder prompt reset', 'BF Memory');
+        toastr.info('Librarian prompt reset', 'BF Memory');
     });
 
     // --- Database Tab: Profiles ---
@@ -2464,7 +2476,7 @@ export async function initSettings() {
             toastr.info(`Nothing to process: all ${total} message(s) are already done or trivially empty.`, 'BF Memory');
             return;
         }
-        if (!confirm(`Run Agent 3 on this chat?\n\nThis will make ~${calls} LLM call(s) (one per eligible message, out of ${total} total). Each call costs tokens. Already-processed and trivially-empty messages are skipped.\n\nProceed?`)) return;
+        if (!confirm(`Run the Scribe on this chat?\n\nThis will make ~${calls} LLM call(s) (one per eligible message, out of ${total} total). Each call costs tokens. Already-processed and trivially-empty messages are skipped.\n\nProceed?`)) return;
         const btn = $('#bf_mem_run_full_chat');
         const progress = $('#bf_mem_full_chat_progress');
         const cancelBtn = $('#bf_mem_run_full_chat_cancel');
@@ -2489,7 +2501,7 @@ export async function initSettings() {
             toastr.error(`Full-chat failed: ${err.message}`, 'BF Memory');
             progress.text(`Failed: ${err.message}`);
         } finally {
-            btn.prop('disabled', false).text('Run Agent 3 on full chat');
+            btn.prop('disabled', false).text('Run the Scribe on full chat');
             cancelBtn.hide();
         }
     });

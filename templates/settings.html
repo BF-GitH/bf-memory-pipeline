@@ -17,11 +17,12 @@
                 </label>
             </div>
 
-            <!-- Tabs -->
+            <!-- Tabs (chronological order each turn: Drafter → Librarian → Writer → Scribe) -->
             <div class="bf-mem-tabs" role="tablist">
-                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Agent 1</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent2" tabindex="-1">Agent 2</button>
-                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent3" tabindex="-1">Agent 3</button>
+                <button role="tab" class="bf-mem-tab active" aria-selected="true" aria-controls="bf_mem_tab_agent1" tabindex="0">Drafter</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent4" tabindex="-1">Librarian</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent2" tabindex="-1">Writer</button>
+                <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_agent3" tabindex="-1">Scribe</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_general" tabindex="-1">General</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_database" tabindex="-1">Database</button>
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_generated" tabindex="-1">Last Generated</button>
@@ -30,13 +31,13 @@
                 <button role="tab" class="bf-mem-tab" aria-selected="false" aria-controls="bf_mem_tab_debug" tabindex="-1">Debug</button>
             </div>
 
-            <!-- Tab: Agent 1 (Draft Planner) -->
+            <!-- Tab: Drafter (plans the reply + picks memory branches) -->
             <div id="bf_mem_tab_agent1" role="tabpanel" class="bf-mem-tabpanel">
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Agent 1 (Draft Planner) Profile</label>
+                            <label>Drafter Profile</label>
                             <div class="bf-mem-profile-row">
                                 <select id="bf_mem_agent1_profile" class="text_pole"></select>
                             </div>
@@ -50,12 +51,12 @@
                         <div class="bf-mem-field">
                             <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent1_context_val">5</span></label>
                             <input type="range" id="bf_mem_agent1_context" min="1" max="50" step="1" value="5" />
-                            <small class="bf-mem-hint">How many recent messages Agent 1 sees when planning the reply.</small>
+                            <small class="bf-mem-hint">How many recent messages the Drafter sees when planning the reply.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Per-message char limit <span class="bf-mem-val" id="bf_mem_draft_charlimit_val">2000</span></label>
                             <input type="range" id="bf_mem_draft_charlimit" min="200" max="8000" step="100" value="2000" />
-                            <small class="bf-mem-hint">Max characters of each recent message shown to Agent 1. Higher = Agent 1 sees the full back half of long turns (default 2000, was a hard 500).</small>
+                            <small class="bf-mem-hint">Max characters of each recent message shown to the Drafter. Higher = the Drafter sees the full back half of long turns (default 2000, was a hard 500).</small>
                         </div>
                     </div>
                 </div>
@@ -66,7 +67,7 @@
                             <input type="checkbox" id="bf_mem_scene_enabled" />
                             <span>Inject live scene card</span>
                         </label>
-                        <small class="bf-mem-hint">Always-on one-line block telling the writer what is true RIGHT NOW (location, who's present, active goals, recent beats). Agent 1 emits it each turn via a #Scene block — no extra LLM call. Injected above the facts every turn a scene exists.</small>
+                        <small class="bf-mem-hint">Always-on one-line block telling the Writer what is true RIGHT NOW (location, who's present, active goals, recent beats). The Drafter emits it each turn via a #Scene block — no extra LLM call. Injected above the facts every turn a scene exists.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Scene (live)</label>
                             <div id="bf_mem_scene_view" class="bf-mem-fact-list">
@@ -77,24 +78,57 @@
                 </div>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Draft Planner Prompt
+                        <i class="fa-solid fa-pen"></i> Drafter Prompt
                         <button id="bf_mem_reset_draft_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
                             <i class="fa-solid fa-undo"></i>
                         </button>
                     </div>
                     <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Draft agent system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells Agent 1 how to plan a reply and list needed facts.</small>
+                        <textarea id="bf_mem_draft_prompt" class="bf-mem-textarea" rows="12" placeholder="Drafter system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Drafter how to plan a reply and list needed facts.</small>
                     </div>
                 </div>
             </div>
 
-            <!-- Tab: Agent 2 (Writer) -->
+            <!-- Tab: Librarian (fetches the relevant facts for the Writer) -->
+            <div id="bf_mem_tab_agent4" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Librarian</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_finder_enabled" />
+                            <span>Use the Librarian agent (STAGE 2 retrieval)</span>
+                        </label>
+                        <small class="bf-mem-hint">After the Drafter picks branches from the memory menu, the Librarian reads the full facts under those branches and chooses the relevant subset to inject for the Writer. Off (or on any error) falls back to deterministic keyword retrieval.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Librarian Profile</label>
+                            <div class="bf-mem-profile-row">
+                                <select id="bf_mem_agent4_profile" class="text_pole"></select>
+                            </div>
+                            <small class="bf-mem-hint">Leave blank to reuse the Drafter's profile. A cheap/fast model works well here.</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header">
+                        <i class="fa-solid fa-pen"></i> Librarian Prompt
+                        <button id="bf_mem_reset_finder_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
+                            <i class="fa-solid fa-undo"></i>
+                        </button>
+                    </div>
+                    <div class="bf-mem-section-body">
+                        <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Librarian system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Librarian how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Tab: Writer (the main model that writes the reply) -->
             <div id="bf_mem_tab_agent2" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-pen-nib"></i> Writer (main model)</div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Agent 2 is your MAIN model writing the reply — it always uses your default/active connection profile. There is no separate profile to set.</small>
+                        <small class="bf-mem-hint">The Writer is your MAIN model writing the reply — it always uses your default/active connection profile. There is no separate profile to set.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -121,35 +155,6 @@
                             <input type="range" id="bf_mem_tertiary" min="0" max="100" step="5" value="15" />
                             <small class="bf-mem-hint">Distant thematic connections (e.g. topic mentioned -> old memory)</small>
                         </div>
-                    </div>
-                </div>
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header"><i class="fa-solid fa-magnifying-glass"></i> Fact Finder (Agent 4)</div>
-                    <div class="bf-mem-section-body">
-                        <label class="checkbox_label">
-                            <input type="checkbox" id="bf_mem_finder_enabled" />
-                            <span>Use the Fact Finder agent (STAGE 2 retrieval)</span>
-                        </label>
-                        <small class="bf-mem-hint">After Agent 1 picks branches from the memory menu, Agent 4 reads the full facts under those branches and chooses the relevant subset to inject. Off (or on any error) falls back to deterministic keyword retrieval.</small>
-                        <div class="bf-mem-field" style="margin-top:8px;">
-                            <label>Agent 4 (Fact Finder) Profile</label>
-                            <div class="bf-mem-profile-row">
-                                <select id="bf_mem_agent4_profile" class="text_pole"></select>
-                            </div>
-                            <small class="bf-mem-hint">Leave blank to reuse Agent 1's profile. A cheap/fast model works well here.</small>
-                        </div>
-                    </div>
-                </div>
-                <div class="bf-mem-section">
-                    <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Fact Finder Prompt
-                        <button id="bf_mem_reset_finder_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
-                            <i class="fa-solid fa-undo"></i>
-                        </button>
-                    </div>
-                    <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_finder_prompt" class="bf-mem-textarea" rows="10" placeholder="Fact finder system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells Agent 4 how to pick the relevant subset of candidate facts. Outputs Category/key identifiers only.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -188,13 +193,13 @@
                 </div>
             </div>
 
-            <!-- Tab: Agent 3 (Memory Updater) -->
+            <!-- Tab: Scribe (writes/updates facts into memory after each reply) -->
             <div id="bf_mem_tab_agent3" role="tabpanel" class="bf-mem-tabpanel" style="display:none;">
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-plug"></i> Connection Profile</div>
                     <div class="bf-mem-section-body">
                         <div class="bf-mem-field">
-                            <label>Agent 3 (Memory Updater) Profile</label>
+                            <label>Scribe Profile</label>
                             <div class="bf-mem-profile-row">
                                 <select id="bf_mem_agent3_profile" class="text_pole"></select>
                                 <button id="bf_mem_refresh_profiles" class="menu_button" title="Refresh profiles">
@@ -211,12 +216,12 @@
                         <div class="bf-mem-field">
                             <label>Context Messages <span class="bf-mem-val" id="bf_mem_agent3_context_val">2</span></label>
                             <input type="range" id="bf_mem_agent3_context" min="1" max="20" step="1" value="2" />
-                            <small class="bf-mem-hint">How many recent messages Agent 3 sees for extraction. Default 2 = the latest user + AI exchange. Higher = more context, more tokens.</small>
+                            <small class="bf-mem-hint">How many recent messages the Scribe sees for extraction. Default 2 = the latest user + AI exchange. Higher = more context, more tokens.</small>
                         </div>
                         <div class="bf-mem-field">
                             <label>Review Interval <span class="bf-mem-val" id="bf_mem_review_val">10</span></label>
                             <input type="range" id="bf_mem_review_interval" min="3" max="100" step="1" value="10" />
-                            <small class="bf-mem-hint">Messages between fact-review popups (review of Agent 3's extracted facts).</small>
+                            <small class="bf-mem-hint">Messages between fact-review popups (review of the Scribe's extracted facts).</small>
                         </div>
                     </div>
                 </div>
@@ -227,7 +232,7 @@
                             <input type="checkbox" id="bf_mem_reflection_enabled" />
                             <span>Enable periodic reflection pass</span>
                         </label>
-                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing Agent 3's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
+                        <small class="bf-mem-hint">Every N turns, runs a maintenance pass that DEDUPES the fact database (merging near-duplicate facts) and makes ONE extra LLM call (reusing the Scribe's profile) to write higher-order observation facts. Conservative + cost-aware — it runs infrequently, off the critical path, and never blocks the reply.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Reflection Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
                             <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
@@ -274,14 +279,14 @@
                 </div>
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
-                        <i class="fa-solid fa-pen"></i> Memory Updater Prompt
+                        <i class="fa-solid fa-pen"></i> Scribe Prompt
                         <button id="bf_mem_reset_memory_prompt" class="bf-mem-reset-btn menu_button" title="Reset to default">
                             <i class="fa-solid fa-undo"></i>
                         </button>
                     </div>
                     <div class="bf-mem-section-body">
-                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Memory updater system prompt..."></textarea>
-                        <small class="bf-mem-hint">Tells Agent 3 how to extract and update facts.</small>
+                        <textarea id="bf_mem_memory_prompt" class="bf-mem-textarea" rows="12" placeholder="Scribe system prompt..."></textarea>
+                        <small class="bf-mem-hint">Tells the Scribe how to extract and update facts.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -305,7 +310,7 @@
                     <div class="bf-mem-section-body">
                         <label class="checkbox_label">
                             <input type="checkbox" id="bf_mem_use_profile" />
-                            <span>Use separate profiles for Agent 1 + Agent 3</span>
+                            <span>Use separate profiles for the Drafter + Scribe</span>
                         </label>
                         <small class="bf-mem-hint">When off, all agents use your default/active connection profile. When on, set each agent's profile in its own tab.</small>
                     </div>
@@ -363,20 +368,20 @@
                     </div>
                 </div>
 
-                <!-- Run Agent 3 on full chat -->
+                <!-- Run the Scribe on full chat -->
                 <div class="bf-mem-section">
                     <div class="bf-mem-section-header">
                         <i class="fa-solid fa-arrows-rotate"></i> Process Existing Chat
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Already have a chat going? Run Agent 3 on every message to backfill facts. Slow and uses tokens per message.</small>
+                        <small class="bf-mem-hint">Already have a chat going? Run the Scribe on every message to backfill facts. Slow and uses tokens per message.</small>
                         <label class="checkbox_label" style="margin-top:6px;">
                             <input type="checkbox" id="bf_mem_skip_processed" checked />
                             <span>Skip messages already processed</span>
                         </label>
                         <div class="bf-mem-db-actions" style="margin-top:6px;">
                             <button id="bf_mem_run_full_chat" class="menu_button">
-                                <i class="fa-solid fa-play"></i> Run Agent 3 on full chat
+                                <i class="fa-solid fa-play"></i> Run the Scribe on full chat
                             </button>
                             <button id="bf_mem_run_full_chat_cancel" class="menu_button redWarningBG" style="display:none;">
                                 <i class="fa-solid fa-stop"></i> Cancel
@@ -419,9 +424,9 @@
                         <i class="fa-solid fa-flask"></i> Last Generated Facts
                     </div>
                     <div class="bf-mem-section-body">
-                        <small class="bf-mem-hint">Everything Agent 3 extracted in the most recent run, BEFORE dedup / cancellation guards.</small>
+                        <small class="bf-mem-hint">Everything the Scribe extracted in the most recent run, BEFORE dedup / cancellation guards.</small>
                         <div id="bf_mem_generated_list" class="bf-mem-fact-list">
-                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see what Agent 3 extracts.</div>
+                            <div class="bf-mem-summary-empty">No pipeline runs yet. Send a message to see what the Scribe extracts.</div>
                         </div>
                     </div>
                 </div>
@@ -493,9 +498,9 @@
                                 <select id="bf_mem_log_subsystem" class="text_pole">
                                     <option value="">All subsystems</option>
                                     <option value="pipeline">pipeline</option>
-                                    <option value="agent1">agent1</option>
-                                    <option value="agent3">agent3</option>
-                                    <option value="finder">finder</option>
+                                    <option value="agent1">Drafter</option>
+                                    <option value="agent3">Scribe</option>
+                                    <option value="finder">Librarian</option>
                                     <option value="retrieval">retrieval</option>
                                     <option value="db">db</option>
                                     <option value="entity">entity</option>

@@ -51,8 +51,8 @@ function updateIconState(iconEl, msg) {
     const processed = !!msg.extra?.bf_mem_processed;
     iconEl.classList.toggle(ICON_PROCESSED_CLASS, processed);
     iconEl.title = processed
-        ? 'Agent 3 has extracted facts from this message. Click to re-run.'
-        : 'Agent 3 has NOT processed this message. Click to force extraction.';
+        ? 'The Scribe has extracted facts from this message. Click to re-run.'
+        : 'The Scribe has NOT processed this message. Click to force extraction.';
 }
 
 async function onIconClick(e, mesId) {
@@ -104,7 +104,7 @@ async function onIconClick(e, mesId) {
 
         updateIconState(iconEl, msg);
         if (typeof toastr !== 'undefined') {
-            toastr.success(`Agent 3: ${n} facts extracted from msg ${mesId}`, 'BF Memory', { timeOut: 3000 });
+            toastr.success(`Scribe: ${n} facts extracted from msg ${mesId}`, 'BF Memory', { timeOut: 3000 });
         }
     } catch (err) {
         addDebugLog('fail', `Per-msg icon failed for msg ${mesId}: ${err.message || err}`);
