@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.25.0] - 2026-05-24
+
+### Added — housekeeping + taxonomy growth (350 → ~1000 labels, and a growth engine)
+Closes the rebuild roadmap: the small portability/log fixes, plus the shelf-label expansion with both a manual and an AI-assisted way to keep growing it. The fact schema is unchanged and existing facts keep resolving — taxonomy growth never rewrites the store.
+
+**Portability seam.** Core data/LLM/logic modules (`database`, `llm-call`, `fact-retrieval`, and the agent-* modules) now reach SillyTavern only through a single thin adapter (`src/host.js`) instead of touching the `SillyTavern` global directly — so the engine stays "loosely clipped" and could move to another host later without a rebuild. Behavior is unchanged (pure indirection). ([src/host.js](src/host.js) + migrated core modules)
+
+**Log fix.** Switching chats no longer loses the last few (especially verbose) debug-log lines: the outgoing chat's log tail is flushed to its own file before the buffer swaps to the new chat. ([src/settings.js](src/settings.js))
+
+**Taxonomy expanded to a ~1000-label 3-level tree.** Layer 2 grew from ~90 flat aspects to **~940 leaf aspects** organized under **~77 sub-areas** within the 7 fixed categories (People holds ~⅓; the old `Time` idea folds under World). The fact still stores only `category` + `aspect`; a flattener preserves the exact storage/menu/retrieval contract, so nothing downstream changed. The Scribe now navigates a grouped (drill) menu instead of a flat list, and a synonym layer canonicalizes near-duplicates (`phobias→fears`, `occupation→career`, …) so the same concept always files to one leaf. Every prior label is preserved and every old fact still resolves. ([src/database.js](src/database.js), [src/agent-memory.js](src/agent-memory.js))
+
+**User-added labels.** From the Database tab you can add your own Layer-1 categories and Layer-2 leaves; they persist in a global overlay merged on top of the built-ins, are deduped/canonicalized on add (a near-duplicate is absorbed as a synonym, not a second label), and show with a "custom" marker. ([src/database.js](src/database.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html), [style.css](style.css))
+
+**AI "Suggest new labels" button.** A manual, on-demand action (no per-turn cost): it scans homeless facts (the `Unsorted/misc` pile + facts stuck on a category default), asks the model once to cluster them and propose new leaves (reusing existing labels where possible), and shows them in an **approve/reject** popup. Approved labels are written through the same deduped overlay path. ([src/taxonomy-suggest.js](src/taxonomy-suggest.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+**Also:** the Database tab no longer shows the obsolete `/50` per-category cap (removed by the never-delete work) — it shows the real fact count and how many are cold-tiered.
+
 ## [0.24.0] - 2026-05-24
 
 ### Added — scale work, part 2: infinite facts, recall, summaries, episodic memory, auto-linking
