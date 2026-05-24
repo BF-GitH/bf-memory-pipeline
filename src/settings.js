@@ -2757,6 +2757,14 @@ export async function initSettings() {
         extensionSettings.enabled = next;
         updateStatus('idle');
         saveSettings();
+        // CANCEL ON DISABLE: toggling OFF must HALT an in-flight run promptly, not let it finish
+        // ~75s later and inject. cancelActiveRun() sets the cancel flag AND aborts in-flight agent
+        // LLM calls. Dynamic import avoids a static circular dep (pipeline.js imports settings.js).
+        if (!next) {
+            import('./pipeline.js')
+                .then(({ cancelActiveRun }) => cancelActiveRun?.('disabled'))
+                .catch(() => { /* pipeline not ready yet — nothing in flight to cancel */ });
+        }
     });
 
     // "Use separate profiles" toggle REMOVED (v0.21.x menu cleanup): per-agent profiles are

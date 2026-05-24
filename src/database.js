@@ -62,6 +62,16 @@ const HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
 const USE_BONUS_WEIGHT = 0.06;
 const USE_BONUS_CAP = 0.20;
 
+// FINDER CANDIDATE CAP (latency fix). The Stage-2 finder's INPUT — the candidate facts rendered
+// into its prompt — was unbounded: a whole-category branch pick admitted EVERY active fact in
+// that category, INCLUDING cold-tiered ones. With "infinite facts / never delete", a heavy
+// category grows without bound and the finder prompt (hence the finder LLM latency) grows with
+// it. We cap the candidate set to the top-N by retrieval salience and EXCLUDE cold facts, so the
+// finder prompt stays bounded no matter how large the store grows. Cold facts can still surface
+// via direct keyword/subject match elsewhere; they just don't bloat the finder prompt. The
+// finder OUTPUT cap (maxFacts=24) was always there — this caps the INPUT.
+const FINDER_CANDIDATE_CAP = 50;
+
 /**
  * Bounded, log-scaled frequency bonus from a fact's useCount, shared by both salience
  * functions so keep-score and slot-rank strengthen identically. Returns 0 for unused facts.
@@ -1862,6 +1872,40 @@ export function scopedScribeCandidates(index, subjects, keywords, cap = 60) {
             .slice(0, cap);
     }
     return candidates;
+}
+
+/**
+ * Bound the Stage-2 FINDER candidate INPUT (latency fix). Given the raw candidate list a branch
+ * pick produced, (1) EXCLUDE cold-tiered facts — they would bloat the finder prompt with
+ * deprioritized overflow and can still surface via direct match elsewhere — and (2) cap to the
+ * top-N HOT facts by retrieval salience (importance + recency + use bonus). Keeps the finder
+ * prompt bounded regardless of how large the store grows under "infinite facts". Returns the
+ * (possibly capped) list and logs `finder.candidate_cap` when it actually trimmed.
+ * @param {Array<{fact: Object, category: string}>} candidates - raw candidates (post-focus/links)
+ * @param {number} [cap=FINDER_CANDIDATE_CAP] - max candidates to send to the finder
+ * @returns {{candidates: Array<{fact: Object, category: string}>, total: number, hot: number, capped: boolean}}
+ */
+export function capFinderCandidates(candidates, cap = FINDER_CANDIDATE_CAP) {
+    const all = Array.isArray(candidates) ? candidates : [];
+    // EXCLUDE cold facts from the finder candidate set (they can still surface via direct match).
+    const hot = all.filter(({ fact }) => isHotFact(fact));
+    let out = hot;
+    let capped = false;
+    if (hot.length > cap) {
+        const now = Date.now();
+        out = hot
+            .slice()
+            .sort((a, b) => salienceScore(b.fact, now) - salienceScore(a.fact, now))
+            .slice(0, cap);
+        capped = true;
+    }
+    if (capped || hot.length < all.length) {
+        addDebugLog('info', `Finder candidate cap: ${all.length} -> ${out.length} (dropped ${all.length - hot.length} cold, ${hot.length - out.length} over-cap)`, {
+            subsystem: 'finder', event: 'finder.candidate_cap', reason: capped ? 'CAP' : 'COLD_FILTER',
+            data: { total: all.length, coldDropped: all.length - hot.length, overCapDropped: hot.length - out.length, kept: out.length, cap },
+        });
+    }
+    return { candidates: out, total: all.length, hot: hot.length, capped };
 }
 
 /**

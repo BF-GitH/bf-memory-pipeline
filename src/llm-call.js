@@ -6,7 +6,15 @@
 import { addDebugLog } from './settings.js';
 import * as host from './host.js';
 
-const LLM_TIMEOUT_MS = 60000; // 60s — bumped from 30s for mobile network tolerance
+// LATENCY BUDGET (latency/abort fix). The agent LLM calls sit on the user's reply-critical
+// path, so they must be hard-bounded — never the old 60s × 3 transports × 2 attempts = ~360s.
+// - PER_TRANSPORT timeout: one transport leg (CMRS / proxy / quiet) may take this long before
+//   we abort it and try the next. ~28s is generous for a real reply yet far below a 60s stall.
+// - WALL-CLOCK budget: the TOTAL time callAgentLLM may spend across ALL transports AND the one
+//   permitted retry. Once exceeded we stop trying further legs/attempts and return empty. This
+//   is the single number that caps the whole cascade (≈ the worst case for a fully-failing API).
+const LLM_TIMEOUT_MS = 28000;          // 28s per transport leg (was 60s, per-leg, unbounded)
+const LLM_WALLCLOCK_BUDGET_MS = 45000; // 45s total across all legs + the one retry (hard cap)
 
 // CACHE-ELIGIBILITY tracking (HONEST — server-side cache HITS are NOT observable from an
 // extension; see the long note in callAgentLLMOnce). We can only observe what makes the
@@ -27,13 +35,91 @@ function cheapHash(str) {
     return (h >>> 0).toString(36);
 }
 
-/** Wrap a promise with a timeout */
-function withTimeout(promise, ms) {
+// ── In-flight abort registry (cancel hook) ───────────────────────────────────
+// The pipeline must be able to ABORT in-flight agent calls when the user clicks Stop
+// (GENERATION_STOPPED) or toggles the extension OFF mid-run. Each active callAgentLLM
+// registers its AbortController here; cancelInFlightLLM() aborts them all at once.
+// This is what makes "disable / stop actually cancels" real — not just "refuse to commit".
+const _activeControllers = new Set();
+
+/**
+ * Abort every in-flight agent LLM call. Called by the pipeline's cancelActiveRun() when the
+ * user disables the extension or clicks Stop mid-run. Idempotent and safe to call with none
+ * in flight. The aborted calls reject with an AbortError, which propagates as a normal
+ * (non-retryable) failure so the caller falls back to deterministic retrieval immediately.
+ * @param {string} [reason='cancel'] - short reason tag for the debug log
+ */
+export function cancelInFlightLLM(reason = 'cancel') {
+    const n = _activeControllers.size;
+    if (n === 0) return;
+    for (const ctrl of _activeControllers) {
+        try { ctrl.abort(new DOMException('Aborted by BF Memory cancel', 'AbortError')); } catch { /* best-effort */ }
+    }
+    _activeControllers.clear();
+    try {
+        addDebugLog('info', `Aborted ${n} in-flight LLM call(s) (${reason})`, {
+            subsystem: 'pipeline', event: 'llm.abort', reason, data: { aborted: n },
+        });
+    } catch { /* logging must never break cancel */ }
+}
+
+/** True when an error represents an abort (cancel) rather than a transport failure. */
+function isAbortError(err) {
+    return !!err && (err.name === 'AbortError' || /\babort/i.test(String(err.message || err)));
+}
+
+/**
+ * True when an error is a DETERMINISTIC failure that a retry cannot fix — HTTP 4xx
+ * (Bad Request / Unauthorized / quota 429) or an abort. Retrying these just burns the
+ * wall-clock budget on a guaranteed-identical failure, so we short-circuit instead.
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function isNonRetryableError(err) {
+    if (isAbortError(err)) return true;
+    const msg = String(err?.message || err || '');
+    // callSTProxy throws `ST proxy <status>: <body>` — match a 4xx status code.
+    if (/\b4\d\d\b/.test(msg)) return true;
+    if (/bad request|unauthorized|forbidden|quota|insufficient|invalid api key/i.test(msg)) return true;
+    return false;
+}
+
+/**
+ * Race a transport leg against (a) a per-leg timeout and (b) an external AbortSignal, and
+ * ABORT the underlying work when either fires. Unlike a bare Promise.race, the timeout here
+ * calls controller.abort() so a transport that supports the signal (the proxy fetch) actually
+ * STOPS rather than lingering in the background billing tokens. Legs that can't take a signal
+ * (CMRS, generateQuietPrompt) at least stop being awaited the instant the timeout/abort fires.
+ * @param {(signal: AbortSignal) => Promise<any>} fn - receives the leg's abort signal
+ * @param {number} ms - per-leg timeout
+ * @param {AbortSignal} [parentSignal] - the call-level signal (budget/cancel)
+ * @returns {Promise<any>}
+ */
+function withTimeout(fn, ms, parentSignal) {
+    const legCtrl = new AbortController();
+    // Cascade the parent (budget/cancel) abort down to this leg.
+    const onParentAbort = () => legCtrl.abort(parentSignal.reason);
+    if (parentSignal) {
+        if (parentSignal.aborted) legCtrl.abort(parentSignal.reason);
+        else parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    }
     let timer;
     const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`LLM call timed out after ${ms / 1000}s`)), ms);
+        timer = setTimeout(() => {
+            legCtrl.abort(new DOMException(`LLM leg timed out after ${ms / 1000}s`, 'TimeoutError'));
+            reject(new Error(`LLM call timed out after ${ms / 1000}s`));
+        }, ms);
     });
-    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+    let work;
+    try {
+        work = Promise.resolve(fn(legCtrl.signal));
+    } catch (e) {
+        work = Promise.reject(e);
+    }
+    return Promise.race([work, timeout]).finally(() => {
+        clearTimeout(timer);
+        if (parentSignal) parentSignal.removeEventListener?.('abort', onParentAbort);
+    });
 }
 
 /**
@@ -85,7 +171,7 @@ function getCMRS() {
  * @param {Array} messages - Chat messages array
  * @returns {Promise<string>} The LLM response text
  */
-async function callViaCMRS(profileId, messages) {
+async function callViaCMRS(profileId, messages, signal) {
     const CMRS = getCMRS();
     if (!CMRS) {
         throw new Error('ConnectionManagerRequestService not available');
@@ -98,6 +184,10 @@ async function callViaCMRS(profileId, messages) {
 
     addDebugLog('info', `CMRS call via profile "${profile.name || profileId}"`);
 
+    // CMRS.sendRequest exposes no documented AbortSignal param, so we can't truly abort its
+    // underlying request. withTimeout still aborts the LEG (stops awaiting) on timeout/cancel,
+    // and we honor an already-aborted signal here so a cancel before/at dispatch short-circuits.
+    if (signal?.aborted) throw new DOMException('Aborted before CMRS dispatch', 'AbortError');
     const result = await CMRS.sendRequest(profileId, messages, 0, {
         stream: false,
         extractData: true,
@@ -143,32 +233,66 @@ export async function callAgentLLM(systemPrompt, userPrompt, profileId = null, a
         });
     } catch { /* logging must never break the call */ }
 
+    // ── Bounded retry under a WALL-CLOCK budget + real abort ──────────────────
+    // One AbortController governs the WHOLE call (all transport legs + the one retry). It is
+    // aborted by: (a) the wall-clock budget timer, or (b) cancelInFlightLLM() when the user
+    // disables/stops mid-run. Registered so the pipeline's cancel hook can reach it.
+    const callCtrl = new AbortController();
+    _activeControllers.add(callCtrl);
+    const deadline = Date.now() + LLM_WALLCLOCK_BUDGET_MS;
+    const budgetTimer = setTimeout(
+        () => callCtrl.abort(new DOMException(`LLM wall-clock budget ${LLM_WALLCLOCK_BUDGET_MS / 1000}s exceeded`, 'TimeoutError')),
+        LLM_WALLCLOCK_BUDGET_MS,
+    );
+
     let lastError = null;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-            const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent);
-            if (result && result.trim()) return result;
-            if (attempt === 1) {
-                addDebugLog('info', 'LLM returned empty response, retrying once...');
+    try {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            // Stop before a fresh attempt if the wall-clock budget is spent / call was cancelled.
+            if (callCtrl.signal.aborted || Date.now() >= deadline) {
+                addDebugLog('fail', `LLM wall-clock budget exhausted before attempt ${attempt} [${agent}]`, {
+                    subsystem: 'pipeline', event: 'llm.budget', reason: 'WALLCLOCK', data: { agent, budgetMs: LLM_WALLCLOCK_BUDGET_MS },
+                });
+                break;
             }
-        } catch (err) {
-            lastError = err;
-            if (attempt === 1) {
-                addDebugLog('info', `LLM call threw (${err.message || err}), retrying once...`);
+            try {
+                const result = await callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent, callCtrl.signal);
+                if (result && result.trim()) return result;
+                if (attempt === 1) {
+                    addDebugLog('info', 'LLM returned empty response, retrying once...');
+                }
+            } catch (err) {
+                lastError = err;
+                // NEVER retry deterministic failures (HTTP 4xx / Bad Request / quota) or an abort
+                // (cancel/budget): a retry would fail identically and just burn the budget. Only a
+                // transient (network / empty) failure earns the single retry.
+                if (isNonRetryableError(err)) {
+                    addDebugLog('info', `LLM call not retried (${isAbortError(err) ? 'aborted/cancelled' : 'deterministic 4xx/quota'}) [${agent}]: ${err.message || err}`, {
+                        subsystem: 'pipeline', event: 'llm.no_retry', reason: isAbortError(err) ? 'ABORTED' : 'DETERMINISTIC_4XX', data: { agent, error: String(err.message || err) },
+                    });
+                    break;
+                }
+                if (attempt === 1) {
+                    addDebugLog('info', `LLM call threw (${err.message || err}), retrying once...`);
+                }
             }
         }
+    } finally {
+        clearTimeout(budgetTimer);
+        _activeControllers.delete(callCtrl);
     }
-    // Both attempts failed — return empty string. Callers (agent-draft, agent-memory)
-    // already handle empty defensively and surface an error.
+
+    // All permitted attempts failed / budget spent — return empty string. Callers
+    // (agent-draft, agent-memory, finder) handle empty defensively and surface an error.
     if (lastError) {
-        addDebugLog('fail', `LLM call failed on both attempts: ${lastError.message || lastError}`);
+        addDebugLog('fail', `LLM call failed: ${lastError.message || lastError}`);
     } else {
-        addDebugLog('fail', 'LLM returned empty response on both attempts');
+        addDebugLog('fail', 'LLM returned empty response / budget exhausted');
     }
     return '';
 }
 
-async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'unknown') {
+async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'unknown', signal) {
     // ── Prompt-caching note (Claude / OpenRouter / Electron Hub etc.) ─────────────
     // We CANNOT attach `cache_control: {type:'ephemeral'}` markers from an extension.
     // SillyTavern's chat-completions backend rebuilds every message into a fresh
@@ -194,29 +318,45 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
         { role: 'user', content: userPrompt },
     ];
 
+    // Each leg below stops short the instant the call-level signal aborts (wall-clock budget
+    // spent OR user cancel), and a deterministic 4xx from the proxy is RE-THROWN so the outer
+    // loop short-circuits the retry. A timeout/abort on one leg still falls through to the next
+    // transport — but only while the shared budget permits (the signal gates re-entry).
+
+    const aborted = () => signal?.aborted;
+    if (aborted()) throw new DOMException('Aborted before dispatch', 'AbortError');
+
     // Priority 1: Use CMRS with the specified profile (safe, no profile switching)
     if (profileId) {
         try {
-            const result = await withTimeout(callViaCMRS(profileId, messages), LLM_TIMEOUT_MS);
+            const result = await withTimeout((sig) => callViaCMRS(profileId, messages, sig), LLM_TIMEOUT_MS, signal);
             return result;
         } catch (cmrsErr) {
+            if (isAbortError(cmrsErr)) throw cmrsErr; // budget/cancel — stop the whole call
             addDebugLog('info', `CMRS failed (${cmrsErr.message}), falling back to direct proxy`);
         }
     }
+    if (aborted()) throw new DOMException('Aborted after CMRS', 'AbortError');
 
     // Priority 2: Direct ST proxy fetch (reads current DOM config)
     try {
-        const result = await withTimeout(callSTProxy(messages), LLM_TIMEOUT_MS);
+        const result = await withTimeout((sig) => callSTProxy(messages, sig), LLM_TIMEOUT_MS, signal);
         return result;
     } catch (proxyErr) {
+        if (isAbortError(proxyErr)) throw proxyErr;
+        // A deterministic 4xx (Bad Request / quota) will fail identically on the quiet fallback
+        // AND on a retry — re-throw so callAgentLLM short-circuits instead of burning the budget.
+        if (isNonRetryableError(proxyErr)) throw proxyErr;
         addDebugLog('info', `ST proxy failed (${proxyErr.message}), falling back to generateQuietPrompt`);
     }
+    if (aborted()) throw new DOMException('Aborted after proxy', 'AbortError');
 
     // Priority 3: generateQuietPrompt (includes chat context, but better than nothing)
     const fallbackPrompt = `${systemPrompt}\n\n${userPrompt}`;
     const result = await withTimeout(
-        host.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
+        () => host.generateQuietPrompt({ quietPrompt: fallbackPrompt, skipWIAN: true }),
         LLM_TIMEOUT_MS,
+        signal,
     );
     return typeof result === 'string' ? result : String(result || '');
 }
@@ -228,7 +368,7 @@ async function callAgentLLMOnce(systemPrompt, userPrompt, profileId, agent = 'un
  * @param {Array} messages
  * @returns {Promise<string>}
  */
-async function callSTProxy(messages) {
+async function callSTProxy(messages, signal) {
     const headers = host.getRequestHeaders();
     if (!headers) {
         throw new Error('Cannot get ST request headers');
@@ -247,10 +387,13 @@ async function callSTProxy(messages) {
 
     addDebugLog('info', `Direct LLM call: source=${config?.source || '?'} model=${(config?.model || '?').substring(0, 40)}`);
 
+    // Pass the leg's AbortSignal so a timeout/cancel TRULY aborts this fetch (the request
+    // stops, stops billing) instead of lingering in the background as the old withTimeout did.
     const response = await fetch('/api/backends/chat-completions/generate', {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
+        signal,
     });
 
     if (!response.ok) {

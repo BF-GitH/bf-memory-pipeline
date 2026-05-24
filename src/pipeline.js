@@ -8,7 +8,8 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPic
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow, markFactsUsed, applyBufferedFactUsage } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow, markFactsUsed, applyBufferedFactUsage } from './database.js';
+import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid } from './settings.js';
@@ -27,7 +28,15 @@ let lastInjection = null; // cached injection text for the FIRST generation (sce
 // the stale draft (facts are safe to reuse; the draft is not). Kept fast: no agent re-run.
 let lastInjectionNoDraft = null;
 let pipelineJustInjected = false; // guards against double-fire of CHAT_COMPLETION_PROMPT_READY
-let pipelineCancelled = false; // set true when user clicks Stop; checked before DB writes
+let pipelineCancelled = false; // set true when user clicks Stop / disables mid-run; checked before DB writes
+// FINDER BUDGET (latency fix). The Stage-2 finder (Agent 4) is the slowest, least-bounded agent
+// and used to be awaited UNCONDITIONALLY on the reply-blocking path (a 64s finder = a 64s stall).
+// We now RACE it against this tight budget: if it doesn't finish in time we use the ALREADY-
+// COMPUTED deterministic retrieval for THIS turn and proceed. The finder result, if it ever
+// arrives, is dropped for this turn (and an in-flight LLM call is left to the wall-clock budget /
+// cancel hook to bound). So a slow/failing model degrades to "use the deterministic facts this
+// turn" — never a 75s stall — while a fast model still gets the finder's refined pick.
+const FINDER_BUDGET_MS = 6000; // 6s max the reply may wait on the finder before falling back
 let groupSkipToastShown = false; // show-once toast when skipping group chats
 let runRecordedInput = false; // true once setRunTokens fired this generation cycle; gates main-output attribution so swipes don't desync the counters
 // Reflection / consolidation: count successful pipeline runs (Agent 3 committed facts).
@@ -361,6 +370,28 @@ function showWorkingIndicator() {
 function hideWorkingIndicator() {
     const indicator = document.getElementById('bf_mem_working_indicator');
     if (indicator) indicator.style.display = 'none';
+}
+
+/**
+ * Cancel the in-flight pipeline run PROMPTLY (cancel fix). Sets pipelineCancelled (so the
+ * pre-injection gate bails) AND aborts any in-flight agent LLM call via the llm-call cancel
+ * hook, so a disabled/stopped run halts in moments instead of finishing ~75s later. Wired to:
+ *   - the `enabled` toggle handler when toggled OFF (settings.js), and
+ *   - the GENERATION_STOPPED event (Stop button).
+ * Idempotent and safe to call when nothing is running.
+ * @param {string} [reason='cancel'] - short reason tag for the debug log (e.g. 'disabled', 'stopped')
+ */
+export function cancelActiveRun(reason = 'cancel') {
+    pipelineCancelled = true;
+    pipelineJustInjected = false;
+    runRecordedInput = false;
+    // Truly abort in-flight agent calls — not just refuse to commit their results.
+    try { cancelInFlightLLM(reason); } catch { /* best-effort */ }
+    hideWorkingIndicator();
+    updateStatus('idle');
+    addDebugLog('info', `Active pipeline run cancelled (${reason}) — in-flight LLM calls aborted`, {
+        subsystem: 'pipeline', event: 'pipeline.cancel', reason: reason.toUpperCase(),
+    });
 }
 
 // --- Determine if this generation should trigger the pipeline ---
@@ -768,12 +799,20 @@ async function runPipelineInline(data) {
         // One bounded hop, deduped by id; newly pulled facts enter as secondary candidates.
         const branchSeen = new Set(candidatesAll.map(({ fact, category }) => `${category}:${fact.key}`));
         expandLinks(databases, candidatesAll, branchSeen);
-        const candidates = candidatesAll.filter(({ fact }) => isFactVisible(fact));
-        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion)`);
+        const candidatesVisible = candidatesAll.filter(({ fact }) => isFactVisible(fact));
+        // CANDIDATE INPUT CAP (latency fix): exclude cold facts and cap to top-N by salience so
+        // the finder prompt stays bounded as the store grows. (Output was always capped at 24.)
+        const { candidates } = capFinderCandidates(candidatesVisible);
+        addDebugLog('info', `STAGE 2: ${candidates.length} candidate fact(s) (from ${candidatesVisible.length} visible) from ${draftResult.branches.length} branch pick(s) + Unsorted${draftResult.focus.length ? ` (focus: ${draftResult.focus.join(', ')})` : ''} (incl. link expansion, cold-excluded + capped)`);
         const finderProfileId = getAgent4ProfileId(settings);
         const finderStart = Date.now();
+        // OFF THE BLOCKING PATH: race the finder against FINDER_BUDGET_MS. The deterministic
+        // retrieval (already-computable, no LLM) is the instant fallback the reply uses if the
+        // finder doesn't beat the budget. The finder Promise is NOT awaited beyond the budget —
+        // a slow/failing model can never stall the reply past FINDER_BUDGET_MS. An in-flight
+        // finder LLM call is bounded by llm-call's own wall-clock budget / cancel hook.
         try {
-            const finder = await runFinderAgent({
+            const finderP = runFinderAgent({
                 candidates,
                 draft: draftResult.draft,
                 recentChat: formattedChat,
@@ -781,23 +820,39 @@ async function runPipelineInline(data) {
                 userPersona,
                 profileId: finderProfileId,
             });
-            // Use finder results when it succeeded AND chose something. Empty/error => fall back.
-            if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
-                const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
-                retrieval = {
-                    facts,
-                    formatted: finder.formatted || formatChosenFacts(finder.facts),
-                    stats: { primary: facts.length, secondary: 0, tertiary: 0 },
-                };
-                addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
-                    subsystem: 'finder', event: 'finder.run',
-                    data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length },
+            const BUDGET = Symbol('finder-budget');
+            let budgetTimer;
+            const budgetP = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve(BUDGET), FINDER_BUDGET_MS); });
+            const raced = await Promise.race([finderP, budgetP]).finally(() => clearTimeout(budgetTimer));
+
+            if (raced === BUDGET) {
+                // Budget exceeded → use the deterministic facts THIS turn; drop the finder result.
+                addDebugLog('info', `STAGE 2 finder exceeded ${FINDER_BUDGET_MS / 1000}s budget — using deterministic retrieval for this turn`, {
+                    subsystem: 'finder', event: 'finder.budget', reason: 'BUDGET_EXCEEDED',
+                    data: { agent: 'finder', profileId: finderProfileId || null, budgetMs: FINDER_BUDGET_MS, candidateCount: candidates.length, fallback: 'deterministic' },
                 });
+                // Avoid an unhandled rejection on the dropped finder promise (e.g. it later aborts).
+                finderP.catch(() => {});
             } else {
-                addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
-                    subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
-                    data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
-                });
+                const finder = raced;
+                // Use finder results when it succeeded AND chose something. Empty/error => fall back.
+                if (finder && !finder.error && Array.isArray(finder.facts) && finder.facts.length > 0) {
+                    const facts = finder.facts.map(({ fact, category }) => ({ fact, category, tier: 'primary' }));
+                    retrieval = {
+                        facts,
+                        formatted: finder.formatted || formatChosenFacts(finder.facts),
+                        stats: { primary: facts.length, secondary: 0, tertiary: 0 },
+                    };
+                    addDebugLog('info', `STAGE 2 finder chose ${facts.length} fact(s) for injection`, {
+                        subsystem: 'finder', event: 'finder.run',
+                        data: { agent: 'finder', profileId: finderProfileId || null, success: true, durationMs: Date.now() - finderStart, candidateCount: candidates.length, chosenCount: facts.length },
+                    });
+                } else {
+                    addDebugLog('info', `STAGE 2 finder ${finder?.error ? `errored (${finder.error})` : 'returned nothing'} — falling back to deterministic retrieval`, {
+                        subsystem: 'finder', event: 'finder.run', reason: finder?.error ? 'FINDER_ERROR' : 'FINDER_EMPTY',
+                        data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finder?.error || null, fallback: 'deterministic' },
+                    });
+                }
             }
         } catch (finderErr) {
             addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`, {
@@ -828,8 +883,17 @@ async function runPipelineInline(data) {
     let baselineInput = 0;
     try { baselineInput = await countChatTokens(baselineArr); } catch { baselineInput = 0; }
 
-    if (pipelineCancelled) {
-        addDebugLog('info', 'Pipeline cancelled — skipping injection');
+    // CANCEL / DISABLE GATE (checked right BEFORE injecting). Bail if the run was cancelled
+    // (Stop button → GENERATION_STOPPED, or a mid-run disable via cancelActiveRun set
+    // pipelineCancelled) OR if the user toggled the extension OFF mid-run (re-read live settings
+    // — the toggle only flips the boolean, so a disable that didn't route through cancelActiveRun
+    // is still honored here). Either way we skip injection so a disabled/stopped run can't inject.
+    const liveSettings = getSettings();
+    const disabledMidRun = !liveSettings || !liveSettings.enabled;
+    if (pipelineCancelled || disabledMidRun) {
+        addDebugLog('info', `Pipeline ${pipelineCancelled ? 'cancelled' : 'disabled mid-run'} — skipping injection`, {
+            subsystem: 'pipeline', event: 'pipeline.cancel', reason: pipelineCancelled ? 'CANCELLED' : 'DISABLED_MIDRUN', data: { runId },
+        });
         // Still record the agent token cost (input == baseline since we didn't inject)
         // so the Tokens tab stays in sync and the per-cycle main-output gate is armed.
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
@@ -1430,17 +1494,12 @@ export function initPipeline() {
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
-    // Set pipelineCancelled so in-flight Agent 3 writes are discarded — we
-    // can't abort the CMRS calls themselves (no AbortSignal exposed by ST),
-    // but we can refuse to commit their results.
+    // cancelActiveRun sets pipelineCancelled (so in-flight writes are discarded) AND now
+    // truly ABORTS the in-flight agent LLM calls via the llm-call cancel hook (AbortController),
+    // so a Stop halts the run promptly instead of letting the cascade run to its timeout.
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
-        pipelineCancelled = true;
-        pipelineJustInjected = false;
-        // Disarm output attribution: no main reply will land for this stopped cycle.
-        runRecordedInput = false;
-        hideWorkingIndicator();
-        updateStatus('idle');
-        addDebugLog('info', 'Generation stopped — in-flight agent writes will be discarded');
+        cancelActiveRun('stopped');
+        addDebugLog('info', 'Generation stopped — in-flight agent calls aborted, writes discarded', { subsystem: 'pipeline', event: 'pipeline.cancel', reason: 'STOPPED' });
     });
 
     // Recompute lastTriggeredUserMsgIndex when messages are deleted (e.g. /cut).
