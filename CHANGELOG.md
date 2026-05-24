@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.26.0] - 2026-05-24
+
+### Fixed — "delete doesn't stick" + 75-second hangs + a real management UI
+A 3-agent diagnosis (detailed / contrarian / edge-case) traced three serious problems to their root causes. All fixed.
+
+**Deleting facts now actually sticks (data-integrity).** Facts lived in THREE places — the IndexedDB working store, the attachment snapshot, AND a full copy inside the DB *profile* (`dbProfiles`). "Clear All" / category-delete wiped the first two but never the profile, so on the next chat-switch the profile re-poured every fact back (and an empty-store guard made a cleared DB literally unable to persist). Now every user delete/clear prunes all three layers, cancels any pending snapshot, and deletes emptied attachment files — a clear stays cleared across chat-switch and reload. (No baked-in/seed facts exist; those were always your own.) ([src/database.js](src/database.js), [src/settings.js](src/settings.js))
+
+**Bounded latency — no more 75-second stalls.** The Librarian (finder) ran on the reply-critical path and a failing API could retry a 60s timeout across three transports (~6 minutes worst case) without ever aborting the stuck request. Now: real `AbortController` cancellation, a 28s per-leg / **45s total** wall-clock budget per agent, no retry on deterministic 4xx errors, and the finder is raced against a **6-second budget** — if it's slow the reply falls back to the instant deterministic retrieval for that turn. The finder's candidate set is also capped (hot-only, top-N by salience) so it can't grow unbounded as the store grows. ([src/llm-call.js](src/llm-call.js), [src/pipeline.js](src/pipeline.js), [src/database.js](src/database.js))
+
+**Disable / Stop now actually stops.** Toggling the extension off (or hitting Stop) mid-run cancels the active run and aborts any in-flight LLM call, and injection is skipped — instead of finishing ~75s later. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+
+### Added — memory-management UI (parity with other memory extensions)
+The Database tab's fact viewer is no longer read-only:
+- **Per-fact edit & delete**, **search/filter** within a category and **across all categories**, **bulk select + delete** — all persisting across all three storage layers (no resurrection).
+- **Real unlink** — unlinking a chat now sticks (it won't silently auto-relink); plus a one-click "unlink current chat".
+- **Cold-tier badges** so you can see (and manually remove) deprioritized facts.
+- **Import** a DB from JSON (replace or merge); large categories render capped + paginated so the UI doesn't freeze.
+([src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
 ## [0.25.0] - 2026-05-24
 
 ### Added — housekeeping + taxonomy growth (350 → ~1000 labels, and a growth engine)
