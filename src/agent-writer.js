@@ -58,6 +58,78 @@ export function buildSceneBlock(scene, maxTokens = 150) {
 }
 
 /**
+ * Build the optional "Big Picture" overview block (top of the summary pyramid + the relevant
+ * shelf summaries) — the cheap zoom-out the Writer anchors on before reading individual facts.
+ * DEFAULT-OFF feature: only called when `enableSummaryPyramid` is on (gated by the caller).
+ *
+ * RELEVANCE: rather than dump ALL shelf summaries (which would defeat the purpose on a huge
+ * store), we include only the shelves whose (category, aspect) bucket touches the CURRENT
+ * scene focus — derived from the scene's location/present/goals/beats text. The whole-story
+ * summary is always included (it's the single cheapest big-picture line). Hard token-capped via
+ * the same char-budget truncation style as buildSceneBlock so it can never balloon the prompt.
+ *
+ * @param {{story?:string, shelves?:Object<string,{text:string}>}|null} pyramid - stored pyramid
+ * @param {object|null} scene - current scene card ({ location, present[], goals[], beats[] })
+ * @param {number} [maxTokens=250] - approximate hard cap (1 token ≈ 4 chars heuristic)
+ * @returns {{block:string, shelvesIncluded:string[]}} block text ('' when nothing usable) + which shelf keys were included
+ */
+export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
+    if (!pyramid || typeof pyramid !== 'object') return { block: '', shelvesIncluded: [] };
+    const story = typeof pyramid.story === 'string' ? pyramid.story.trim() : '';
+    const shelves = (pyramid.shelves && typeof pyramid.shelves === 'object') ? pyramid.shelves : {};
+
+    // Build a lowercased relevance haystack from the current scene focus.
+    const sceneTokens = new Set();
+    if (scene && typeof scene === 'object') {
+        const collect = (v) => {
+            if (typeof v === 'string') {
+                for (const tok of v.toLowerCase().split(/[^a-z0-9]+/)) { if (tok.length >= 3) sceneTokens.add(tok); }
+            } else if (Array.isArray(v)) { for (const x of v) collect(x); }
+        };
+        collect(scene.location); collect(scene.present); collect(scene.goals); collect(scene.beats);
+    }
+
+    // Pick relevant shelves: a shelf is relevant if its aspect token OR its summary text
+    // overlaps the scene tokens. When there is NO scene focus at all, include none (the
+    // story line alone is the overview) to keep the block small.
+    const picked = [];
+    for (const [bucketKey, entry] of Object.entries(shelves)) {
+        const text = (entry && typeof entry.text === 'string') ? entry.text.trim() : '';
+        if (!text) continue;
+        const aspect = bucketKey.includes('||') ? bucketKey.split('||')[1] : bucketKey;
+        let relevant = false;
+        if (sceneTokens.size) {
+            if (sceneTokens.has(aspect)) relevant = true;
+            if (!relevant) {
+                for (const tok of text.toLowerCase().split(/[^a-z0-9]+/)) {
+                    if (tok.length >= 4 && sceneTokens.has(tok)) { relevant = true; break; }
+                }
+            }
+        }
+        if (relevant) picked.push({ bucketKey, aspect, text });
+    }
+
+    if (!story && picked.length === 0) return { block: '', shelvesIncluded: [] };
+
+    const lines = ['[Big Picture]'];
+    if (story) lines.push(`Story so far: ${story}`);
+    for (const p of picked) {
+        // Pretty Category/aspect label from the bucketKey.
+        const [cat, asp] = p.bucketKey.includes('||') ? p.bucketKey.split('||') : ['', p.bucketKey];
+        const label = cat ? `${cat.charAt(0).toUpperCase()}${cat.slice(1)}/${asp}` : asp;
+        lines.push(`- ${label}: ${p.text}`);
+    }
+    let block = lines.join('\n');
+
+    // Hard cap (same heuristic + truncation style as buildSceneBlock): clip mid-string.
+    const charBudget = Math.max(80, Math.floor((Number(maxTokens) || 250) * 4));
+    if (block.length > charBudget) {
+        block = block.slice(0, charBudget - 1).trimEnd() + '…';
+    }
+    return { block, shelvesIncluded: picked.map(p => p.bucketKey) };
+}
+
+/**
  * Build the fact injection block that gets inserted into the prompt
  * This doesn't call an LLM - it prepares context for the main generation
  * @param {string} draft - Draft from Agent 1

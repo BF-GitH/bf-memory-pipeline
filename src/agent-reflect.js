@@ -24,8 +24,8 @@
 // how large the DB has grown. A failure degrades gracefully — it never breaks the
 // pipeline (mirrors the existing agent fallbacks).
 
-import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, normalizeAspect, L1_CATEGORIES } from './database.js';
-import { addDebugLog, setReflection } from './settings.js';
+import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
+import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
 // Bound the fact summary fed into the reflection prompt so a huge DB can't blow up cost.
@@ -43,10 +43,24 @@ const MAX_REEVAL_CANDIDATES = 15;
 // A current-state fact is "stale" (a re-eval candidate) once it hasn't been touched for
 // this long — it may be a one-off the extractor recorded that never recurred.
 const REEVAL_STALE_STATE_MS = 24 * 60 * 60 * 1000; // 24h of wall-clock since last update
+// SUMMARY PYRAMID (middle layer) — hard cap on how many (category, aspect) shelves we ask
+// the model to (re)summarize per reflection pass. This is the cost guard: a huge store with
+// hundreds of buckets can't explode the call — only the MOST-CHANGED handful are refreshed
+// each pass, and unchanged buckets are NEVER touched (their stored summary is carried forward).
+const MAX_SHELVES_PER_PASS = 6;
+// Cap a single shelf summary (chars) defensively, regardless of the model's compliance.
+const MAX_SHELF_SUMMARY_CHARS = 220;
+// Bound the example facts shown per shelf in the prompt (newest-first) so the #SHELVES request
+// stays cheap even for a populous bucket.
+const MAX_SHELF_SAMPLE_FACTS = 8;
 
-export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss.
+export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
 
 Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
+
+Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences (the top of a zoom-out pyramid — the cheapest big-picture recap). Keep it tight and factual.
+
+If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (<= ~25 words) capturing the gist of that bucket so it can stand in for the raw facts. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
 
 You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
@@ -56,6 +70,13 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 
 # OUTPUT FORMAT (exactly this, nothing else)
 
+#STORY
+<2-4 sentence whole-story recap, or "." if there is nothing yet>
+.
+#SHELVES
++ <Category>/<aspect> = <short bucket summary>
++ <Category>/<aspect> = <short bucket summary>
+.
 #OBS
 + <subject>_<short_pattern_key> = <atomic pattern clause>
 + <subject>_<short_pattern_key> = <atomic pattern clause>
@@ -66,7 +87,7 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 + <id> = keep
 .
 
-If there are no observations, put a single "." under #OBS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Do not invent facts not supported by the material.`;
+If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
 
 /**
  * Build the compact, bounded input bundle for the reflection pass.
@@ -108,7 +129,50 @@ function collectReevalCandidates(databases) {
     return out.slice(0, MAX_REEVAL_CANDIDATES);
 }
 
-function buildReflectInput({ scene, databases, reevalCandidates = [] }) {
+/**
+ * SUMMARY PYRAMID — pick which (category, aspect) shelves to (re)summarize THIS pass.
+ * COST GUARD: only buckets that MATERIALLY CHANGED since their last stored summary are
+ * candidates — a bucket changed if it has no stored shelf entry yet, or its current active
+ * fact count differs from what the stored summary was built against. Unchanged buckets are
+ * NEVER touched (their summary is carried forward verbatim). Candidates are sorted by the
+ * SIZE of the change (largest delta first — those gain the most from a refresh) and capped to
+ * MAX_SHELVES_PER_PASS, so a huge store with hundreds of buckets can't explode the call.
+ *
+ * @param {{aspectCounts: Map, byCatAspect: Map}} index - prebuilt memory index (active facts)
+ * @param {{shelves?: Object<string,{factCount:number}>}|null} priorPyramid - last stored pyramid
+ * @returns {Array<{bucketKey:string, category:string, aspect:string, factCount:number, prevCount:number, samples:string[]}>}
+ */
+function pickChangedShelves(index, priorPyramid) {
+    const priorShelves = (priorPyramid && priorPyramid.shelves) || {};
+    const candidates = [];
+    // aspectCounts: Map(category -> Map(aspect -> active HOT count)). We summarize per bucket.
+    for (const [category, aspectMap] of (index.aspectCounts || new Map())) {
+        for (const [aspect, count] of aspectMap) {
+            if (!count) continue; // empty bucket — nothing to summarize
+            const catLower = String(category).toLowerCase();
+            const bucketKey = `${catLower}||${aspect}`;
+            const prev = priorShelves[bucketKey];
+            const prevCount = prev ? (Number(prev.factCount) || 0) : 0;
+            // Materially changed iff no prior summary OR the active fact count moved.
+            if (prev && prevCount === count) continue; // unchanged — carry forward, never re-summarize
+            // Gather a few sample fact values (newest-first) to ground the summary.
+            const entries = (index.byCatAspect.get(bucketKey) || []);
+            const samples = entries
+                .map(e => e.fact)
+                .filter(f => f && f.value != null)
+                .sort((a, b) => (Number(b.lastUpdated) || 0) - (Number(a.lastUpdated) || 0))
+                .slice(0, MAX_SHELF_SAMPLE_FACTS)
+                .map(f => `${f.key} = ${String(f.value).slice(0, 120)}`);
+            candidates.push({ bucketKey, category, aspect, factCount: count, prevCount, samples });
+        }
+    }
+    // Biggest change first (abs delta; brand-new buckets weigh their full count) — refresh the
+    // shelves that drifted most, then cap.
+    candidates.sort((a, b) => Math.abs(b.factCount - b.prevCount) - Math.abs(a.factCount - a.prevCount));
+    return candidates.slice(0, MAX_SHELVES_PER_PASS);
+}
+
+function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [] }) {
     const parts = [];
 
     // FIX #12: the prior "story so far" summary is intentionally NOT prepended anymore — the
@@ -154,6 +218,17 @@ function buildReflectInput({ scene, databases, reevalCandidates = [] }) {
     }
     if (factSummary) parts.push(`## Stored facts (current)\n${factSummary}`);
 
+    // SUMMARY PYRAMID — shelves to (re)summarize this pass. Each entry lists the exact
+    // Category/aspect label the model must echo back, plus a few sample fact values for
+    // grounding. ONLY changed buckets reach here (cost-bounded by pickChangedShelves).
+    if (Array.isArray(changedShelves) && changedShelves.length) {
+        const shelfLines = changedShelves.map(s => {
+            const sample = s.samples && s.samples.length ? `\n    ${s.samples.join('\n    ')}` : '';
+            return `+ ${s.category}/${s.aspect} (${s.factCount} fact${s.factCount === 1 ? '' : 's'})${sample}`;
+        });
+        parts.push(`## Shelves to summarize (one short summary per shelf, echo the exact Category/aspect label)\n${shelfLines.join('\n')}`);
+    }
+
     // Re-evaluation candidates (uncertain Unsorted/misc + stale states). Each line is
     // `[id] Category/key = value (note)` so the model can return a verdict per id.
     if (Array.isArray(reevalCandidates) && reevalCandidates.length) {
@@ -167,7 +242,7 @@ function buildReflectInput({ scene, databases, reevalCandidates = [] }) {
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nNow output ONLY the #OBS and #REEVAL sections.');
+    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS and #REEVAL sections.');
     return parts.join('\n\n');
 }
 
@@ -178,18 +253,48 @@ function buildReflectInput({ scene, databases, reevalCandidates = [] }) {
  * @returns {{summary: string, observations: Array<{key:string,value:string}>}}
  */
 export function parseReflectResult(response) {
-    const out = { summary: '', observations: [], reevals: [] };
+    const out = { summary: '', shelves: [], observations: [], reevals: [] };
     if (!response || !response.trim()) return out;
 
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
 
-    // #STORY ... (bounded before #OBS).
-    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#OBS|$)/i);
+    // #STORY ... (bounded before #SHELVES/#OBS — whichever comes first).
+    const storyMatch = text.match(/#STORY\s*([\s\S]*?)(?=\n\s*#SHELVES|\n\s*#OBS|$)/i);
     if (storyMatch) {
         let s = storyMatch[1].trim();
+        // The grammar tells the model to terminate the section with a lone ".". Strip a
+        // trailing terminator line, then treat a bare "." / "(none)" as empty.
+        s = s.replace(/\n?\s*\.\s*$/, '').trim();
         if (s === '.' || /^\(none\)$/i.test(s)) s = '';
         if (s.length > MAX_SUMMARY_CHARS) s = s.slice(0, MAX_SUMMARY_CHARS).trimEnd() + '…';
         out.summary = s;
+    }
+
+    // #SHELVES lines: `+ Category/aspect = short summary`. Bounded before #OBS.
+    const shelvesMatch = text.match(/#SHELVES\s*([\s\S]*?)(?=\n\s*#OBS|\n\s*#REEVAL|$)/i);
+    if (shelvesMatch) {
+        const block = shelvesMatch[1].trim();
+        if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
+            for (const rawLine of block.split('\n')) {
+                let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
+                if (!line || line === '.' || !line.startsWith('+')) continue;
+                line = line.slice(1).trim();
+                const eqIdx = line.indexOf('=');
+                if (eqIdx < 0) continue;
+                let label = line.slice(0, eqIdx).trim();
+                // Strip an optional trailing "(N facts)" the model may echo from the prompt.
+                label = label.replace(/\s*\([^)]*\)\s*$/, '').trim();
+                const slashIdx = label.indexOf('/');
+                if (slashIdx < 0) continue; // need Category/aspect
+                const category = label.slice(0, slashIdx).trim();
+                const aspect = label.slice(slashIdx + 1).trim().toLowerCase();
+                let value = line.slice(eqIdx + 1).trim();
+                if (!category || !aspect || !value) continue;
+                if (value.length > MAX_SHELF_SUMMARY_CHARS) value = value.slice(0, MAX_SHELF_SUMMARY_CHARS).trimEnd() + '…';
+                out.shelves.push({ category, aspect, text: value });
+                if (out.shelves.length >= MAX_SHELVES_PER_PASS) break;
+            }
+        }
     }
 
     // #OBS lines: `+ key = value`. Bounded BEFORE #REEVAL so it can't swallow it.
@@ -304,10 +409,25 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const reevalCandidates = collectReevalCandidates(databases);
         const reevalById = new Map(reevalCandidates.map(c => [c.id, c]));
 
+        // SUMMARY PYRAMID (middle layer): pick which (category, aspect) shelves changed since
+        // their last summary and fold a bounded #SHELVES request into THIS same LLM call (no
+        // extra call). Index is built from the post-dedupe databases. Cost-guarded: only
+        // changed buckets, capped at MAX_SHELVES_PER_PASS — unchanged buckets are never touched.
+        const priorPyramid = (() => { try { return getSummaryPyramid(); } catch { return null; } })();
+        let index = null;
+        try { index = buildMemoryIndex(databases); } catch { index = null; }
+        const changedShelves = index ? pickChangedShelves(index, priorPyramid) : [];
+        if (changedShelves.length) {
+            addDebugLog('info', `[${runId}] Summary pyramid: ${changedShelves.length} changed shelf(s) queued for summary (cap ${MAX_SHELVES_PER_PASS}): ${changedShelves.map(s => `${s.category}/${s.aspect}`).join(', ')}`, {
+                subsystem: 'reflection', event: 'summary.shelves',
+                data: { queued: changedShelves.length, cap: MAX_SHELVES_PER_PASS, buckets: changedShelves.map(s => s.bucketKey) },
+            });
+        }
+
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates }));
+        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
@@ -326,6 +446,40 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         // accepts an observations-only reflection (returns null only when BOTH are empty).
         if (parsed.summary || parsed.observations.length > 0) {
             setReflection({ summary: parsed.summary, observations: parsed.observations.map(o => o.value) }, runId);
+        }
+
+        // SUMMARY PYRAMID — merge this pass's refreshed shelf summaries into the stored pyramid
+        // and refresh the TOP (story) level from the SAME reflection #STORY (NOT duplicated — we
+        // reuse parsed.summary, the top of the pyramid). Unchanged shelves are carried forward
+        // verbatim from priorPyramid (never re-summarized). Each refreshed shelf records the
+        // factCount it was summarized against so the NEXT pass's changed-bucket detection works.
+        // Stored in chat_metadata (out of keyword retrieval — no pollution). NEVER deletes facts.
+        try {
+            const changedByKey = new Map(changedShelves.map(s => [`${s.category.toLowerCase()}||${s.aspect}`, s]));
+            const mergedShelves = { ...((priorPyramid && priorPyramid.shelves) || {}) };
+            let refreshed = 0;
+            for (const sh of (parsed.shelves || [])) {
+                const bucketKey = `${String(sh.category).toLowerCase()}||${String(sh.aspect).toLowerCase()}`;
+                // Pair the model's summary with the live factCount we computed for that bucket.
+                const queued = changedByKey.get(bucketKey);
+                if (!queued) continue; // model returned a shelf we didn't ask for — ignore (anti-drift)
+                mergedShelves[bucketKey] = { text: sh.text, factCount: queued.factCount, updatedAt: Date.now() };
+                refreshed++;
+            }
+            const storyForPyramid = parsed.summary || (priorPyramid && priorPyramid.story) || '';
+            if (storyForPyramid || Object.keys(mergedShelves).length > 0) {
+                setSummaryPyramid({ story: storyForPyramid, shelves: mergedShelves }, runId);
+            }
+            if (refreshed > 0) {
+                addDebugLog('info', `[${runId}] Summary pyramid: refreshed ${refreshed} shelf summary(ies); ${Object.keys(mergedShelves).length} shelf(s) stored total`, {
+                    subsystem: 'reflection', event: 'summary.shelves',
+                    data: { refreshed, totalStored: Object.keys(mergedShelves).length, buckets: parsed.shelves.map(s => `${s.category}/${s.aspect}`) },
+                });
+            }
+        } catch (err) {
+            addDebugLog('fail', `[${runId}] Summary pyramid update failed (non-fatal): ${err.message || err}`, {
+                subsystem: 'reflection', event: 'summary.shelves', reason: 'ERROR',
+            });
         }
 
         // Write observations as normal facts. reconcile-on-write in upsertFact prevents

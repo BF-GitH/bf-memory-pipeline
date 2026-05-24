@@ -89,6 +89,12 @@ let sceneCard = null; // { location, present[], goals[], beats[], updatedAt, run
 // observations. Persisted per-chat in chat_metadata.bf_mem_reflection, reloaded on
 // CHAT_CHANGED. null = none yet (back-compatible: absent reflection = no injection).
 let reflection = null; // { summary, observations[], updatedAt, runId }
+// Summary pyramid — hierarchical zoom-out state. TOP level reuses the reflection #STORY
+// summary (NOT duplicated — copied in at generation time); MIDDLE level holds one SHORT
+// summary per populated (category, aspect) "shelf/bucket". Persisted per-chat in
+// chat_metadata.bf_mem_pyramid, reloaded on CHAT_CHANGED. null = none yet (back-compatible:
+// absent pyramid = no Big Picture injection). Derived/regenerable — never deletes facts.
+let summaryPyramid = null; // { story, shelves: { 'cat||aspect': { text, factCount, updatedAt } }, updatedAt, runId }
 
 const DEFAULT_SETTINGS = {
     enabled: false,
@@ -124,6 +130,18 @@ const DEFAULT_SETTINGS = {
     // only active on the main generation path (ST's tool loop never runs on the quiet/agent
     // paths). READ-ONLY: the tool never writes or deletes.
     enableWriterRecallTool: false,
+    // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
+    // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
+    // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.
+    // Default OFF so behavior is byte-identical to today (respects the earlier decision to NOT
+    // bloat every turn). Shelf summaries themselves are GENERATED regardless during the existing
+    // reflection pass (cost-bounded: only changed buckets, capped per pass) and stored in
+    // chat_metadata — this toggle only gates whether they're INJECTED. Absent (older settings)
+    // → default false (back-compatible).
+    enableSummaryPyramid: false,
+    // Hard cap on the injected Big Picture block, in approx tokens (reuses the buildSceneBlock
+    // char-budget truncation style). Bounds prompt growth even with a huge store.
+    summaryPyramidMaxTokens: 250,
     reviewInterval: 10,
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
@@ -267,6 +285,8 @@ function validateSettings(s) {
     if (!s.agent4Profile && s.finderProfile) s.agent4Profile = s.finderProfile;
     if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = true;
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
+    if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    s.summaryPyramidMaxTokens = Math.floor(clamp(s.summaryPyramidMaxTokens, 50, 1000, 250));
     if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
     if (typeof s.memoryPrompt !== 'string')      s.memoryPrompt = '';
@@ -1199,6 +1219,86 @@ function renderReflection() {
             '</div>';
     }
     el.innerHTML = html || '<div class="bf-mem-summary-empty">No reflection yet.</div>';
+}
+
+// --- Summary Pyramid (persistent — stored in chat_metadata.bf_mem_pyramid) ---
+// Hierarchical zoom-out: a SHORT summary per (category, aspect) "shelf/bucket" rolling up
+// into the whole-story summary (reused from reflection's #STORY). Mirrors the reflection
+// persistence pattern: per-chat, shape-checked reload, best-effort save. Read by the writer
+// injection builder (agent-writer.js) and written by the reflection pass (agent-reflect.js).
+
+const PYRAMID_META_KEY = 'bf_mem_pyramid';
+
+/** Coerce a stored value into the pyramid shape, or null if unusable. */
+function normalizePyramid(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const story = typeof raw.story === 'string' ? raw.story.trim() : '';
+    const shelves = {};
+    if (raw.shelves && typeof raw.shelves === 'object' && !Array.isArray(raw.shelves)) {
+        for (const [bucketKey, entry] of Object.entries(raw.shelves)) {
+            if (!bucketKey || !entry || typeof entry !== 'object') continue;
+            const text = typeof entry.text === 'string' ? entry.text.trim() : '';
+            if (!text) continue; // an empty shelf summary carries no value — drop it
+            shelves[String(bucketKey)] = {
+                text,
+                factCount: Number(entry.factCount) || 0,
+                updatedAt: Number(entry.updatedAt) || Date.now(),
+            };
+        }
+    }
+    if (!story && Object.keys(shelves).length === 0) return null;
+    return {
+        story,
+        shelves,
+        updatedAt: Number(raw.updatedAt) || Date.now(),
+        runId: typeof raw.runId === 'string' ? raw.runId : '',
+    };
+}
+
+function loadPyramidFromMeta() {
+    try {
+        const md = getContext().chatMetadata || getContext().chat_metadata;
+        if (!md) return null;
+        return normalizePyramid(md[PYRAMID_META_KEY]);
+    } catch { return null; }
+}
+
+function savePyramidToMeta() {
+    try {
+        const ctx = getContext();
+        const md = ctx.chatMetadata || ctx.chat_metadata;
+        if (!md) return;
+        md[PYRAMID_META_KEY] = summaryPyramid;
+        ctx.saveMetadata?.();
+    } catch { /* best-effort */ }
+}
+
+/**
+ * Current summary pyramid object (or null). Read by agent-writer.js (Big Picture injection)
+ * and agent-reflect.js (changed-bucket detection — compares stored shelf factCount/updatedAt
+ * against the live index).
+ * @returns {{story:string, shelves:Object<string,{text:string,factCount:number,updatedAt:number}>, updatedAt:number, runId:string}|null}
+ */
+export function getSummaryPyramid() {
+    return summaryPyramid;
+}
+
+/**
+ * Store a fresh summary pyramid (replaces the prior one — it's rolling derived state, not a
+ * log). Mirrors setReflection. Best-effort persist to chat_metadata.
+ * @param {{story?:string, shelves?:Object}} pyramid
+ * @param {string} runId
+ */
+export function setSummaryPyramid(pyramid, runId = '') {
+    const next = normalizePyramid({ ...(pyramid || {}), updatedAt: Date.now(), runId });
+    if (!next) return; // nothing meaningful to store
+    summaryPyramid = next;
+    savePyramidToMeta();
+}
+
+/** Re-load the pyramid from the current chat's metadata. Called on CHAT_CHANGED. */
+export function reloadPyramidFromChat() {
+    summaryPyramid = loadPyramidFromMeta();
 }
 
 // --- Character Registry (live list in the Agent 3 tab) ---
@@ -2303,6 +2403,17 @@ export async function initSettings() {
         import('./agent-writer.js').then(m => m.syncWriterRecallTool?.()).catch(() => {});
     });
 
+    // Summary pyramid "Big Picture" injection toggle. Default OFF. Gates ONLY whether the
+    // story+shelf summaries are injected into the Writer's context — shelf summaries are
+    // still generated on the reflection cadence regardless. No registration side-effect.
+    $('#bf_mem_pyramid_enabled').prop('checked', extensionSettings.enableSummaryPyramid === true).on('change', function () {
+        const before = extensionSettings.enableSummaryPyramid === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableSummaryPyramid = next;
+        addDebugLog('info', `Summary pyramid Big Picture injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableSummaryPyramid' }, before, after: !!next });
+        saveSettings();
+    });
+
     // Review interval slider
     $('#bf_mem_review_interval').val(extensionSettings.reviewInterval);
     $('#bf_mem_review_val').text(extensionSettings.reviewInterval);
@@ -2758,6 +2869,7 @@ export async function initSettings() {
         reloadTokensFromChat();
         reloadSceneFromChat();
         reloadReflectionFromChat();
+        reloadPyramidFromChat();
         reloadEntitiesUI();
     });
 
@@ -2767,6 +2879,7 @@ export async function initSettings() {
     reloadTokensFromChat();
     reloadSceneFromChat();
     reloadReflectionFromChat();
+    reloadPyramidFromChat();
     reloadEntitiesUI();
 
     // Save to active profile on page close/refresh

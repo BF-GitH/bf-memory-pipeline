@@ -200,6 +200,16 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-layer-group"></i> Big Picture (summary pyramid)</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_pyramid_enabled" />
+                            <span>Inject a Big Picture overview (story + relevant shelf summaries)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, prepends a compact, token-capped overview to the Writer's context: the rolling story summary plus the SHORT per-shelf (category/aspect) summaries relevant to the current scene — a cheap zoom-out instead of hundreds of raw facts. The Writer still drills into specifics via the <code>search_memory</code> tool. Shelf summaries are built periodically during the reflection pass (only for changed buckets), so leaving this on adds no extra generation cost — only a small bounded prompt block.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
                     <div class="bf-mem-section-body">
                         <small class="bf-mem-hint">For tracked sequences (e.g. a character's location over time) the current step is always included. These set the chance of reaching further back in history. The furthest successful roll sets how far back to include — and every step in between is always included (no gaps).</small>

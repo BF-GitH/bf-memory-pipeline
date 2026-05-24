@@ -4,14 +4,14 @@
 
 import { runDraftAgent } from './agent-draft.js';
 import { runFinderAgent, formatChosenFacts } from './agent-finder.js';
-import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './agent-writer.js';
+import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
 import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow, markFactsUsed, applyBufferedFactUsage } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
@@ -846,26 +846,50 @@ async function runPipelineInline(data) {
     // Always-on scene block: injected EVERY turn (above the facts) whenever enabled
     // and a scene exists — independent of whether any facts were retrieved.
     let sceneBlock = '';
+    const scene = getScene();
     if (settings.sceneCardEnabled) {
-        const scene = getScene();
         sceneBlock = buildSceneBlock(scene, settings.sceneCardMaxTokens || 150);
         if (sceneBlock) addDebugLog('info', `Scene block injected (${sceneBlock.length} chars): ${sceneBlock}`);
     }
 
-    // NOTE: the reflection "story so far" summary is intentionally NO LONGER injected into
-    // the writer (refinement #1). The writer now receives only the scene sheet + chosen
-    // facts + Agent 1's draft (+ the last messages it already sees). Reflection still runs
-    // (refinement #4) as a silent dedupe-janitor / observation writer, but never injects.
-    // reflectionInject is retained as an inert setting for back-compat (default now false).
+    // NOTE: the reflection "story so far" summary is NOT injected on its own (refinement #1).
+    // The ONLY way the story/shelf summaries reach the writer is the OPT-IN summary pyramid
+    // "Big Picture" block below — DEFAULT OFF. When off, the writer receives only the scene
+    // sheet + chosen facts + Agent 1's draft, byte-identical to before. reflectionInject stays
+    // inert for back-compat (default false).
 
-    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, sceneBlock);
+    // OPTIONAL "Big Picture" overview (summary pyramid). Default OFF (enableSummaryPyramid).
+    // When ON, prepend a compact, token-capped block = story summary + scene-relevant shelf
+    // summaries ABOVE the scene block (the cheapest zoom-out; the writer drills in via the
+    // search_memory recall tool). Combined into the same `sceneBlock` slot of buildWriterInjection
+    // (which already sits above the fact list). When OFF, sceneBlock is untouched.
+    let bigPictureBlock = '';
+    if (settings.enableSummaryPyramid === true) {
+        try {
+            const pyramid = getSummaryPyramid();
+            const bp = buildBigPictureBlock(pyramid, scene, settings.summaryPyramidMaxTokens || 250);
+            bigPictureBlock = bp.block || '';
+            if (bigPictureBlock) {
+                addDebugLog('debug', `[${runId}] Big Picture block injected (${bigPictureBlock.length} chars, ${bp.shelvesIncluded.length} shelf summaries)`, {
+                    subsystem: 'writer', event: 'summary.injected',
+                    data: { chars: bigPictureBlock.length, approxTokens: Math.ceil(bigPictureBlock.length / 4), shelves: bp.shelvesIncluded },
+                });
+            }
+        } catch (err) {
+            addDebugLog('fail', `[${runId}] Big Picture injection failed (non-fatal): ${err.message || err}`, { subsystem: 'writer', event: 'summary.injected', reason: 'ERROR' });
+        }
+    }
+    // Stack the Big Picture above the scene block (both live in the pre-facts slot).
+    const overviewBlock = [bigPictureBlock, sceneBlock].filter(Boolean).join('\n\n');
+
+    const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, overviewBlock);
     lastInjection = injection; // Used for THIS first generation only.
     // FIX #8a: cache a draft-less variant for swipes/regens. Same scene + facts (those are
     // turn-stable and safe to reuse), but pass an empty draft so the stale "what happens
     // next" direction can't mis-steer a divergent re-roll. buildWriterInjection renders an
     // empty draft as "(no direction)" inside the #Scene Direction slot — a neutral
     // placeholder that doesn't push the re-roll toward the original swipe's planned beat.
-    lastInjectionNoDraft = buildWriterInjection('', retrieval.formatted, sceneBlock);
+    lastInjectionNoDraft = buildWriterInjection('', retrieval.formatted, overviewBlock);
 
     // Optional: trim main-model chat history to last N messages — relies on facts to
     // replace older context. Default 0 = don't trim (main model sees full chat as usual).
