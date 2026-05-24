@@ -1713,6 +1713,163 @@ async function addUserCategory(rawName) {
     refreshDatabaseView();
 }
 
+/**
+ * AI "Suggest new labels" handler (Database tab button). MANUAL, on-demand: mines the fact DB
+ * for homeless facts, makes ONE LLM call (taxonomy-suggest.js, Scribe/Agent-3 profile), then
+ * shows the parsed proposals in a MANDATORY human-approval popup. Approved leaves are written
+ * through the SAME overlay path the manual "Add your own label" controls use (addUserLeaf /
+ * addUserCategory) so dedup/canonicalization/cache-invalidation/refresh are identical — re-running
+ * dedup here is correct (a proposal that collides with an existing/just-added leaf is absorbed as
+ * a synonym, not duplicated). NOTHING is added without explicit approval. Never throws into the UI.
+ * @returns {Promise<void>}
+ */
+async function onSuggestLabelsClick() {
+    const btn = document.getElementById('bf_mem_suggest_labels_btn');
+    if (btn && btn.dataset.busy === '1') return; // guard against double-click while the call is in flight
+    if (btn) { btn.dataset.busy = '1'; btn.disabled = true; }
+    try {
+        const { getAgent3ProfileId } = await import('./profiler.js');
+        const { runLabelSuggestion } = await import('./taxonomy-suggest.js');
+        const profileId = getAgent3ProfileId(extensionSettings);
+
+        toastr.info('Scanning facts and asking the model for label ideas…', 'BF Memory');
+        const result = await runLabelSuggestion({ profileId });
+
+        if (result.noCandidates) {
+            toastr.info('No homeless facts to analyze — everything already has a specific home.', 'BF Memory');
+            return;
+        }
+        if (result.error) {
+            toastr.error(`Suggest labels failed: ${result.error}`, 'BF Memory');
+            return;
+        }
+        if (result.proposals.length === 0 && result.synonyms.length === 0) {
+            toastr.info(`Analyzed ${result.candidateCount} fact(s); the model proposed no new labels.`, 'BF Memory');
+            return;
+        }
+        await showLabelSuggestionsPopup(result);
+    } catch (err) {
+        addDebugLog('fail', `Suggest labels handler failed (non-fatal): ${err.message || err}`);
+        toastr.error('Suggest labels failed. See the Debug tab for details.', 'BF Memory');
+    } finally {
+        if (btn) { btn.dataset.busy = '0'; btn.disabled = false; }
+    }
+}
+
+/**
+ * MANDATORY human-approval popup for AI-suggested labels. Reuses ST's Popup API (same
+ * Popup + POPUP_TYPE.TEXT + custom OK/Cancel pattern showEntityPopup uses). Each NEW-leaf
+ * proposal gets an Approve/Reject radio (default Reject — dismiss-safe); map-to-existing
+ * synonym suggestions are shown read-only (informational; v1 doesn't auto-refile). On Save,
+ * each Approved proposal is written via addUserCategory (new category) + addUserLeaf (leaf) —
+ * the same dedup+persist+invalidate+refresh the manual controls use. NOTHING is added unless
+ * the user explicitly Approves it and clicks Save.
+ *
+ * NOTE (v1): approved labels are ADDED to the taxonomy only — existing homeless facts are NOT
+ * auto-refiled onto the new leaf. The late-bound aspect resolver + future Scribe turns pick the
+ * new label up. (TODO: optional opt-in refile via a safe upsertFact of just the clustered facts.)
+ *
+ * @param {{proposals: Array, synonyms: Array, candidateCount: number}} result
+ * @returns {Promise<void>}
+ */
+async function showLabelSuggestionsPopup(result) {
+    const proposals = result.proposals || [];
+    const synonyms = result.synonyms || [];
+
+    const ok = await ensurePopup();
+    if (!ok || !Popup) {
+        toastr.error('Popup not available', 'BF Memory');
+        return;
+    }
+
+    const proposalRows = proposals.map((p, idx) => {
+        const grp = `bf_mem_suggest_choice_${idx}`;
+        const examples = (p.examples || []).length
+            ? `<div class="bf-mem-suggest-examples" style="font-size:0.85em;opacity:0.8;margin-top:2px;">e.g. ${p.examples.map(e => escapeHtml(e)).join('; ')}</div>`
+            : '';
+        const catBadge = p.newCategory ? ` <span class="bf-mem-action-badge" title="A brand-new top-level category">NEW CAT</span>` : '';
+        return `
+            <div class="bf-mem-suggest-row" data-idx="${idx}" style="display:flex;flex-direction:column;gap:4px;padding:8px 0;border-bottom:1px solid var(--SmartThemeBorderColor,#444);">
+                <div><b>${escapeHtml(p.category)}</b> ▸ ${escapeHtml(p.subArea || 'Custom')} ▸ <b>${escapeHtml(p.label)}</b>${catBadge}</div>
+                ${p.definition ? `<div style="font-size:0.9em;">${escapeHtml(p.definition)}</div>` : ''}
+                ${examples}
+                <div class="bf-mem-suggest-choices" style="display:flex;gap:14px;flex-wrap:wrap;">
+                    <label class="checkbox_label"><input type="radio" name="${grp}" value="approve" /> <span>Approve</span></label>
+                    <label class="checkbox_label"><input type="radio" name="${grp}" value="reject" checked /> <span>Reject</span></label>
+                </div>
+            </div>`;
+    }).join('');
+
+    const synonymRows = synonyms.length
+        ? `<div class="bf-mem-suggest-synonyms" style="margin-top:10px;">
+                <h4 style="margin:0 0 4px 0;">Already covered (the model suggests these clusters fit an existing leaf — informational, not added)</h4>
+                ${synonyms.map(s => `<div style="font-size:0.9em;padding:2px 0;">${escapeHtml(s.category)}/<b>${escapeHtml(s.leaf)}</b>${s.reason ? ` — ${escapeHtml(s.reason)}` : ''}</div>`).join('')}
+            </div>`
+        : '';
+
+    const html = `
+        <div class="bf-mem-suggest-popup" data-count="${proposals.length}">
+            <h3>AI label suggestions (${proposals.length})</h3>
+            <p>Reviewed ${result.candidateCount} homeless fact(s). Approve the labels you want added to your taxonomy. Approved labels are de-duplicated against the existing vocab before they're added. Nothing is added unless you Approve it and click Save.</p>
+            ${proposals.length ? `<div class="bf-mem-suggest-list" style="max-height:50vh;overflow-y:auto;">${proposalRows}</div>` : '<p><i>No new-label proposals.</i></p>'}
+            ${synonymRows}
+        </div>`;
+
+    let decisions = [];
+    try {
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', {
+            okButton: 'Save approved',
+            cancelButton: 'Cancel (add nothing)',
+            wide: true,
+            allowVerticalScrolling: true,
+        });
+        const popupResult = await popup.show();
+        const root = popup.dlg || popup.content || document;
+        const cancelled = !popupResult;
+        if (!cancelled) {
+            root.querySelectorAll?.('.bf-mem-suggest-row').forEach((row) => {
+                const idx = parseInt(row.getAttribute('data-idx'), 10);
+                const p = proposals[idx];
+                if (!p) return;
+                const sel = row.querySelector('input[type="radio"]:checked');
+                if (sel && sel.value === 'approve') decisions.push(p);
+            });
+        }
+    } catch (err) {
+        addDebugLog('fail', `Suggest labels popup failed (non-fatal): ${err.message || err}`);
+        return;
+    }
+
+    if (decisions.length === 0) {
+        addDebugLog('info', `Suggest labels: user approved 0 of ${proposals.length} proposal(s)`, {
+            subsystem: 'settings', event: 'taxonomy.suggest', reason: 'NONE_APPROVED', actor: 'USER',
+            data: { proposed: proposals.length },
+        });
+        toastr.info('No labels added.', 'BF Memory');
+        return;
+    }
+
+    // Apply approved proposals through the SAME overlay path the manual add controls use. A new
+    // category is added first (so its leaf can attach to it), then the leaf — both re-run their
+    // own dedup (a collision is absorbed as a synonym, never duplicated). They each persist,
+    // invalidate the taxonomy memo, and refresh the Database view, and emit label.added /
+    // label.merged logs, so no extra wiring is needed here.
+    for (const p of decisions) {
+        try {
+            if (p.newCategory) {
+                await addUserCategory(p.category);
+            }
+            await addUserLeaf(p.category, p.label, p.subArea);
+        } catch (err) {
+            addDebugLog('fail', `Suggest labels: failed to add "${p.category}/${p.label}" (non-fatal): ${err.message || err}`);
+        }
+    }
+    addDebugLog('pass', `Suggest labels: user approved ${decisions.length} of ${proposals.length} proposal(s)`, {
+        subsystem: 'settings', event: 'taxonomy.suggest', reason: 'APPROVED', actor: 'USER',
+        data: { approved: decisions.length, proposed: proposals.length, labels: decisions.map(d => `${d.category}/${d.label}`) },
+    });
+}
+
 async function refreshDatabaseView() {
     const {
         getAllDatabases, withSkeleton, MENU_CATEGORY_ORDER, aspectVocabFor, deriveAspect,
@@ -2852,6 +3009,8 @@ export async function initSettings() {
     $('#bf_mem_addleaf_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addleaf_btn').trigger('click'); } });
     $('#bf_mem_addcat_btn').on('click', () => addUserCategory($('#bf_mem_addcat_name').val()));
     $('#bf_mem_addcat_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addcat_btn').trigger('click'); } });
+    // AI suggest-new-labels (manual, on-demand — mines homeless facts, one LLM call, approval gate).
+    $('#bf_mem_suggest_labels_btn').on('click', () => onSuggestLabelsClick());
     $('#bf_mem_export_db').on('click', async () => {
         const { getAllDatabases } = await import('./database.js');
         const databases = await getAllDatabases();

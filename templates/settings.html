@@ -527,6 +527,17 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                                     </button>
                                 </div>
                             </div>
+
+                            <!-- AI: scan homeless facts and propose new labels (manual, on-demand) -->
+                            <div class="bf-mem-field" style="margin-top:8px;">
+                                <label>Let AI suggest labels</label>
+                                <small class="bf-mem-hint">Scans facts that never found a specific home and proposes new labels for them. One LLM call (uses the Scribe profile); you approve each suggestion before anything is added. Manual only — no per-turn cost.</small>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:6px;">
+                                    <button id="bf_mem_suggest_labels_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-wand-magic-sparkles"></i> Suggest new labels (AI)
+                                    </button>
+                                </div>
+                            </div>
                         </details>
 
                         <div class="bf-mem-db-actions">
