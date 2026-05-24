@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.27.0] - 2026-05-24
+
+### Fixed — CRITICAL: memory could be silently overwritten on chat-switch / branch
+A 3-agent diagnosis found a data-loss bug: switching chats (especially opening a **branch**) could blank the working memory and then **rehydrate stale data over your fresh facts**.
+
+Root cause was a **version-stamp bug**: the durable backup file was stamped with the time its *upload finished* — and because saves are throttled (~15s), an *old* backup looked "newer" than current data, so on load the extension adopted the stale backup and overwrote newer facts. (The tell: the failing log showed an attachment-vs-IDB stamp gap of ~15.5s — exactly the save-throttle.) On top of that, opening a chat destructively wiped the working store before reloading from a per-chat profile (empty for a fresh branch), and an un-awaited snapshot on chat-switch could even delete backup files.
+
+Fixes ([src/database.js](src/database.js), [src/settings.js](src/settings.js), [src/pipeline.js](src/pipeline.js)):
+- **Version by data, not upload time** — snapshots compare the logical `updatedAt` baked into the data, so a clean flush yields equal stamps and never triggers a spurious rehydrate.
+- **Clobber guard** — a rehydrate may only add/replace-with-more; it will *never* shrink a populated live store. On any doubt, the live data is kept.
+- **Non-destructive chat load** — opening a chat no longer wipes existing memory when the profile is empty.
+- **Coordinated chat-switch** — the outgoing chat is flushed (identity pinned) before the new one loads, and a chat-switch can no longer delete durable backup files.
+- **Per-turn cache keyed by (character, chat)** so a same-character chat-switch can't serve a stale map.
+- **Branches inherit the parent chat's memory** by default (instead of resolving to an empty profile).
+- User-initiated delete/clear still fully wipes all layers (no regression).
+
+### Added — DB connection-lifecycle logging
+The Debug log now records the connection story explicitly: `chat.switch` (left→entered, branch flag), `db.connect` (which profile, link state, facts loaded, source), and an enriched `db.rehydrated` with before/after fact counts so a clobber is visible at a glance — plus the active profile/avatar on each run summary. ([src/settings.js](src/settings.js), [src/database.js](src/database.js), [src/pipeline.js](src/pipeline.js))
+
 ## [0.26.0] - 2026-05-24
 
 ### Fixed — "delete doesn't stick" + 75-second hangs + a real management UI
