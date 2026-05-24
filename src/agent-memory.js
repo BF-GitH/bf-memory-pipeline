@@ -12,6 +12,20 @@ function getSettingsSafe() {
     return host.getExtensionSettings();
 }
 
+// ── Scribe system-prompt prefix-stability (OBSERVABILITY ONLY) ────────────────
+// Mirrors the prefix-stability tracking llm-call.js logs as `cache.eligibility`, but kept
+// local here so we can hand `systemPromptStable` back to the pipeline's agent3 timing line
+// WITHOUT changing llm-call's shared return shape. This is a pure measurement: a giant
+// UNSTABLE Scribe system prompt (no server-side cache reuse) is a prime slowness suspect, so
+// surfacing the flag + size on the run summary makes that obvious. No behavior change.
+let _lastScribeSysHash;
+function _cheapHashScribeSys(str) {
+    let h = 5381;
+    const s = String(str || '');
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return h;
+}
+
 export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for ~5 facts on a normal turn, but go higher (up to ~12) when a message genuinely discloses that much. Missing a clearly-stated reveal is worse than one extra fact.
 
 # READ THE WHOLE MESSAGE — INCLUDING DIALOGUE
@@ -281,6 +295,13 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     }
 
     const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages, scopedFacts);
+    // Capture the Scribe system-prompt size + prefix-stability for the run-summary timing
+    // breakdown (slowness hunt). Measurement only — does NOT alter the prompt or the call.
+    const systemPromptChars = systemPrompt.length;
+    const systemPromptApproxTokens = Math.round(systemPromptChars / 4); // ~4 chars/token estimate
+    const sysHash = _cheapHashScribeSys(systemPrompt);
+    const systemPromptStable = _lastScribeSysHash !== undefined && _lastScribeSysHash === sysHash;
+    _lastScribeSysHash = sysHash;
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -302,11 +323,12 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
 
         // Backward-compatible: still expose .updates (the full proposed set, now
         // annotated). .applied is the new committed/changed subset for pipeline.js.
-        return { ...parsed, applied, tokensIn, tokensOut };
+        // systemPrompt{Chars,ApproxTokens,Stable}: observability for the run-summary timing.
+        return { ...parsed, applied, tokensIn, tokensOut, systemPromptChars, systemPromptApproxTokens, systemPromptStable };
     } catch (error) {
         addDebugLog('fail', `Agent 3 error: ${error.message || error}`);
         console.error('[BFMemory] Agent 3 (Memory) error:', error);
-        return { updates: [], summary: '', raw: '', error: error.message, tokensIn: 0, tokensOut: 0 };
+        return { updates: [], summary: '', raw: '', error: error.message, tokensIn: 0, tokensOut: 0, systemPromptChars, systemPromptApproxTokens, systemPromptStable };
     }
 }
 

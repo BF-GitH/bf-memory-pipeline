@@ -223,7 +223,7 @@ function recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult
  * @param {boolean} [a.cancelled]
  * @param {{NEW?:number,UPDATED?:number,SKIPPED?:number,EVICTED?:number}} [a.facts] count override
  */
-function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts }) {
+function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult, cancelled, facts, stages }) {
     try {
         const duration = Date.now() - startTime;
         const agent1Ok = !!(draftResult && !draftResult.error && draftResult.draft);
@@ -287,6 +287,18 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
                     },
                     facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
                     tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, mainOut, netIn },
+                    // PER-STAGE TIMING BREAKDOWN (observability only — slowness hunt). Whatever the
+                    // caller measured this run (blocking-path stages and/or post-reply agent3 etc).
+                    // Null/absent when a path didn't supply it. Keeps the legacy fields intact.
+                    stages: stages || null,
+                    // Agent-3 (Scribe) prompt cost, surfaced PROMINENTLY for the slowness hunt: a
+                    // giant UNSTABLE system prompt (no server-side cache reuse) is a prime suspect.
+                    // Read off memoryResult when Agent 3 ran on this summary path (post-reply).
+                    agent3Prompt: agent3Ran ? {
+                        systemPromptChars: Number.isFinite(memoryResult?.systemPromptChars) ? memoryResult.systemPromptChars : null,
+                        systemPromptApproxTokens: Number.isFinite(memoryResult?.systemPromptApproxTokens) ? memoryResult.systemPromptApproxTokens : null,
+                        systemPromptStable: typeof memoryResult?.systemPromptStable === 'boolean' ? memoryResult.systemPromptStable : null,
+                    } : null,
                     // DB context this run ran against (observability stamp).
                     activeProfile,
                     avatar,
@@ -563,6 +575,18 @@ async function runPipelineInline(data) {
     lastTriggeredUserMsgIndex = lastUserMsgIndex;
 
     const startTime = Date.now();
+    // PER-STAGE TIMING (observability only — no behavior change). Wall-clock deltas measured
+    // around each existing await on the blocking path, collected here and attached to the
+    // run.summary `stages` blob + a single `pipeline.timing` debug line so the next exported
+    // log pinpoints which stage regressed. Stages that don't run this turn stay null.
+    const stageMs = {
+        agent1Ms: null,                 // Agent 1 draft + speculative retrieval (parallel) wall-clock
+        speculativeRetrievalMs: null,   // covered by the agent1 parallel block; recorded for clarity
+        finderMs: null,                 // time the reply ACTUALLY waited on Stage-2 (incl. budget race)
+        deterministicMs: null,          // deterministic-retrieval fallback build (when it runs)
+        sceneBuildMs: null,             // scene/big-picture block build
+        injectMs: null,                 // buildWriterInjection + injectMemoryContext + token recount
+    };
     // FIX #10: short per-run id to group this run's log entries + the SUMMARY line.
     const runId = `R${startTime.toString(36).slice(-5)}`;
     // Debug-log redesign §2: set the ambient run id so leaf logs (retrieval/db) auto-tag with
@@ -660,6 +684,11 @@ async function runPipelineInline(data) {
         );
 
         [draftResult, speculativeRetrieval] = await Promise.all(promises);
+        // Agent 1 + speculative retrieval run in PARALLEL (single Promise.all), so the reply
+        // waited the wall-clock of the slower of the two. Record that shared parallel wall-clock
+        // for both — we can't separate them without changing the await structure (out of scope).
+        stageMs.agent1Ms = Date.now() - agent1Start;
+        stageMs.speculativeRetrievalMs = stageMs.agent1Ms;
     } catch (error) {
         addDebugLog('fail', `Pipeline exception: ${error.message}`);
         hideWorkingIndicator();
@@ -837,6 +866,10 @@ async function runPipelineInline(data) {
             let budgetTimer;
             const budgetP = new Promise((resolve) => { budgetTimer = setTimeout(() => resolve(BUDGET), FINDER_BUDGET_MS); });
             const raced = await Promise.race([finderP, budgetP]).finally(() => clearTimeout(budgetTimer));
+            // Time the reply ACTUALLY waited on Stage-2 — measured around the budget RACE, so it
+            // captures the budget-fallback case (capped at ~FINDER_BUDGET_MS) as well as a finder
+            // that beat the budget. NOT just the finder LLM time. Observability only.
+            stageMs.finderMs = Date.now() - finderStart;
 
             if (raced === BUDGET) {
                 // Budget exceeded → use the deterministic facts THIS turn; drop the finder result.
@@ -868,6 +901,8 @@ async function runPipelineInline(data) {
                 }
             }
         } catch (finderErr) {
+            // The reply stopped waiting on Stage-2 here (a throw before the race recorded it).
+            if (stageMs.finderMs === null) stageMs.finderMs = Date.now() - finderStart;
             addDebugLog('fail', `STAGE 2 finder threw (${finderErr.message || finderErr}) — falling back to deterministic retrieval`, {
                 subsystem: 'finder', event: 'finder.run', reason: 'FINDER_THREW',
                 data: { agent: 'finder', profileId: finderProfileId || null, success: false, durationMs: Date.now() - finderStart, candidateCount: candidates.length, error: finderErr.message || String(finderErr), fallback: 'deterministic' },
@@ -883,7 +918,9 @@ async function runPipelineInline(data) {
     // FALLBACK: finder disabled, errored, or empty → deterministic retrieval (over Agent 1's
     // keyword requests + speculative) which ALWAYS still includes active Unsorted facts.
     if (!retrieval) {
+        const detStart = Date.now();
         retrieval = await buildDeterministicRetrieval();
+        stageMs.deterministicMs = Date.now() - detStart; // observability: fallback build wall-clock
     }
 
     addDebugLog('info', `Retrieved ${retrieval.stats.primary}P/${retrieval.stats.secondary}S/${retrieval.stats.tertiary}T facts`);
@@ -912,7 +949,7 @@ async function runPipelineInline(data) {
         // Agent 3 no longer runs here, so memoryResult is null on the blocking path —
         // its tokens are recorded separately via addAgent3Tokens on MESSAGE_RECEIVED.
         recordRunTokens({ baselineInput, actualInput: baselineInput, draftResult, memoryResult: null });
-        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true });
+        logRunSummary({ runId, startTime, baselineInput, actualInput: baselineInput, draftResult, memoryResult: null, cancelled: true, stages: stageMs });
         hideWorkingIndicator();
         updateStatus('idle');
         // Cancelled inline: no post-reply work will run for this turn — disarm + clear ambient.
@@ -922,6 +959,7 @@ async function runPipelineInline(data) {
     }
     // Always-on scene block: injected EVERY turn (above the facts) whenever enabled
     // and a scene exists — independent of whether any facts were retrieved.
+    const sceneBuildStart = Date.now(); // observability: scene + big-picture block build wall-clock
     let sceneBlock = '';
     const scene = getScene();
     if (settings.sceneCardEnabled) {
@@ -958,7 +996,11 @@ async function runPipelineInline(data) {
     }
     // Stack the Big Picture above the scene block (both live in the pre-facts slot).
     const overviewBlock = [bigPictureBlock, sceneBlock].filter(Boolean).join('\n\n');
+    stageMs.sceneBuildMs = Date.now() - sceneBuildStart;
 
+    // injectMs spans the writer-injection build + the actual injectMemoryContext + the
+    // post-inject token recount (the remaining synchronous-ish blocking work before generate).
+    const injectStart = Date.now();
     const injection = buildWriterInjection(draftResult.draft, retrieval.formatted, overviewBlock);
     lastInjection = injection; // Used for THIS first generation only.
     // FIX #8a: cache a draft-less variant for swipes/regens. Same scene + facts (those are
@@ -997,6 +1039,7 @@ async function runPipelineInline(data) {
         const actualArr = data.chat || data.messages;
         try { actualInput = await countChatTokens(actualArr); } catch { actualInput = baselineInput; }
     }
+    stageMs.injectMs = Date.now() - injectStart;
 
     // Record token metrics for the Tokens tab. Agent 3 no longer runs on this path
     // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
@@ -1004,7 +1047,18 @@ async function runPipelineInline(data) {
     // the run count or re-counting input.
     recordRunTokens({ baselineInput, actualInput, draftResult, memoryResult: null });
     // FIX #10: consolidated per-run summary (after token recording — values in scope).
-    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false });
+    // Thread the per-stage breakdown so ONE summary line carries the full timing picture.
+    logRunSummary({ runId, startTime, baselineInput, actualInput, draftResult, memoryResult: null, cancelled: false, stages: stageMs });
+
+    // OBSERVABILITY: one concise per-stage timing line (debug level) for the slowness hunt.
+    // Pure log — emitting it changes no state and runs after the blocking work is recorded.
+    const blockingTotalMs = Date.now() - startTime;
+    addDebugLog('debug',
+        `[${runId}] Stage timing: agent1=${stageMs.agent1Ms ?? '-'}ms finder=${stageMs.finderMs ?? '-'}ms ` +
+        `det=${stageMs.deterministicMs ?? '-'}ms scene=${stageMs.sceneBuildMs ?? '-'}ms ` +
+        `inject=${stageMs.injectMs ?? '-'}ms total=${blockingTotalMs}ms`,
+        { runId, subsystem: 'pipeline', event: 'pipeline.timing', data: { phase: 'blocking', ...stageMs, totalMs: blockingTotalMs } },
+    );
 
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
@@ -1111,6 +1165,12 @@ async function runMemoryExtraction() {
     // Set the ambient id so leaf db/eviction logs auto-tag with this run; endRun() in finally.
     beginRun(runId);
 
+    // PER-STAGE TIMING for the POST-REPLY path (observability only — no behavior change).
+    // agent3Ms = wall-clock the Scribe LLM call (runMemoryUpdater) actually took; snapshotMs =
+    // the durable profile snapshot (saveCurrentToActiveProfile). Emitted as a `pipeline.timing`
+    // debug line at the end so the post-reply cost shows up alongside the blocking-path one.
+    const postStageMs = { agent3Ms: null, snapshotMs: null };
+
     memoryExtractionInFlight = true;
     isInternalCall = true; // our extraction LLM call must not re-trigger the pipeline
     let memoryResult = null;
@@ -1147,10 +1207,12 @@ async function runMemoryExtraction() {
         addDebugLog('info', `[${runId}] Agent 3 (post-reply) target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
 
         const agent3ProfileId = getAgent3ProfileId(settings);
+        const agent3Start = Date.now();
         memoryResult = await runMemoryUpdater(
             targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId,
             !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex,
         ).catch(err => ({ updates: [], summary: '', raw: '', error: err.message, tokensIn: 0, tokensOut: 0 }));
+        postStageMs.agent3Ms = Date.now() - agent3Start; // observability: Scribe LLM call wall-clock
 
         // Fold Agent 3's tokens into the session totals WITHOUT bumping the run count
         // (the run was already counted on the blocking path) and update lastRunTokens.
@@ -1286,7 +1348,9 @@ async function runMemoryExtraction() {
         // change this turn was use-it-or-lose-it strengthening so the profile snapshot stays in
         // sync with the working store even on a turn that produced no extraction updates.
         if (memoryResult.updates.length > 0 || usageBumpCats.length > 0) {
+            const snapStart = Date.now();
             await saveCurrentToActiveProfile(capturedDbProfile);
+            postStageMs.snapshotMs = Date.now() - snapStart; // observability: durable snapshot wall-clock
         }
     } catch (err) {
         // Graceful degradation: a memory-extraction failure must never break the next turn.
@@ -1294,6 +1358,28 @@ async function runMemoryExtraction() {
     } finally {
         memoryExtractionInFlight = false;
         isInternalCall = false;
+        // OBSERVABILITY: one concise post-reply timing line (debug level) for the slowness hunt.
+        // Includes the Scribe prompt size + prefix-stability so a giant UNSTABLE system prompt is
+        // obvious. Pure log in the finally — never alters control flow or the next turn.
+        try {
+            const postTotalMs = Date.now() - startTime;
+            addDebugLog('debug',
+                `[${runId}] Stage timing (post-reply): agent3=${postStageMs.agent3Ms ?? '-'}ms ` +
+                `snapshot=${postStageMs.snapshotMs ?? '-'}ms total=${postTotalMs}ms` +
+                (Number.isFinite(memoryResult?.systemPromptApproxTokens)
+                    ? ` | a3 sys=${memoryResult.systemPromptChars}ch ~${memoryResult.systemPromptApproxTokens}tok stable=${memoryResult.systemPromptStable}`
+                    : ''),
+                {
+                    runId, subsystem: 'pipeline', event: 'pipeline.timing',
+                    data: {
+                        phase: 'post-reply', ...postStageMs, totalMs: postTotalMs,
+                        agent3SystemPromptChars: Number.isFinite(memoryResult?.systemPromptChars) ? memoryResult.systemPromptChars : null,
+                        agent3SystemPromptApproxTokens: Number.isFinite(memoryResult?.systemPromptApproxTokens) ? memoryResult.systemPromptApproxTokens : null,
+                        agent3SystemPromptStable: typeof memoryResult?.systemPromptStable === 'boolean' ? memoryResult.systemPromptStable : null,
+                    },
+                },
+            );
+        } catch { /* logging must never break the turn */ }
         endRun(); // clear the ambient run id once post-reply extraction's logging window closes
     }
 }
@@ -1339,9 +1425,16 @@ async function maybeRunReflection() {
         });
         // Persist any observation facts the pass wrote to the active DB profile.
         try { await saveCurrentToActiveProfile(settings.activeDbProfile); } catch { /* best-effort */ }
-        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${Date.now() - reflectStart}ms)`, {
+        const reflectionMs = Date.now() - reflectStart;
+        addDebugLog('info', `[${pending.runId}] Reflection pass complete (${reflectionMs}ms)`, {
             subsystem: 'reflection', event: 'reflection.run',
-            data: { agent: 'reflection', profileId: pending.profileId || null, success: true, durationMs: Date.now() - reflectStart },
+            data: { agent: 'reflection', profileId: pending.profileId || null, success: true, durationMs: reflectionMs },
+        });
+        // OBSERVABILITY: surface reflectionMs in the pipeline.timing event family (slowness hunt),
+        // grouped under the turn's runId. Pure log — no behavior change.
+        addDebugLog('debug', `[${pending.runId}] Stage timing (reflection): reflection=${reflectionMs}ms`, {
+            runId: pending.runId, subsystem: 'pipeline', event: 'pipeline.timing',
+            data: { phase: 'reflection', reflectionMs, totalMs: reflectionMs },
         });
     } catch (err) {
         addDebugLog('fail', `Reflection pass failed (non-fatal): ${err.message || err}`, {
