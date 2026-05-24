@@ -2760,6 +2760,12 @@ export async function initSettings() {
         // is debounced, so a synchronous immediate chat save here is the primary fix —
         // reload is exactly when the buffered entries would otherwise be lost.
         flushDebugLogNow();
+        // HYBRID PERSISTENCE: best-effort flush of the durable IDB→attachment snapshot so the
+        // newest facts reach the backend before reload. beforeunload can't reliably AWAIT the
+        // async upload, so the throttled cadence (every ~15s) remains the real guarantee; this
+        // is a final nudge. Fire-and-forget + self-guarded (never throws). Imported lazily to
+        // avoid a static settings.js→database.js cycle.
+        import('./database.js').then(m => m.flushSnapshotNow?.()).catch(() => {});
     });
 
     // Note: removed MESSAGE_RECEIVED → saveCurrentToActiveProfile() handler.

@@ -423,6 +423,258 @@ function getCharacterAvatar() {
 }
 
 // =============================================================================
+// HYBRID PERSISTENCE LAYER (IndexedDB working store + attachment durable snapshot)
+// =============================================================================
+//
+// MOTIVATION. Until now facts lived ONLY in SillyTavern character ATTACHMENTS
+// (`bf_memory_db_<category>.json`), one file per category. Every read fetch()ed +
+// JSON.parsed every category file, and every write re-uploaded a whole file (delete
+// old + upload new). That is durable + device-independent (it travels with the ST
+// backend) but slow and write-heavy.
+//
+// HYBRID MODEL (this phase):
+//   * IndexedDB ("IDB") is the FAST WORKING STORE. All reads/writes that used to hit
+//     attachments now go through IDB first. ONE IDB record PER CHARACTER AVATAR holds
+//     the EXACT same { category: { facts:[...] } } map the rest of the code already
+//     uses — so nothing downstream changes shape.
+//   * The character ATTACHMENT(S) become a DURABLE, device-independent SNAPSHOT/BACKUP.
+//     On a throttled cadence (and on meaningful flush points: chat change / beforeunload)
+//     we serialize the IDB record back out to the SAME per-category attachment files via
+//     the SAME uploadFileAttachment mechanism, so a new device / cleared browser / another
+//     device can rehydrate from the backend.
+//
+// CONTRACT PRESERVED. The public API (getAllDatabases / saveDatabase / deleteDatabase /
+// upsertFact / …) keeps its EXACT signatures + return shapes. The per-turn cache +
+// invalidate-on-write contract is unchanged: a write invalidates the cache so the next
+// read is fresh, and an IDB write is AWAITED+COMMITTED before that read can run.
+//
+// GRACEFUL FALLBACK (critical). EVERY IDB access is wrapped in try/catch behind a
+// capability probe (idbAvailable()). If IndexedDB is missing, blocked (private mode), or
+// throws, the layer transparently FALLS BACK to the ORIGINAL attachment-only paths
+// (loadAllDatabasesFromAttachments / saveDatabaseToAttachment / the inline delete). A user
+// with no usable IDB sees ZERO behavior change.
+// =============================================================================
+
+const IDB_NAME = 'bf_memory_pipeline';
+const IDB_VERSION = 1;
+const IDB_STORE = 'character_dbs';
+// Schema version stamped into each IDB record + each snapshot payload, so a future migration
+// can recognize an old on-disk shape. Bump only on a breaking record-shape change.
+const SNAPSHOT_SCHEMA_VERSION = 1;
+
+// Capability probe result is memoized: 'unknown' until first checked, then true/false.
+let _idbCapable = 'unknown';
+let _idbConnPromise = null; // shared open() promise (one connection for the page lifetime)
+
+/**
+ * One-time capability probe: is IndexedDB usable here? False when the global is absent or
+ * throws on access (some locked-down contexts). The real open() below also try/catches and
+ * sets _idbCapable=false on hard failures, so this is a fast pre-filter, not the only guard.
+ * @returns {boolean}
+ */
+function idbAvailable() {
+    if (_idbCapable !== 'unknown') return _idbCapable;
+    try {
+        _idbCapable = (typeof indexedDB !== 'undefined' && indexedDB !== null);
+    } catch {
+        _idbCapable = false;
+    }
+    return _idbCapable;
+}
+
+/**
+ * Open (and lazily create/upgrade) the IDB connection. Shares ONE in-flight/resolved promise
+ * for the whole page. REJECTS (and disables IDB for the session on hard errors) on any failure
+ * so every caller falls back to attachments. Never throws synchronously.
+ * @returns {Promise<IDBDatabase>}
+ */
+function openIdb() {
+    if (!idbAvailable()) return Promise.reject(new Error('IndexedDB unavailable'));
+    if (_idbConnPromise) return _idbConnPromise;
+    _idbConnPromise = new Promise((resolve, reject) => {
+        let req;
+        try {
+            req = indexedDB.open(IDB_NAME, IDB_VERSION);
+        } catch (e) {
+            _idbCapable = false; // hard-disable for the session
+            reject(e);
+            return;
+        }
+        req.onupgradeneeded = () => {
+            try {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(IDB_STORE)) {
+                    // Keyed by character avatar (the same identifier used for attachments).
+                    db.createObjectStore(IDB_STORE, { keyPath: 'avatar' });
+                }
+            } catch (e) {
+                console.error('[BFMemory] IDB upgrade failed', e);
+            }
+        };
+        req.onsuccess = () => {
+            const db = req.result;
+            // If the connection is ever force-closed (e.g. a version change from another tab),
+            // drop the shared promise so the next call reopens cleanly.
+            db.onversionchange = () => { try { db.close(); } catch { /* ignore */ } _idbConnPromise = null; };
+            resolve(db);
+        };
+        req.onerror = () => { _idbCapable = false; reject(req.error || new Error('IDB open error')); };
+        req.onblocked = () => { reject(new Error('IDB open blocked')); };
+    }).catch((e) => {
+        // Reset so a later attempt can retry, but the memoized capability flag (set on hard
+        // errors above) keeps us in attachment-only mode when IDB is genuinely unusable.
+        _idbConnPromise = null;
+        throw e;
+    });
+    return _idbConnPromise;
+}
+
+/**
+ * Promise-wrap a single IDB transaction request. Resolves with request.result once the request
+ * succeeds; rejects on request OR transaction error/abort.
+ * @template T
+ * @param {IDBDatabase} db
+ * @param {IDBTransactionMode} mode
+ * @param {(store: IDBObjectStore) => IDBRequest<T>} fn
+ * @returns {Promise<T>}
+ */
+function idbRequest(db, mode, fn) {
+    return new Promise((resolve, reject) => {
+        let tx;
+        try { tx = db.transaction(IDB_STORE, mode); } catch (e) { reject(e); return; }
+        let req;
+        try { req = fn(tx.objectStore(IDB_STORE)); } catch (e) { reject(e); return; }
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error('IDB request error'));
+        tx.onabort = () => reject(tx.error || new Error('IDB tx aborted'));
+        tx.onerror = () => reject(tx.error || new Error('IDB tx error'));
+    });
+}
+
+/**
+ * Read the full IDB record for an avatar: { avatar, databases, updatedAt, schema } or null.
+ * @param {string} avatar
+ * @returns {Promise<{avatar:string, databases:Object, updatedAt:number, schema:number}|null>}
+ */
+async function idbGetRecord(avatar) {
+    const db = await openIdb();
+    const rec = await idbRequest(db, 'readonly', (store) => store.get(avatar));
+    return rec || null;
+}
+
+/**
+ * Write the full { category: { facts } } map for an avatar into IDB as ONE record, stamping
+ * updatedAt + schema. The await resolves only AFTER the transaction commits, so a subsequent
+ * idbGetRecord() in the next read is GUARANTEED to see this write (no stale-read-after-write).
+ * @param {string} avatar
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {number} [updatedAt] - explicit timestamp (e.g. when adopting a snapshot's stamp)
+ * @returns {Promise<number>} the updatedAt actually written
+ */
+async function idbPutDatabases(avatar, databases, updatedAt) {
+    const db = await openIdb();
+    const stamp = Number(updatedAt) || Date.now();
+    const record = { avatar, databases: databases || {}, updatedAt: stamp, schema: SNAPSHOT_SCHEMA_VERSION };
+    await idbRequest(db, 'readwrite', (store) => store.put(record));
+    return stamp;
+}
+
+// =============================================================================
+// DURABLE SNAPSHOT to attachments (throttled). The snapshot REUSES the existing per-category
+// attachment layout (`bf_memory_db_<category>.json`) so it is fully backward/forward
+// compatible: an older (attachment-only) build reads exactly these files, and the loader's
+// legacy migration reads them too. We additionally stamp `updatedAt`/`snapshotVersion` into
+// each file so the rehydrate logic can version-compare.
+//
+// CADENCE. Snapshotting every category file on every fact write would re-introduce the upload
+// thrash we moved off of. So saveDatabase()/deleteDatabase() mark the avatar DIRTY + schedule a
+// THROTTLED snapshot (SNAPSHOT_THROTTLE_MS). A meaningful flush point (CHAT_CHANGED /
+// beforeunload) calls flushSnapshotNow() to force the tail out immediately.
+// =============================================================================
+
+const SNAPSHOT_THROTTLE_MS = 15000; // at most one full snapshot per dirty avatar every 15s
+const _snapshotDirty = new Set();   // avatars with un-snapshotted IDB writes
+const _snapshotTimers = new Map();  // avatar -> pending setTimeout id
+let _snapshotInFlight = false;      // single-flight guard so two snapshots never overlap
+
+/**
+ * Mark an avatar's IDB state as needing a durable attachment snapshot and (re)arm the throttle
+ * timer. No-op in attachment-only mode (writes are already durable). Never throws.
+ * @param {string} avatar
+ */
+function scheduleSnapshot(avatar) {
+    if (!avatar || !idbAvailable()) return;
+    _snapshotDirty.add(avatar);
+    if (_snapshotTimers.has(avatar)) return; // timer already armed; it picks up the dirty flag
+    const id = setTimeout(() => {
+        _snapshotTimers.delete(avatar);
+        // Fire-and-forget; snapshotAvatar fully self-guards (a failed upload must never break the
+        // pipeline — IDB still holds the authoritative working copy).
+        snapshotAvatar(avatar).catch((e) => console.error('[BFMemory] snapshot failed', e));
+    }, SNAPSHOT_THROTTLE_MS);
+    _snapshotTimers.set(avatar, id);
+}
+
+/**
+ * Serialize an avatar's IDB databases out to the per-category attachment files (durable backup).
+ * Single-flight + best-effort: clears the dirty flag up-front so writes during the (slow) upload
+ * re-mark it for the next pass. NEVER throws into callers.
+ * @param {string} avatar
+ * @returns {Promise<void>}
+ */
+async function snapshotAvatar(avatar) {
+    if (!avatar || !idbAvailable()) return;
+    if (_snapshotInFlight) { _snapshotDirty.add(avatar); return; } // coalesce; retry next tick
+    if (!_snapshotDirty.has(avatar)) return;
+    _snapshotInFlight = true;
+    _snapshotDirty.delete(avatar);
+    try {
+        const rec = await idbGetRecord(avatar);
+        if (!rec || !rec.databases) return;
+        const stamp = Number(rec.updatedAt) || Date.now();
+        // Write each POPULATED category to its own attachment file (existing layout). Empty
+        // categories are skipped (matches the write-on-first-fact policy that kept the backend
+        // from accumulating empty files).
+        for (const [category, sdb] of Object.entries(rec.databases)) {
+            if (!sdb || !Array.isArray(sdb.facts) || sdb.facts.length === 0) continue;
+            const payload = { ...sdb, category, snapshotVersion: SNAPSHOT_SCHEMA_VERSION, updatedAt: stamp };
+            try {
+                await saveDatabaseToAttachment(avatar, payload);
+            } catch (e) {
+                console.error(`[BFMemory] snapshot of "${category}" failed`, e);
+            }
+        }
+        addDebugLog('debug', 'Durable snapshot written (IDB → attachments)', {
+            subsystem: 'db', event: 'db.snapshot', data: { updatedAt: stamp },
+        });
+    } catch (e) {
+        _snapshotDirty.add(avatar); // re-mark so a later cadence retries; never propagate
+        console.error('[BFMemory] snapshotAvatar failed', e);
+    } finally {
+        _snapshotInFlight = false;
+    }
+}
+
+/**
+ * Force an immediate durable snapshot of the CURRENT character's IDB state to attachments.
+ * Exported so the orchestrator can flush on a meaningful boundary (CHAT_CHANGED / beforeunload).
+ * Best-effort: no-op in attachment-only mode (writes are already durable). Never throws.
+ * @returns {Promise<void>}
+ */
+export async function flushSnapshotNow() {
+    try {
+        if (!idbAvailable()) return;
+        const avatar = getCharacterAvatar();
+        if (!avatar) return;
+        if (_snapshotTimers.has(avatar)) { clearTimeout(_snapshotTimers.get(avatar)); _snapshotTimers.delete(avatar); }
+        _snapshotDirty.add(avatar); // ensure snapshotAvatar runs even if no timer was armed
+        await snapshotAvatar(avatar);
+    } catch (e) {
+        console.error('[BFMemory] flushSnapshotNow failed', e);
+    }
+}
+
+// =============================================================================
 // PER-TURN getAllDatabases() CACHE (perf). getAllDatabases() fetch()es + JSON.parses
 // every category attachment, and it is called ~4-5×/turn (Drafter menu, speculative
 // retrieval, finder, post-reply extraction, reflection/UI). Re-reading every category
@@ -489,12 +741,113 @@ export async function getAllDatabases() {
 }
 
 /**
- * Uncached loader: fetch + parse + legacy-remap every category attachment for a character.
- * Split out of getAllDatabases() so the cache wrapper above can memoize it.
+ * Uncached loader (HYBRID orchestrator). Decides where the authoritative working copy lives and
+ * returns the SAME { category -> DatabaseSchema } map shape callers already expect. Split out of
+ * getAllDatabases() so the per-turn cache wrapper above can memoize it.
+ *
+ * FLOW (IDB available):
+ *   1) Read the IDB record for this avatar AND the attachment snapshot (the latter is the same
+ *      fetch+parse the legacy path does, run once here as both the snapshot reader and fallback).
+ *   2) VERSION-COMPARE by updatedAt:
+ *        - No IDB record but attachments hold facts  → MIGRATE: seed IDB from attachments once,
+ *          return that map (new device / first run after upgrade / legacy install).
+ *        - Attachment snapshot stamp NEWER than IDB  → REHYDRATE IDB from the snapshot, return it
+ *          (another device wrote a newer snapshot, or local IDB is empty/stale).
+ *        - IDB present and >= snapshot               → IDB is authoritative; return IDB (it
+ *          snapshots back out on the next write cadence).
+ *   3) On ANY IDB error → fall back to the pure attachment loader (no behavior change).
+ *
+ * FLOW (IDB unavailable): straight passthrough to loadAllDatabasesFromAttachments — the EXACT
+ * original behavior, so a user with no usable IDB sees zero regression.
  * @param {string} avatar
  * @returns {Promise<Object<string, DatabaseSchema>>}
  */
 async function loadAllDatabases(avatar) {
+    if (!avatar) return {};
+
+    // FALLBACK PATH: no usable IDB → original attachment-only behavior, unchanged.
+    if (!idbAvailable()) {
+        return loadAllDatabasesFromAttachments(avatar);
+    }
+
+    try {
+        const rec = await idbGetRecord(avatar);
+        const idbStamp = rec ? (Number(rec.updatedAt) || 0) : -1; // -1 = no IDB record at all
+        const idbHasData = !!(rec && rec.databases && Object.keys(rec.databases).length > 0);
+
+        // Read the attachment snapshot once (legacy loader; also performs the legacy
+        // category/aspect remap). Its newest stamp drives the version compare.
+        const attachMap = await loadAllDatabasesFromAttachments(avatar);
+        const attachStamp = attachmentSnapshotStamp(avatar, attachMap);
+        const attachHasData = Object.keys(attachMap).some(c => (attachMap[c]?.facts || []).length > 0);
+
+        // CASE A — MIGRATION: no IDB record yet, but attachments hold facts. Seed IDB ONCE,
+        // adopting the snapshot stamp so a later device compare is meaningful. Serve attachments.
+        if (idbStamp < 0 && attachHasData) {
+            await idbPutDatabases(avatar, attachMap, attachStamp || Date.now());
+            addDebugLog('info', 'Migrated legacy attachment DBs into IndexedDB', {
+                subsystem: 'db', event: 'db.migrated', data: { categories: Object.keys(attachMap).length },
+            });
+            return attachMap;
+        }
+
+        // CASE B — REHYDRATE: the attachment snapshot is strictly NEWER than IDB (another device,
+        // or local IDB empty/stale). Adopt the snapshot into IDB and serve it.
+        if (attachHasData && attachStamp > idbStamp) {
+            await idbPutDatabases(avatar, attachMap, attachStamp);
+            addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
+                subsystem: 'db', event: 'db.rehydrated', data: { attachStamp, idbStamp },
+            });
+            return attachMap;
+        }
+
+        // CASE C — IDB is authoritative (present and >= snapshot, or attachments empty). Serve IDB;
+        // a genuinely empty store returns {} (skeleton is layered on by callers via withSkeleton).
+        if (idbHasData) return rec.databases;
+        return {};
+    } catch (e) {
+        // ANY IDB failure → transparent fallback to the original attachment-only loader.
+        console.error('[BFMemory] IDB load failed; falling back to attachments', e);
+        _idbCapable = false; // stop hammering a broken IDB for the rest of the session
+        return loadAllDatabasesFromAttachments(avatar);
+    }
+}
+
+/**
+ * Compute the snapshot "version" stamp for an avatar's attachment files. Prefers the max
+ * `updatedAt` stamped into the parsed DBs (written by snapshotAvatar); falls back to the max
+ * attachment `created` time on the file metadata (covers legacy files with no stamp). Returns 0
+ * when there are no DB attachments. Used by the rehydrate version-compare in loadAllDatabases.
+ * @param {string} avatar
+ * @param {Object<string, DatabaseSchema>} parsedMap - already-parsed attachment DB map
+ * @returns {number}
+ */
+function attachmentSnapshotStamp(avatar, parsedMap) {
+    let max = 0;
+    for (const db of Object.values(parsedMap || {})) {
+        const u = Number(db?.updatedAt) || 0;
+        if (u > max) max = u;
+    }
+    try {
+        const context = getContext();
+        const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
+        for (const a of attachments) {
+            if (!a.name?.startsWith(DB_PREFIX)) continue;
+            const c = Number(a.created) || 0;
+            if (c > max) max = c;
+        }
+    } catch { /* ignore */ }
+    return max;
+}
+
+/**
+ * Pure ATTACHMENT loader (the ORIGINAL loadAllDatabases body, unchanged): fetch + parse +
+ * legacy-remap every category attachment for a character. This is BOTH the fallback path (IDB
+ * unavailable/broken) AND the snapshot reader used by the hybrid orchestrator above.
+ * @param {string} avatar
+ * @returns {Promise<Object<string, DatabaseSchema>>}
+ */
+async function loadAllDatabasesFromAttachments(avatar) {
     if (!avatar) return {};
 
     const context = getContext();
@@ -667,6 +1020,44 @@ export async function saveDatabase(db) {
         });
     }
 
+    // HYBRID WRITE. Prefer IDB as the fast working store; the durable attachment snapshot is
+    // written on a throttled cadence (scheduleSnapshot) rather than on every fact write. On ANY
+    // IDB failure (or when IDB is unavailable) fall through to the ORIGINAL synchronous
+    // attachment upload so behavior is identical for users without usable IDB.
+    if (idbAvailable()) {
+        try {
+            // Read-modify-write: merge this one category into the avatar's full IDB record so a
+            // single-category save never drops the other categories. The await on idbPutDatabases
+            // resolves only after the tx COMMITS — so the next getAllDatabases() (cache already
+            // invalidated above) re-reads and sees this write (no stale-read-after-write).
+            const rec = await idbGetRecord(avatar);
+            const databases = (rec && rec.databases) ? rec.databases : {};
+            databases[db.category] = db;
+            await idbPutDatabases(avatar, databases, Date.now());
+            // Mark dirty + arm the throttled durable snapshot to attachments.
+            scheduleSnapshot(avatar);
+            return;
+        } catch (e) {
+            // IDB write failed mid-session → disable IDB and fall back to attachment-only for the
+            // rest of the session so we never silently lose this write.
+            console.error('[BFMemory] IDB save failed; falling back to attachment write', e);
+            _idbCapable = false;
+        }
+    }
+
+    // FALLBACK / attachment-only path (also the original behavior): upload synchronously.
+    await saveDatabaseToAttachment(avatar, db);
+}
+
+/**
+ * Write ONE category database to its attachment file (the ORIGINAL saveDatabase upload body,
+ * unchanged in behavior). Used by (a) the attachment-only fallback in saveDatabase and (b) the
+ * durable snapshot (snapshotAvatar). Caller has already enforced the fact cap. Throws on a failed
+ * upload (callers decide how to handle: saveDatabase propagates; snapshotAvatar swallows).
+ * @param {string} avatar
+ * @param {DatabaseSchema} db
+ */
+async function saveDatabaseToAttachment(avatar, db) {
     const fileName = `${DB_PREFIX}${db.category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
     const content = JSON.stringify(db, null, 2);
     const base64Data = btoa(unescape(encodeURIComponent(content)));
@@ -727,6 +1118,22 @@ export async function deleteDatabase(category) {
     // Per-turn cache: deleting a category is a write — invalidate so a later read re-fetches.
     invalidateDatabaseCache();
 
+    // HYBRID: drop the category from the IDB working record first so the next read can't resurrect
+    // it. Best-effort — on IDB failure we disable IDB and still remove the attachment below.
+    if (idbAvailable()) {
+        try {
+            const rec = await idbGetRecord(avatar);
+            if (rec && rec.databases && Object.prototype.hasOwnProperty.call(rec.databases, category)) {
+                delete rec.databases[category];
+                await idbPutDatabases(avatar, rec.databases, Date.now());
+            }
+        } catch (e) {
+            console.error('[BFMemory] IDB delete failed; removing attachment only', e);
+            _idbCapable = false;
+        }
+    }
+
+    // Always remove the durable attachment file too (the snapshot backup must lose it as well).
     const context = getContext();
     const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];
     const fileName = `${DB_PREFIX}${category.toLowerCase().replace(/[^a-z0-9]/g, '_')}.json`;
