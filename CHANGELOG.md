@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.29.0] - 2026-05-24
+
+### Fixed — follow-ups from 0.28 testing
+- **Subject `@`-leak (broke indexing/dedup/focus).** The Scribe emits `subj:@Name`; the parser wasn't stripping the `@`, so facts were stored with subject `@name`. That broke the per-subject index, the state-dedup, and the focus filter (and was the real reason some facts didn't surface). Now stripped at parse time and defensively on read. ([src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js))
+- **`Failed to inject memory context`.** `injectMemoryContext` could silently fail when SillyTavern's prompt-event data wasn't the exact expected shape — meaning memory might not reach the Writer. It now tries multiple container shapes, pushes on an empty array, and on true failure logs a `inject.failed` diagnostic dumping the actual data shape so it's debuggable. ([src/agent-writer.js](src/agent-writer.js))
+- **Truthful aspect in the Debug log.** `fact.created`/`fact.updated` now log the real resolved aspect (e.g. `current_location`) instead of an internal key-derived string (`fionalocation`). ([src/database.js](src/database.js))
+- **`knownBy` default.** When the Scribe omits it, facts now default to the present character + user (instead of always "everyone"); a prompt line nudges the model to set it for secrets. ([src/agent-memory.js](src/agent-memory.js))
+- **Tokens tab.** Now tracks **all** agents — Drafter, Librarian (finder), Writer, Scribe, **and Reflection** (finder + reflection token counts were being computed then discarded) — and a branch chat starts its own token tally instead of showing the parent's stale counts. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+- **Active DB profile.** A profile is now reliably ensured + linked + activated at fact-write time (not only on chat-change), so the Database tab shows the active profile and per-turn saves no longer silently no-op (this also covers branch chats whose parent wasn't linked). "Save As New" now binds the new profile to the current chat. ([src/settings.js](src/settings.js))
+
 ## [0.28.0] - 2026-05-24
 
 ### Fixed — facts now belong to the right character (was a data-loss bug) + a faster loop
