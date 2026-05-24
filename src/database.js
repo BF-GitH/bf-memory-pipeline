@@ -462,6 +462,32 @@ export function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail =
 }
 
 /**
+ * MARK a single fact COLD in place (never-delete demotion). Sets `cold:true` so the fact is
+ * deprioritized by retrieval/menu but stays DURABLE on disk (IDB + snapshot) and fully
+ * resurrectable (a re-mention/update/direct match un-colds it via uncoldFact, exactly like any
+ * cold-tiered overflow fact). This is the single-fact counterpart to coldTierOverflow's bulk
+ * demotion, used when an automated pass (e.g. the reflection #REEVAL "drop" verdict) judges a
+ * fact low-value — instead of DELETING it (which would violate the never-delete invariant) we
+ * cold-tier it. Logs `fact.demoted` (standing debug-logging rule), mirroring coldTierOverflow's
+ * log so a "drop" surfaces in the Debug tab as a COLD-TIERING, not a deletion. No-op (no re-log)
+ * when the fact is already cold. Returns true when it actually newly cold-tiered the fact.
+ * @param {FactSchema} fact - the stored fact object (mutated in place)
+ * @param {string} category - owning category (for the log)
+ * @param {string} reason - structured reason code (e.g. 'REEVAL_DROP')
+ * @param {string} [detail] - optional human note (e.g. why it was demoted)
+ * @returns {boolean}
+ */
+export function markFactCold(fact, category, reason = 'DEMOTED_LOW_VALUE', detail = '') {
+    if (!fact || fact.cold === true) return false;
+    fact.cold = true;
+    addDebugLog('info', `Fact cold-tiered (kept, deprioritized): [${category}] ${fact.key}${detail ? ` — ${detail}` : ''}`, {
+        subsystem: 'db', event: 'fact.demoted', reason,
+        data: { category, key: fact.key, salienceScore: Number(salienceScore(fact, Date.now()).toFixed(3)) },
+    });
+    return true;
+}
+
+/**
  * Decide whether an INCOMING write should SUPERSEDE the existing fact it reconciles to
  * (i.e. mark the old value as ended and record the new current value) rather than just
  * correct it in place. Supersession is reserved for CHANGEABLE STATE — a status, a
@@ -2389,6 +2415,190 @@ function mergeRelationships(existing, incoming) {
         result[tier] = Array.from(new Set([...e, ...i]));
     }
     return result;
+}
+
+// =============================================================================
+// AUTOMATIC ASSOCIATIVE LINKING (A-MEM style, lexical, DETERMINISTIC, zero-API).
+//
+// GOAL. When a fresh fact lands, auto-connect it to the most-related EXISTING active facts so
+// that asking about any one surfaces the others — by lexical/structural overlap alone (no LLM).
+//
+// HOW THE LINK SURFACES. We do NOT touch retrieval: we only populate `fact.relationships`, which
+// the retrieval path ALREADY follows. A primary hit's `relationships.primary`/`secondary` refs are
+// tokenized and resolved through the token index (see searchFactsIndexed's expansion + the
+// expandLinks fallback that reads `result.fact.relationships.primary`). A ref is admitted when the
+// target fact's `category key tags` text CONTAINS the ref string, so a ref must be a token that
+// (a) appears in the target's byToken index and (b) is a substring of its identifiers. A fact's
+// own `key` satisfies BOTH — so we record links as the TARGET FACT's KEY (link by IDENTITY of a
+// real stored fact, never an invented token). Refs are deduped + lowercased to match resolution.
+//
+// RELATEDNESS SIGNALS (priority order, mirroring the scope-graph the rest of the code uses):
+//   1. SAME SUBJECT (index.bySubject) — facts about the same person/place/thing → PRIMARY.
+//   2. SHARED LOCATION or SHARED `involved` member → PRIMARY (the place/people graph).
+//   3. LEXICAL TOKEN OVERLAP (index.byToken) ≥ AUTOLINK_MIN_TOKEN_OVERLAP shared meaningful
+//      tokens → SECONDARY (weaker, topical co-occurrence).
+// HARD BOUNDS: cap primary + secondary refs (AUTOLINK_MAX_PRIMARY/SECONDARY); skip self, skip
+// inactive/superseded targets, dedupe, and never clobber existing (manual or prior) links — we
+// UNION into them via mergeRelationships. The work is O(matching facts), never O(all facts),
+// because every candidate set comes from an index bucket (bySubject/byToken).
+// =============================================================================
+
+const AUTOLINK_MAX_PRIMARY = 5;
+const AUTOLINK_MAX_SECONDARY = 5;
+const AUTOLINK_MIN_TOKEN_OVERLAP = 2; // ≥ this many shared >3-char tokens to earn a secondary link
+
+/**
+ * Canonical link ref for a target fact: its `key`, lowercased + trimmed. Recording the KEY (not an
+ * invented token) makes the link an IDENTITY reference to a real stored fact, and the key resolves
+ * cleanly through the retrieval ref-expansion (the key is both an index token and a substring of
+ * the target's identifiers). Returns '' for a keyless fact.
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+function autoLinkRef(fact) {
+    return String(fact?.key || '').trim().toLowerCase();
+}
+
+/**
+ * AUTO-LINK a freshly-written fact to related EXISTING active facts (deterministic, zero-API).
+ * Mutates `fact.relationships` IN PLACE, UNIONING new refs into any existing (manual/prior) links
+ * via mergeRelationships — never clobbering. Targets are pulled from the prebuilt in-memory index
+ * (bySubject / byToken), so the cost is O(matching facts). Bounded hard by AUTOLINK_MAX_PRIMARY /
+ * AUTOLINK_MAX_SECONDARY. Skips self (same category:key), inactive/superseded targets, and dupes.
+ *
+ * ORDERING/CORRECTNESS: the caller passes the index as it was at the START of the write batch (see
+ * applyUpdates) — the index is name-agnostic + active-only and is NOT mutated here, so a fact added
+ * earlier in the same batch simply isn't a candidate yet (acceptable: the next turn's index will
+ * include it, and the earlier fact may already link forward to this one). We read the index; we do
+ * NOT rebuild it per fact (which would be O(all) per fact). Pure aside from mutating `fact`.
+ *
+ * BACK-LINKING DECISION (intentionally NOT done here): we record FORWARD links only. The
+ * structural signals (same-subject / shared-location / shared-involved) are ALREADY symmetric at
+ * retrieval time — expandLinks traverses the scope graph (subject⇄place⇄people) in BOTH directions
+ * off the candidate set, so querying either side surfaces the other regardless of which fact stores
+ * the ref. Adding a reverse ref onto each target would mutate facts in OTHER categories that the
+ * current extraction is NOT already saving, forcing extra attachment writes (I/O bloat the project
+ * explicitly avoids). So we skip reverse-ref writes; the forward link + symmetric scope-graph cover
+ * the bidirectional case. TODO(optional): if a target happens to live in a category the batch is
+ * already re-saving, a reverse ref could ride that save for free — left out to keep this bounded.
+ *
+ * Logs `fact.autolink` (debug level, standing rule) with the link counts + chosen targets.
+ * @param {{bySubject: Map, byToken: Map}} index - the per-turn in-memory fact index
+ * @param {FactSchema} fact - the freshly-upserted fact (mutated in place)
+ * @param {string} category - the fact's owning category (to skip self by category:key identity)
+ * @param {string} [runId] - optional correlation id for the debug log
+ * @returns {{primary: string[], secondary: string[]}} the refs actually added (post-cap, post-dedupe)
+ */
+export function autoLinkFact(index, fact, category, runId) {
+    const empty = { primary: [], secondary: [] };
+    if (!index || !fact || typeof fact !== 'object') return empty;
+    if (!isActiveFact(fact)) return empty; // never link FROM a superseded snapshot
+    const selfId = `${category}:${fact.key}`;
+    const selfRef = autoLinkRef(fact);
+
+    // A candidate is admissible iff it's a DIFFERENT, ACTIVE stored fact. (The index already holds
+    // only active facts, but guard anyway in case a caller passes a hand-built index.)
+    const admissible = (entry) => {
+        const t = entry && entry.fact;
+        if (!t || typeof t !== 'object') return false;
+        if (`${entry.category}:${t.key}` === selfId) return false; // skip self
+        if (!isActiveFact(t)) return false;
+        return true;
+    };
+
+    // ---- PRIMARY candidates: same subject, OR shared location, OR shared involved member. ----
+    const primaryRefs = new Set();
+    const addPrimary = (entry) => {
+        if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) return;
+        if (!admissible(entry)) return;
+        const ref = autoLinkRef(entry.fact);
+        if (ref && ref !== selfRef) primaryRefs.add(ref);
+    };
+
+    // Signal 1 — SAME SUBJECT.
+    const subject = deriveSubject(fact);
+    if (subject) {
+        for (const entry of (index.bySubject.get(subject) || [])) {
+            if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) break;
+            addPrimary(entry);
+        }
+    }
+
+    // Signal 2 — SHARED LOCATION + SHARED `involved` member. The `location`/`involved` tokens are
+    // indexed under byToken (they are part of a fact's key/value/tags for most facts) but the most
+    // reliable structural match is: a candidate whose OWN location/involved overlaps ours. We pull
+    // candidate sets cheaply by tokenizing our location/involved and unioning their byToken buckets,
+    // then keep only those that genuinely SHARE the structural field (not just a stray token hit).
+    const myLoc = String(fact.location || '').trim().toLowerCase();
+    const myInvolved = new Set((Array.isArray(fact.involved) ? fact.involved : [])
+        .map(s => String(s ?? '').trim().toLowerCase()).filter(Boolean));
+    if (myLoc || myInvolved.size > 0) {
+        const structuralSeen = new Set();
+        const structuralTokens = new Set();
+        if (myLoc) for (const w of myLoc.split(/[^a-z0-9]+/)) if (w.length > 3) structuralTokens.add(w);
+        for (const inv of myInvolved) for (const w of inv.split(/[^a-z0-9]+/)) if (w.length > 3) structuralTokens.add(w);
+        for (const tok of structuralTokens) {
+            if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) break;
+            for (const entry of (index.byToken.get(tok) || [])) {
+                if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) break;
+                const id = `${entry.category}:${entry.fact?.key}`;
+                if (structuralSeen.has(id)) continue;
+                structuralSeen.add(id);
+                if (!admissible(entry)) continue;
+                const t = entry.fact;
+                const tLoc = String(t.location || '').trim().toLowerCase();
+                const tInvolved = new Set((Array.isArray(t.involved) ? t.involved : [])
+                    .map(s => String(s ?? '').trim().toLowerCase()).filter(Boolean));
+                const sharesLoc = !!(myLoc && tLoc && (myLoc === tLoc
+                    || myLoc.startsWith(tLoc + '_') || tLoc.startsWith(myLoc + '_')));
+                let sharesInvolved = false;
+                for (const inv of myInvolved) { if (tInvolved.has(inv)) { sharesInvolved = true; break; } }
+                if (sharesLoc || sharesInvolved) addPrimary(entry);
+            }
+        }
+    }
+
+    // ---- SECONDARY candidates: lexical token overlap ≥ AUTOLINK_MIN_TOKEN_OVERLAP. ----
+    // Tally how many of OUR meaningful tokens each candidate fact shares (via the token index),
+    // then admit the highest-overlap facts as secondary links until the cap. Skips anything already
+    // linked as primary (a stronger tie supersedes the weaker lexical one) and self/inactive.
+    const secondaryRefs = new Set();
+    const myTokens = factTokens(fact); // >3-char tokens of key+value+tags+aliases (index-consistent)
+    if (myTokens.length > 0) {
+        const overlap = new Map(); // `category:key` -> { entry, count }
+        for (const tok of myTokens) {
+            for (const entry of (index.byToken.get(tok) || [])) {
+                if (!admissible(entry)) continue;
+                const id = `${entry.category}:${entry.fact.key}`;
+                const rec = overlap.get(id);
+                if (rec) rec.count++;
+                else overlap.set(id, { entry, count: 1 });
+            }
+        }
+        const ranked = [...overlap.values()]
+            .filter(r => r.count >= AUTOLINK_MIN_TOKEN_OVERLAP)
+            .sort((a, b) => b.count - a.count);
+        for (const { entry } of ranked) {
+            if (secondaryRefs.size >= AUTOLINK_MAX_SECONDARY) break;
+            const ref = autoLinkRef(entry.fact);
+            if (!ref || ref === selfRef) continue;
+            if (primaryRefs.has(ref)) continue; // already a stronger (primary) link
+            secondaryRefs.add(ref);
+        }
+    }
+
+    const primary = [...primaryRefs];
+    const secondary = [...secondaryRefs];
+    if (primary.length === 0 && secondary.length === 0) return empty;
+
+    // UNION the new refs into any existing (manual/prior) relationships — never clobber.
+    fact.relationships = mergeRelationships(fact.relationships, { primary, secondary, tertiary: [] });
+
+    addDebugLog('debug', `Auto-linked fact: [${category}] ${fact.key} (+${primary.length} primary, +${secondary.length} secondary)`, {
+        subsystem: 'db', event: 'fact.autolink', runId,
+        data: { key: fact.key, category, primary: primary.length, secondary: secondary.length, targets: [...primary, ...secondary] },
+    });
+    return { primary, secondary };
 }
 
 /**

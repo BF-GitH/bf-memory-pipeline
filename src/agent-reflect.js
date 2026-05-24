@@ -24,7 +24,7 @@
 // how large the DB has grown. A failure degrades gracefully — it never breaks the
 // pipeline (mirrors the existing agent fallbacks).
 
-import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
+import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
 import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -64,7 +64,7 @@ If a "## Shelves to summarize" list is given, write ONE short summary line per l
 
 You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
-- DROP — it was a confirmed one-off / no longer true / noise: discard it.
+- DROP — it was a confirmed one-off / no longer true / noise: demote it (it is deprioritized, not erased — it stays recoverable if it ever matters again).
 - KEEP — still genuinely uncertain: leave it where it is for a later pass.
 Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fact by its exact id shown in brackets.
 
@@ -513,8 +513,9 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
 
         // RE-EVALUATION: apply promote/drop verdicts on the uncertain candidates. PROMOTE
         // moves the fact to its proper Layer-1 category + aspect (and bumps importance so it
-        // stops looking transient); DROP removes a confirmed one-off; KEEP/unknown is a no-op.
-        // Cheap, bounded by MAX_REEVAL_CANDIDATES, and logged with reasons. Best-effort.
+        // stops looking transient); DROP DEMOTES a confirmed one-off TO COLD-TIER (never-delete:
+        // the fact stays on disk + resurrectable, just deprioritized — NOT removed); KEEP/unknown
+        // is a no-op. Cheap, bounded by MAX_REEVAL_CANDIDATES, and logged with reasons. Best-effort.
         let promoted = 0, dropped = 0;
         const reevalModified = new Set();
         for (const v of (parsed.reevals || [])) {
@@ -526,12 +527,18 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             if (!fact) continue; // already gone (deduped/superseded since collection)
 
             if (v.verdict === 'drop') {
-                removeFact(fromDb, cand.key);
+                // NEVER-DELETE: a "drop" verdict DEMOTES the fact to cold-tier instead of removing
+                // it. The fact remains in db.facts (cold:true) — durable on disk + resurrectable
+                // exactly like any cold-tiered overflow fact (a later re-mention/update/direct
+                // match un-colds it). markFactCold also logs `fact.demoted` (subsystem:'db'); we
+                // additionally log the reflection-level demotion so a #REEVAL "drop" is visible as
+                // a cold-tiering, not a deletion. Idempotent: already-cold facts still count.
+                const newlyCold = markFactCold(fact, cand.category, 'REEVAL_DROP', 'reflection judged one-off');
                 reevalModified.add(cand.category);
                 dropped++;
-                addDebugLog('info', `[${runId}] Re-eval DROP: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"`, {
-                    subsystem: 'db', event: 'fact.reeval_dropped', reason: 'CONFIRMED_ONE_OFF',
-                    data: { category: cand.category, key: cand.key },
+                addDebugLog('info', `[${runId}] Re-eval DROP→cold-tier: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"`, {
+                    subsystem: 'reflection', event: 'fact.demoted', reason: 'REEVAL_DROP',
+                    data: { category: cand.category, key: cand.key, newlyCold },
                 });
                 continue;
             }

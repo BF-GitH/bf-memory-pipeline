@@ -139,6 +139,12 @@ const DEFAULT_SETTINGS = {
     // chat_metadata — this toggle only gates whether they're INJECTED. Absent (older settings)
     // → default false (back-compatible).
     enableSummaryPyramid: false,
+    // Automatic associative linking (A-MEM style, lexical, DETERMINISTIC, zero-API). When ON, a
+    // freshly-written fact is auto-connected to related EXISTING facts (same subject / shared
+    // location / shared participants / lexical token overlap) by recording links into its
+    // `relationships` — so asking about any one surfaces the others. Free + deterministic (no LLM),
+    // so it DEFAULTS ON; the toggle lets a user disable it. Absent (older settings) => true.
+    enableAutoLinking: true,
     // Hard cap on the injected Big Picture block, in approx tokens (reuses the buildSceneBlock
     // char-budget truncation style). Bounds prompt growth even with a huge store.
     summaryPyramidMaxTokens: 250,
@@ -286,6 +292,8 @@ function validateSettings(s) {
     if (typeof s.useFinderAgent !== 'boolean')   s.useFinderAgent = true;
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    // Auto-linking defaults ON (free + deterministic): absent/invalid => true (back-compat).
+    if (typeof s.enableAutoLinking !== 'boolean') s.enableAutoLinking = true;
     s.summaryPyramidMaxTokens = Math.floor(clamp(s.summaryPyramidMaxTokens, 50, 1000, 250));
     if (typeof s.finderPrompt !== 'string')      s.finderPrompt = '';
     if (typeof s.draftPrompt !== 'string')       s.draftPrompt = '';
@@ -2411,6 +2419,17 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.enableSummaryPyramid = next;
         addDebugLog('info', `Summary pyramid Big Picture injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableSummaryPyramid' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Auto-linking toggle (A-MEM style associative linking). DEFAULT ON (free + deterministic),
+    // so the checkbox reflects `!== false`. Gates whether applyUpdates auto-connects a fresh fact
+    // to related existing facts via `relationships`. No registration side-effect.
+    $('#bf_mem_autolink_enabled').prop('checked', extensionSettings.enableAutoLinking !== false).on('change', function () {
+        const before = extensionSettings.enableAutoLinking !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.enableAutoLinking = next;
+        addDebugLog('info', `Automatic associative linking ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableAutoLinking' }, before, after: !!next });
         saveSettings();
     });
 

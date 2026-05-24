@@ -210,6 +210,16 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                     </div>
                 </div>
                 <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-diagram-project"></i> Automatic associative linking</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_autolink_enabled" />
+                            <span>Auto-connect a new fact to related existing facts</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. When a fact is written, it is automatically linked to related existing facts — same subject, shared location/participants, or strong word overlap — so asking about any one surfaces the others. Fully deterministic and free (no LLM call). Links are added to the fact's relationship list (capped, never overwriting existing links).</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
                     <div class="bf-mem-section-header"><i class="fa-solid fa-timeline"></i> Sequence Depth Dice</div>
                     <div class="bf-mem-section-body">
                         <small class="bf-mem-hint">For tracked sequences (e.g. a character's location over time) the current step is always included. These set the chance of reaching further back in history. The furthest successful roll sets how far back to include — and every step in between is always included (no gaps).</small>

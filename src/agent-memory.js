@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, getMemoryIndex, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
+import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -1030,6 +1030,20 @@ async function applyUpdates(updates, existingDatabases) {
     const modified = new Set();
     const applied = [];
 
+    // AUTOMATIC ASSOCIATIVE LINKING (A-MEM style, lexical, deterministic, zero-API). Default ON;
+    // gated by `enableAutoLinking` (a free + deterministic feature, so it defaults true). We build
+    // the in-memory fact index ONCE here, BEFORE the write loop, capturing the PRE-BATCH state.
+    //
+    // ORDERING/CORRECTNESS ARGUMENT: each saveDatabase() below invalidates the shared per-turn
+    // index (getMemoryIndex), so we deliberately do NOT call getMemoryIndex() inside the loop
+    // (that would force an O(all-facts) rebuild per write). Instead we hold a single pre-batch
+    // snapshot built from `existingDatabases` (the map being mutated). New facts added earlier in
+    // THIS batch are simply not yet candidates — acceptable and provably non-looping: the next
+    // turn's index includes them, and the earlier fact may already have linked forward. The index
+    // references the same active fact objects, so links target real stored facts by identity.
+    const autoLinkOn = getSettingsSafe()?.enableAutoLinking !== false; // absent => ON (default true)
+    const linkIndex = autoLinkOn ? buildMemoryIndex(existingDatabases) : null;
+
     for (const update of updates) {
         const category = update.category;
 
@@ -1124,6 +1138,17 @@ async function applyUpdates(updates, existingDatabases) {
         // Layer A: forward aliases so upsertFact can UNION them (dedupe) across re-mentions.
         if (Array.isArray(update.aliases) && update.aliases.length) factToWrite.aliases = update.aliases;
         upsertFact(db, factToWrite);
+
+        // AUTO-LINK (deterministic, zero-API): for a fact that actually changed state, connect it
+        // to related EXISTING facts by recording links into its `relationships` (UNION, never
+        // clobber). We re-find the stored fact (upsertFact may have re-keyed via parallel-state
+        // dedup) and link against the PRE-BATCH index snapshot. The mutation rides the existing
+        // saveDatabase() below (no extra write). SKIPPED no-ops are skipped — nothing changed.
+        if (autoLinkOn && update.changed && linkIndex) {
+            const stored = findFactMatch(db, factToWrite.key);
+            if (stored) autoLinkFact(linkIndex, stored, category, update.source);
+        }
+
         const relCount = update.relationships?.length || 0;
         addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
 
