@@ -3083,6 +3083,8 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
                 !!msg.is_user,
                 userPersona,
                 [],  // no prior context — process each message in isolation for retro extraction
+                null,
+                String(msg.name || '').trim(), // source speaker (HUB FIX per-character namespacing)
             );
             const n = result?.updates?.length || 0;
             factsAdded += n;

@@ -1208,9 +1208,13 @@ async function runMemoryExtraction() {
 
         const agent3ProfileId = getAgent3ProfileId(settings);
         const agent3Start = Date.now();
+        // HUB FIX (per-character namespacing): pass the target message's AUTHOR name so the Scribe's
+        // generic `char`/`{{char}}` facts resolve to the REAL speaking character — correct for group
+        // chats / NPC-vs-main-char where ST sets `targetMessage.name` to the speaking member.
+        const sourceSpeakerName = String(targetMessage.name || '').trim();
         memoryResult = await runMemoryUpdater(
             targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId,
-            !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex,
+            !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex, sourceSpeakerName,
         ).catch(err => ({ updates: [], summary: '', raw: '', error: err.message, tokensIn: 0, tokensOut: 0 }));
         postStageMs.agent3Ms = Date.now() - agent3Start; // observability: Scribe LLM call wall-clock
 

@@ -263,9 +263,13 @@ Only SKIP when something is purely hypothetical, [OOC:], reported/historical spe
  *   `@src:user` are attributed here instead of messageIndex (FIX #3 off-by-one).
  *   When null, falls back to messageIndex so single-message (icon/backfill) runs
  *   index identically to the live pipeline.
+ * @param {string} sourceSpeakerName - The DISPLAY NAME of the target message's author
+ *   (group-member name in group chats; the active character otherwise). Used by the HUB FIX
+ *   to resolve a CHAR-sourced fact's generic `char`/`{{char}}` subject + key prefix to the REAL
+ *   speaking character's name. Empty → falls back to the active character name.
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null) {
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null, sourceSpeakerName = '') {
     // SCOPED DEDUP CONTEXT (scaling fix). Instead of dumping EVERY active fact into the Scribe
     // prompt (impossible on a huge store), fetch only the SCOPED candidates that could be
     // duplicates/relevant for THIS message — by the subjects + keyword tokens in play — via the
@@ -310,7 +314,16 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
         const tokensIn = await host.getTokenCount(systemPrompt + '\n' + userPrompt);
         const tokensOut = await host.getTokenCount(resultStr);
 
-        const parsed = parseMemoryUpdateResult(resultStr, messageIndex, userMsgIndex);
+        // HUB FIX: resolve the Scribe's generic char/user placeholders to REAL names on the PARSED
+        // output. Prefer the SOURCE SPEAKER of the message being extracted: a USER message → the
+        // persona name; a CHAR/group-member message → that author's name (sourceSpeakerName, e.g.
+        // the speaking group member), falling back to the active character name. The user name
+        // always resolves to the persona.
+        const charName = (!isUserMessage && String(sourceSpeakerName || '').trim())
+            ? String(sourceSpeakerName).trim()
+            : String(host.getCurrentCharacterName() || '').trim();
+        const userName = String(host.getUserPersonaName() || '').trim();
+        const parsed = parseMemoryUpdateResult(resultStr, messageIndex, userMsgIndex, { charName, userName });
 
         // Apply updates to databases. applyUpdates annotates each update with a
         // .status (NEW/UPDATED/SKIPPED) + .changed boolean and returns the subset
@@ -392,7 +405,14 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
 
     // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
     const substitute = host.getSubstituteParams();
-    const systemPrompt = substitute(sysPrompt);
+    // CACHE-STABILITY (slowness fix): keep the SYSTEM prompt byte-stable across chats/characters
+    // so the host's server-side prompt cache can reuse the big static rulebook prefix. We
+    // deliberately do NOT run substitute() here — the {{char}}/{{user}} macros stay LITERAL in
+    // the system message (the real names are still resolved in the USER message data block below,
+    // and on the Scribe's PARSED OUTPUT at apply time). Baking per-character names into the system
+    // prefix made systemPromptStable=false and defeated caching (the documented invariant in
+    // llm-call.js: never interleave variable data into the static system prefix).
+    const systemPrompt = sysPrompt;
 
     // User message: data to analyze
     const dataParts = [];
@@ -465,8 +485,12 @@ function summarizeScopedFacts(scopedFacts) {
  * @param {string} response
  * @param {number} messageIndex - CHAR message index (default attribution)
  * @param {number|null} userMsgIndex - USER message index; facts tagged @src:user map here
+ * @param {{charName?:string, userName?:string}} [names] - resolved REAL names used to rewrite a
+ *   fact's generic `char`/`user`/`{{char}}`/`{{user}}` subject + key prefix to the actual
+ *   character / user-persona name (HUB FIX — per-character namespacing). `charName` prefers the
+ *   SOURCE SPEAKER of the message being extracted (group-member author) when known.
  */
-function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
+function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, names = {}) {
     const result = {
         updates: [],
         summary: '',
@@ -832,6 +856,25 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         // deterministically from the key prefix so the field is always present downstream.
         let resolvedSubject = subject || deriveSubjectFromKey(key);
 
+        // HUB FIX (per-character namespacing): resolve a GENERIC `char`/`user`/`{{char}}`/`{{user}}`
+        // subject AND key prefix to the REAL character / user-persona name. The Scribe's output is
+        // never run through substituteParams, so without this an untagged `+ People/char_* = ...`
+        // line would store subject "char" and a generic `char_*` key that collides across
+        // characters. We run it BEFORE the place-filing / NPC-drawer logic so those operate on the
+        // resolved name. The resolved name is also written back into `key` so the stored key is
+        // per-character (`<name>_physical_state`). A key that already starts with a real name is
+        // left untouched (no double-prefix). Place facts are NOT char/user-keyed, so this is a no-op
+        // for them (the place-filing rule below still runs on the unchanged place key).
+        {
+            const tmp = { subject: resolvedSubject, key };
+            resolveGenericNames(tmp, names);
+            resolvedSubject = tmp.subject;
+            key = tmp.key;
+            // The `update` object literal above captured the ORIGINAL `key` by shorthand; propagate
+            // the (possibly) rewritten per-character key onto it.
+            update.key = key;
+        }
+
         // PLACE-FILING FIX (scope feature): for a place fact, the SUBJECT must be the PLACE,
         // not the owning character. When the writer didn't give an explicit `subj:`, take the
         // SECOND key token (`<NAME>_<PLACE>...` -> `<PLACE>`) so the location is recallable
@@ -1022,6 +1065,115 @@ function deriveSubjectFromKey(key) {
     if (!k) return '';
     const us = k.indexOf('_');
     return us > 0 ? k.slice(0, us) : k;
+}
+
+// ── HUB FIX: resolve the GENERIC {{char}}/{{user}} placeholders to REAL names ──────────────
+// The Scribe emits facts with a LITERAL generic prefix (`char_*`, `user_*`) and often a literal
+// `subj:{{char}}` / `subj:char`. Because the Scribe's OUTPUT is never run through substituteParams
+// (only the prompt examples are), an untagged fact would otherwise store subject = the literal
+// string "char" and keep a generic `char_*` key — so (a) facts aren't tied to the real character,
+// (b) the focus filter drops the in-focus character's own facts (real name vs subject "char"), and
+// (c) CRITICAL: two characters share one `char_*` key namespace and overwrite each other in place.
+// We resolve these placeholders to the real character/user name on the PARSED output (subject AND
+// key prefix), so every stored fact is per-character namespaced and can never collide.
+
+// The reserved generic tokens that mean "the character" / "the user" rather than a proper name.
+const RESERVED_CHAR_TOKENS = new Set(['char', '{{char}}', 'char_name', 'character']);
+const RESERVED_USER_TOKENS = new Set(['user', '{{user}}', 'user_name', 'persona']);
+
+/**
+ * Normalize a name to a SAFE snake_case key token (lowercase alnum/underscore). Mirrors the
+ * key cleanup the parser applies to the raw key. Returns '' when nothing usable remains.
+ * @param {string} name
+ * @returns {string}
+ */
+function nameToKeyToken(name) {
+    return String(name || '').trim().replace(/\s+/g, '_').replace(/[^a-zA-Z0-9_]/g, '').toLowerCase();
+}
+
+/**
+ * Is `token` one of the reserved generic placeholders for the CHARACTER?
+ * Matches the literal word `char`, the unresolved macro `{{char}}`, and a couple of close
+ * variants. Case-insensitive. (`user` variants are handled by isReservedUserToken.)
+ * @param {string} token
+ * @returns {boolean}
+ */
+function isReservedCharToken(token) {
+    return RESERVED_CHAR_TOKENS.has(String(token || '').trim().toLowerCase());
+}
+
+/** Is `token` one of the reserved generic placeholders for the USER persona? */
+function isReservedUserToken(token) {
+    return RESERVED_USER_TOKENS.has(String(token || '').trim().toLowerCase());
+}
+
+/**
+ * Resolve a fact's generic `char`/`user`/`{{char}}`/`{{user}}` subject + key prefix to the REAL
+ * character / user-persona name, so facts are per-character namespaced and can never collide
+ * across characters. Operates on the PARSED output (the Scribe's LLM reply is never run through
+ * substituteParams), catching BOTH the tagged (`subj:{{char}}`) and untagged (bare `char_*` key)
+ * cases. Idempotent and conservative:
+ *   - Only the reserved generic prefix is rewritten — a key that already starts with a real name
+ *     (`fiona_*`) is left untouched (no double-prefix, no rename).
+ *   - The same resolved name is applied to BOTH the stored subject AND the key prefix.
+ *   - The source SPEAKER of the message being extracted is preferred when known (a USER message →
+ *     the persona name; a CHAR/group-member message → that author's name), falling back to the
+ *     active character / persona names.
+ *
+ * @param {{subject:string, key:string}} update - the parsed fact (mutated in place)
+ * @param {{charName:string, userName:string}} names - resolved real names
+ * @returns {void}
+ */
+function resolveGenericNames(update, names) {
+    const charName = String(names?.charName || '').trim();
+    const userName = String(names?.userName || '').trim();
+
+    // 1) SUBJECT: if it reads as a reserved generic, swap to the real name.
+    const subj = String(update.subject || '').trim();
+    let resolvedRole = null; // 'char' | 'user' | null
+    if (isReservedCharToken(subj)) { resolvedRole = 'char'; }
+    else if (isReservedUserToken(subj)) { resolvedRole = 'user'; }
+
+    // 2) KEY PREFIX: the generic `char_*` / `user_*` namespace. Resolve EVEN when the subject was
+    //    an explicit real name but the key kept the generic prefix (belt-and-suspenders), and infer
+    //    the role from the key prefix when the subject was absent/generic.
+    const key = String(update.key || '').trim().toLowerCase();
+    const firstTok = key.indexOf('_') > 0 ? key.slice(0, key.indexOf('_')) : key;
+    let keyRole = null;
+    if (isReservedCharToken(firstTok)) keyRole = 'char';
+    else if (isReservedUserToken(firstTok)) keyRole = 'user';
+    if (!resolvedRole && keyRole) resolvedRole = keyRole;
+
+    if (!resolvedRole) return; // nothing generic to resolve — leave real-name facts untouched
+
+    const realName = resolvedRole === 'user' ? userName : charName;
+    const realToken = nameToKeyToken(realName);
+    // No usable real name (unnamed character / missing persona): leave the fact as-is rather than
+    // mint an empty prefix. The defensive deriveSubject in database.js still avoids storing the
+    // bare literal "char"/"user" as a subject downstream.
+    if (!realName || !realToken) return;
+
+    const beforeSubject = update.subject;
+    const beforeKey = update.key;
+
+    // Apply to subject.
+    update.subject = realName;
+
+    // Apply to the key prefix: rewrite ONLY the leading generic token, preserving the rest of the
+    // key (`char_physical_state` → `<name>_physical_state`). A key with no generic prefix is left
+    // alone (so an already-real-name key like `fiona_*` is never double-prefixed/renamed).
+    if (keyRole) {
+        const us = key.indexOf('_');
+        const tail = us > 0 ? key.slice(us + 1) : '';
+        update.key = tail ? `${realToken}_${tail}` : realToken;
+    }
+
+    if (beforeSubject !== update.subject || beforeKey !== update.key) {
+        addDebugLog('debug', `Resolved generic ${resolvedRole} → "${realName}": ${beforeKey} (subj:${beforeSubject || '∅'}) → ${update.key} (subj:${update.subject})`, {
+            subsystem: 'agent3', event: 'fact.subject_resolved', reason: resolvedRole === 'user' ? 'GENERIC_USER' : 'GENERIC_CHAR',
+            data: { role: resolvedRole, name: realName, beforeKey, afterKey: update.key, beforeSubject, afterSubject: update.subject },
+        });
+    }
 }
 
 /**

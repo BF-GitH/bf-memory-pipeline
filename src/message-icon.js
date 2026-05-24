@@ -94,6 +94,8 @@ async function onIconClick(e, mesId) {
             !!msg.is_user,
             userPersona,
             [],
+            null,
+            String(msg.name || '').trim(), // source speaker (HUB FIX per-character namespacing)
         );
         const n = result?.updates?.length || 0;
 

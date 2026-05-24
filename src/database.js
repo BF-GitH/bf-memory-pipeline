@@ -2695,7 +2695,7 @@ function stripSupersededSuffix(key) {
 export function deriveSubject(fact) {
     if (!fact) return '';
     const explicit = String(fact.subject || '').trim().toLowerCase();
-    if (explicit) return explicit;
+    if (explicit) return resolveGenericSubjectToken(explicit);
     const key = String(fact.key || '').trim().toLowerCase();
     if (!key) return '';
     // Place facts: the location owns the fact, not the prefix character. With no explicit
@@ -2706,7 +2706,38 @@ export function deriveSubject(fact) {
         return tokens[0] || '';
     }
     const us = key.indexOf('_');
-    return us > 0 ? key.slice(0, us) : key;
+    const prefix = us > 0 ? key.slice(0, us) : key;
+    return resolveGenericSubjectToken(prefix);
+}
+
+// Reserved generic placeholders the Scribe emits for "the character" / "the user". When a stored
+// fact's subject (explicit or key-derived) is one of these, it is NOT a real subject — resolving
+// it to the active character/user name keeps the focus filter, bySubject index, and parallel-state
+// matcher from collapsing distinct characters under one literal "char"/"user" bucket. This is the
+// DEFENSIVE half of the HUB FIX (the primary resolution happens on the Scribe's parsed output in
+// agent-memory.js); it also repairs LEGACY `char_*`/`user_*` facts already on disk.
+const _RESERVED_CHAR_SUBJECT = new Set(['char', '{{char}}', 'character']);
+const _RESERVED_USER_SUBJECT = new Set(['user', '{{user}}', 'persona']);
+
+/**
+ * Resolve a reserved generic subject token (`char`/`user`/`{{char}}`/`{{user}}`) to the active
+ * character / user-persona name (lowercased, key-safe). A real proper-name subject is returned
+ * unchanged. Never returns the bare literal "char"/"user" when a real name is resolvable — so no
+ * stored fact reads its subject as a generic placeholder downstream. Falls back to the literal
+ * token only when no real name is available (unnamed character), which is still safer than before
+ * because the parser-side resolution already prevents this for new writes.
+ * @param {string} token - a lowercased subject token
+ * @returns {string}
+ */
+function resolveGenericSubjectToken(token) {
+    const t = String(token || '').trim().toLowerCase();
+    if (!t) return '';
+    let real = '';
+    try {
+        if (_RESERVED_CHAR_SUBJECT.has(t)) real = String(host.getCurrentCharacterName() || '').trim();
+        else if (_RESERVED_USER_SUBJECT.has(t)) real = String(host.getUserPersonaName() || '').trim();
+    } catch { /* host unavailable — fall through to the literal token */ }
+    return real ? real.toLowerCase() : t;
 }
 
 /**
@@ -2722,20 +2753,43 @@ export function deriveSubject(fact) {
  * @param {FactSchema} fact
  * @returns {string}
  */
-function factAspect(fact) {
+// ALLOWLIST of trailing tokens that are pure VERSION/TENSE qualifiers — a "variant of the same
+// thing", safe to collapse onto the base facet (`clothing_current`/`clothing_change` → `clothing`).
+// We ONLY ever drop a trailing token when it is one of these. The previous blanket "drop the last
+// token whenever there's >1" rule discarded the DISTINGUISHING token of compound facets
+// (`physical_location` vs `physical_state`, `interaction` vs `interaction_style`), causing a
+// location to clobber a physical state. Keeping the full facet otherwise preserves those as
+// distinct slots while still merging genuine temporal variants.
+const FACET_VERSION_QUALIFIERS = new Set([
+    'current', 'latest', 'now', 'change', 'changed', 'update', 'updated', 'new', 'state', 'status', 'prev', 'previous',
+]);
+
+/**
+ * Strip a leading subject prefix from a key and return the remaining facet tokens (lowercased,
+ * separator-split, empties removed). Returns null when the key is just the subject (no facet).
+ * @param {FactSchema} fact
+ * @returns {string[]|null}
+ */
+function facetTokensOf(fact) {
     const key = String(fact?.key || '').trim().toLowerCase();
-    if (!key) return '';
+    if (!key) return null;
     const subject = deriveSubject(fact);
-    // Strip a leading "subject_" prefix from the key when the subject came from the key.
     let rest = key;
-    if (subject && key === subject) return ''; // key is just the subject — no facet
+    if (subject && key === subject) return null; // key is just the subject — no facet
     if (subject && key.startsWith(subject + '_')) rest = key.slice(subject.length + 1);
     const tokens = rest.split('_').filter(Boolean);
-    if (tokens.length === 0) return '';
-    // Drop the trailing qualifier token when there's more than one facet token, so
-    // `clothing_change`/`clothing_current` collapse to `clothing` but a single-token
-    // facet (`clothing`) is preserved as-is.
-    const facetTokens = tokens.length > 1 ? tokens.slice(0, -1) : tokens;
+    return tokens.length ? tokens : null;
+}
+
+function factAspect(fact) {
+    const tokens = facetTokensOf(fact);
+    if (!tokens) return '';
+    // Drop the trailing token ONLY when it is a recognized version/tense qualifier, so
+    // `clothing_current`/`clothing_change` collapse to `clothing` but the DISTINGUISHING trailing
+    // token of a compound facet is KEPT (`physical_location` ≠ `physical_state`,
+    // `interaction` ≠ `interaction_style`). A single-token facet is always preserved as-is.
+    const last = tokens[tokens.length - 1];
+    const facetTokens = (tokens.length > 1 && FACET_VERSION_QUALIFIERS.has(last)) ? tokens.slice(0, -1) : tokens;
     return facetTokens.join('');
 }
 
@@ -2747,14 +2801,8 @@ function factAspect(fact) {
  * @returns {string}
  */
 function leadingFacetToken(fact) {
-    const key = String(fact?.key || '').trim().toLowerCase();
-    if (!key) return '';
-    const subject = deriveSubject(fact);
-    let rest = key;
-    if (subject && key === subject) return '';
-    if (subject && key.startsWith(subject + '_')) rest = key.slice(subject.length + 1);
-    const tokens = rest.split('_').filter(Boolean);
-    return tokens[0] || '';
+    const tokens = facetTokensOf(fact);
+    return tokens ? (tokens[0] || '') : '';
 }
 
 /**
@@ -2764,12 +2812,18 @@ function leadingFacetToken(fact) {
  * Conservative gate — ALL must hold:
  *   - both incoming and candidate resolve to a non-empty, EQUAL subject,
  *   - both share the same leading facet token (so `clothing*` only merges with `clothing*`),
+ *   - both resolve to the SAME full aspect (`physical_location` ≠ `physical_state` — the
+ *     allowlist-aware factAspect keeps the distinguishing token),
+ *   - NEITHER key carries a trailing `_<int>` enumeration suffix (`_1`/`_2`/`_3` are the Scribe's
+ *     DISTINCTNESS signal for separate co-existing items — never collapse them),
  *   - the candidate is a CURRENT `state` fact (durable traits/events are never collapsed),
  *   - the incoming write is itself a state (or untyped — see caller; untyped is excluded),
  *   - neither is a sequence/track fact (handled separately, append-only),
  *   - the candidate is not the exact-key match already found.
  * Returns the matched index or -1. Reuses the supersession path so the old value is kept
- * as inactive history rather than silently overwritten.
+ * as inactive history rather than silently overwritten. Genuine SAME-slot state evolution (same
+ * key, e.g. standing→sitting) still supersedes via the exact-key path; this only catches
+ * parallel-key near-dups of the SAME aspect.
  * @param {DatabaseSchema} db
  * @param {FactSchema} incoming
  * @param {number} excludeIdx - index already matched by exact/normalized key (skip it)
@@ -2778,6 +2832,9 @@ function leadingFacetToken(fact) {
 function findParallelStateKey(db, incoming, excludeIdx) {
     if (!db || !Array.isArray(db.facts)) return -1;
     if (isSequenceFact(incoming)) return -1;
+    // Numbered enumeration keys (`..._1`, `..._2`) are DISTINCT items by the Scribe's own idiom —
+    // never parallel-collapse them onto a same-aspect neighbor.
+    if (hasNumericTail(incoming.key)) return -1;
     const incSubject = deriveSubject(incoming);
     if (!incSubject) return -1;
     const incLead = leadingFacetToken(incoming);
@@ -2789,6 +2846,7 @@ function findParallelStateKey(db, incoming, excludeIdx) {
         const f = db.facts[i];
         if (isSequenceFact(f)) continue;
         if (f.active === false) continue;            // never reconcile onto history snapshots
+        if (hasNumericTail(f.key)) continue;         // distinct enumerated item — keep separate
         if (normalizeKind(f.kind) !== 'state') continue; // only changeable state collapses
         if (deriveSubject(f) !== incSubject) continue;
         if (leadingFacetToken(f) !== incLead) continue;
@@ -2796,6 +2854,17 @@ function findParallelStateKey(db, incoming, excludeIdx) {
         return i;
     }
     return -1;
+}
+
+/**
+ * True when a key ends in a `_<int>` enumeration suffix (`char_clothing_condition_2`). Such a
+ * suffix is the Scribe's explicit DISTINCTNESS signal for separate co-existing items, so these
+ * keys are excluded from the parallel-state collapse (they must NOT supersede each other).
+ * @param {string} key
+ * @returns {boolean}
+ */
+function hasNumericTail(key) {
+    return /_\d+$/.test(String(key || '').trim().toLowerCase());
 }
 
 /**
@@ -3079,18 +3148,24 @@ export function findFactMatch(db, key) {
 
 /**
  * Normalize a fact key for conservative reconcile-on-write matching.
- * Strips trailing numeric/ordinal suffixes, separators, and a trailing plural 's'
- * so cosmetic variants of the SAME property collapse to one canonical form while
- * genuinely different properties stay distinct. Returns '' for empty input.
- *   demeanor / demeanor_1 / demeanor2 -> "demeanor"
+ * Strips separators and a trailing plural 's' so cosmetic variants of the SAME property collapse
+ * to one canonical form while genuinely different properties stay distinct. Returns '' for empty
+ * input.
  *   hair_color / haircolor            -> "haircolor"
  *   trait / traits                    -> "trait"
+ *
+ * NOTE — numeric suffixes are NO LONGER stripped (corruption fix). `_1`/`_2`/`_3` are the Scribe's
+ * INTENTIONAL idiom for DISTINCT enumerated items (its own examples mint `possession_1`,
+ * `clothing_condition_1`/`_2`, `location_1`/`_2`/`_3`). The old `\d+$`-strip collapsed
+ * `clothing_condition_1` and `_2` to one key, so the second item SUPERSEDED (effectively lost) the
+ * first. Keeping the number distinct preserves both. True same-slot state evolution is still
+ * handled by (a) the exact-key path, (b) the parallel-state matcher (same subject + aspect), and
+ * (c) the explicit `~` supersession marker — none of which rely on digit-stripping.
  */
 function normalizeFactKey(key) {
     let k = String(key || '').toLowerCase().trim();
     if (!k) return '';
-    k = k.replace(/[_\-\s]*\d+$/, '');   // drop trailing numeric suffix (_1, 2, -3)
-    k = k.replace(/[_\-\s]+/g, '');      // drop all separators
+    k = k.replace(/[_\-\s]+/g, '');      // drop all separators (keep any trailing digits distinct)
     if (k.length > 3 && k.endsWith('s')) k = k.slice(0, -1); // crude singularize
     return k;
 }
