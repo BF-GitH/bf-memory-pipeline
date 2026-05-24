@@ -144,39 +144,233 @@ export function normalizeTone(v) {
 // LAYER 1 — canonical category set (menu order; Unsorted always last as the catch-all).
 export const L1_CATEGORIES = ['People', 'Places', 'Things', 'Relationships', 'Events', 'World', 'Unsorted'];
 
-// LAYER 2 — fixed aspect vocab PER category (granular, generic, character-agnostic). Each
-// label is a SCENE-TRIGGER drawer: narrow enough that it's plainly irrelevant most turns, so
-// when the planner "opens" one it's a real signal (vs. the old broad always-true buckets like
-// `identity`/`appearance` the planner opened every turn). The note-taker (Agent 3) PICKS the
-// MOST SPECIFIC matching label from this fixed list; an out-of-vocab value snaps to the
-// category default (see normalizeAspect). The FIRST entry of each list is the safest coarse
-// fallback (see DEFAULT_ASPECT). Relationships stay ABSTRACT/topical (NOT character-keyed) —
-// the who↔who is carried by the `subj:`/`with:@<name>` pair-tag (Layer 3), never a label.
-// ~90 labels total. People holds ~half the granularity (RP memory is mostly about people).
+// LAYER 2 — fixed aspect vocab PER category, now a 3-LEVEL NESTED TREE (granular, generic,
+// character-agnostic). Each Layer-1 category maps to an OBJECT keyed by SUB-AREA (the new
+// middle navigation tier, a.k.a. "facet group") whose value is an array of LEAF aspects.
+//
+//   Category (L1, 7 fixed)  ▸  Sub-area (L1.5, ~70 total, NAVIGATION-ONLY)  ▸  leaf (L2, ~1000)
+//
+// The SUB-AREA is a grouping/drill device ONLY: it is NOT stored on a fact and is NOT a new
+// menu axis — facts still carry just `category` + `aspect` (a leaf string). The LEAF is what
+// gets written to `fact.aspect`, exactly as before; `flatVocab(cat)` (Object.values().flat())
+// reproduces the old FLAT per-category array so every existing consumer (aspectVocabFor,
+// normalizeAspect, summarizeMenu, deriveAspect, the Database tab) is UNCHANGED — they still see
+// a flat per-category vocab, just a much larger one.
+//
+// Each leaf is a SCENE-TRIGGER drawer: narrow enough that it's plainly irrelevant most turns, so
+// when the planner "opens" one it's a real signal. The note-taker (Agent 3) DRILLS the tree
+// (category ▸ sub-area ▸ leaf) and PICKS the MOST SPECIFIC leaf; an out-of-vocab value snaps to
+// the category default (see normalizeAspect). The FIRST leaf of each category's FIRST sub-area is
+// the safest coarse fallback, kept explicit per category in DEFAULT_ASPECT. Relationships stay
+// ABSTRACT/topical (NOT character-keyed) — the who↔who is carried by the `subj:`/`with:@<name>`
+// pair-tag (Layer 3), never a leaf.
+//
+// BACK-COMPAT: this set is a strict SUPERSET of the pre-expansion ~90 flat leaves — every old
+// leaf survives as a leaf here (so stored facts keep resolving), and renamed/synonym concepts
+// route via the synonym map (LEGACY_ASPECT_MAP, below). Leaf names are snake_case, one canonical
+// name per concept (synonyms live in the map, never as parallel leaves). ~1000 leaves / ~70
+// sub-areas total; People deliberately holds ~⅓ (RP memory is mostly about people). The former
+// `Time` category folds in as World sub-areas (Calendar/Clock/Schedule/Cycles/Reckoning) so the
+// 7 fixed L1 categories are unchanged.
 export const TAXONOMY = {
-    People: [
-        // current state / who they are
-        'status', 'identity', 'origin', 'career', 'finances', 'reputation', 'allegiance',
-        // body & look
-        'appearance', 'body_marks', 'wardrobe', 'current_clothing', 'speech_style', 'health', 'injuries',
-        // inner life
-        'mood', 'beliefs', 'values', 'morals', 'fears', 'desires', 'sexuality',
-        'current_goal', 'ambitions',
-        // how they act
-        'habits', 'vices', 'secrets',
-        // capabilities
-        'skills', 'knowledge',
-        // past & circumstance
-        'childhood', 'family_origin', 'upbringing', 'education', 'trauma',
-        // daily circumstance
-        'home', 'daily_routine', 'current_location', 'carried_items',
-    ],
-    Places:        ['feature', 'function', 'atmosphere', 'access', 'inhabitants', 'condition', 'geography', 'significance'],
-    Things:        ['object', 'key_item', 'weapon', 'substance', 'tech', 'properties', 'ownership', 'currency'],
-    Relationships: ['history', 'family_ties', 'friendship', 'romance', 'attraction', 'rivalry', 'tension', 'trust', 'debt', 'alliance', 'power_dynamic'],
-    Events:        ['scene', 'milestone', 'action', 'conflict', 'agreement', 'revelation', 'change', 'plan'],
-    World:         ['lore', 'rule', 'faction', 'culture', 'politics', 'economy', 'history', 'geography', 'time'],
-    Unsorted:      ['misc'],
+    People: {
+        // ── current state / who they are ──────────────────────────────────────────────
+        'Identity': [
+            'status', 'identity', 'name', 'aliases', 'age', 'birthdate', 'species', 'gender',
+            'pronouns', 'ethnicity', 'nationality', 'titles', 'legal_status', 'naming_origin',
+            'identity_secret', 'self_concept', 'public_persona', 'private_persona', 'caste',
+            'birth_name', 'middle_name', 'surname', 'epithet', 'codename', 'true_name',
+            'apparent_age', 'maturity', 'citizenship', 'documentation',
+        ],
+        'Origin & Past': [
+            'origin', 'childhood', 'birthplace', 'family_origin', 'upbringing', 'education',
+            'formative_event', 'trauma', 'lost_home', 'prior_career', 'coming_of_age',
+            'first_love', 'worst_day', 'ancestry', 'bloodline', 'lineage', 'inherited_status',
+            'defining_loss', 'lineage_secret', 'hometown', 'social_origin', 'mentor_past',
+            'apprenticeship', 'military_service', 'past_residence', 'early_hardship',
+            'turning_point_past', 'past_alias',
+        ],
+        // ── body & look ───────────────────────────────────────────────────────────────
+        'Body': [
+            'appearance', 'height', 'build', 'weight', 'skin', 'hair', 'eyes', 'face', 'hands',
+            'posture', 'gait', 'voice', 'voice_timbre', 'scent', 'complexion',
+            'distinguishing_feature', 'physiology_quirk', 'nonhuman_traits',
+            'hair_color', 'eye_color', 'skin_tone', 'figure', 'musculature', 'frame',
+            'facial_hair', 'teeth', 'nails', 'feet', 'fingers', 'physical_age_signs',
+            'handedness',
+        ],
+        'Marks & Modifications': [
+            'body_marks', 'scars', 'tattoos', 'birthmarks', 'piercings', 'brands', 'prosthetics',
+            'cybernetics', 'ritual_marks', 'disfigurement', 'freckles', 'moles', 'bruises',
+            'calluses', 'implants', 'augmentations',
+        ],
+        'Appearance Style': [
+            'wardrobe', 'current_clothing', 'grooming', 'jewelry', 'makeup', 'fragrance',
+            'signature_look', 'uniform', 'armor_worn', 'accessories', 'disguise', 'state_of_dress',
+            'footwear', 'headwear', 'hairstyle', 'color_palette', 'cleanliness_personal',
+            'fashion_sense', 'worn_items',
+        ],
+        'Health': [
+            'health', 'injuries', 'illness', 'chronic_condition', 'allergies', 'disability',
+            'addiction_physical', 'fitness', 'fertility', 'pregnancy', 'medication',
+            'mental_health', 'sleep_quality', 'pain', 'fatigue', 'recovery',
+            'diagnosis', 'symptom', 'immunity', 'vision', 'hearing', 'metabolism',
+            'physical_limit', 'scarring_internal', 'convalescence',
+        ],
+        // ── inner life ──────────────────────────────────────────────────────────────
+        'Mind & Personality': [
+            'mood', 'temperament', 'demeanor', 'intelligence_style', 'humor', 'patience',
+            'confidence', 'neuroticism', 'openness', 'optimism', 'quirks', 'core_trait', 'flaw',
+            'virtue', 'temper', 'introversion_extroversion', 'stress_response',
+            'disposition', 'self_esteem', 'empathy', 'wit', 'curiosity', 'discipline',
+            'impulsiveness', 'pessimism', 'attitude', 'demeanor_under_pressure',
+        ],
+        'Beliefs & Values': [
+            'beliefs', 'values', 'morals', 'religion', 'ideology', 'superstitions',
+            'code_of_honor', 'taboos', 'political_view', 'loyalty_object', 'worldview',
+            'sacred_values', 'principle', 'conviction', 'prejudice', 'faith_personal',
+            'moral_line', 'philosophy', 'stance',
+        ],
+        'Drives': [
+            'desires', 'ambitions', 'current_goal', 'motivation', 'dreams', 'regrets', 'guilt',
+            'shame', 'pride', 'what_they_protect', 'unmet_need', 'temptation', 'guilty_pleasure',
+            'aspiration', 'long_term_goal', 'short_term_goal', 'hope', 'wish', 'craving',
+            'driving_question', 'purpose_personal',
+        ],
+        'Fears & Wounds': [
+            'fears', 'insecurities', 'emotional_wound', 'triggers', 'grief', 'anxieties',
+            'dread_object', 'existential_fear', 'social_fear', 'nightmare', 'sore_spot',
+            'vulnerability', 'past_hurt', 'unresolved_pain', 'doubt',
+        ],
+        'Sexuality': [
+            'sexuality', 'orientation', 'attractions', 'turn_ons', 'turn_offs', 'kinks',
+            'boundaries', 'experience_level', 'libido', 'romantic_style', 'intimacy_style',
+            'attraction_pattern', 'consent_style', 'fantasy', 'inhibition', 'comfort_zone',
+        ],
+        // ── how they act ──────────────────────────────────────────────────────────────
+        'Behavior': [
+            'habits', 'tells', 'mannerisms', 'speech_style', 'catchphrases', 'rituals',
+            'coping_mechanism', 'social_mask', 'body_language', 'compulsion',
+            'nervous_tell', 'gesture_habit', 'verbal_tic', 'idiosyncrasy', 'reaction_pattern',
+            'social_behavior', 'eating_habit', 'sleep_habit',
+        ],
+        'Vices & Struggles': [
+            'vices', 'drinking', 'smoking', 'addiction_behavioral', 'bad_habit',
+            'self_destructive_pattern', 'gambling', 'indulgence', 'weakness_personal',
+            'guilty_habit', 'dependency_personal',
+        ],
+        'Secrets': [
+            'secrets', 'hidden_agenda', 'lies_told', 'double_life', 'concealed_identity',
+            'buried_past', 'guilty_knowledge', 'cover_story', 'blackmail_material',
+            'secret_shame', 'undisclosed_motive', 'kept_promise', 'withheld_truth',
+        ],
+        // ── capabilities ──────────────────────────────────────────────────────────────
+        'Capabilities': [
+            'skills', 'talents', 'languages', 'combat_skill', 'magic_ability', 'profession_skill',
+            'tech_skill', 'social_skill', 'craft', 'weakness', 'limitation', 'training',
+            'incompetence', 'specialty', 'signature_move', 'proficiency', 'instinct',
+            'physical_ability', 'mental_ability', 'survival_skill', 'artistic_skill',
+        ],
+        'Knowledge': [
+            'knowledge', 'field_of_expertise', 'secret_knowledge', 'forbidden_knowledge', 'trivia',
+            'street_smarts', 'lore_known', 'expertise', 'education_subject', 'rumor_known',
+            'information_held', 'witnessed_event',
+        ],
+        // ── standing & means ────────────────────────────────────────────────────────
+        'Status & Standing': [
+            'reputation', 'social_class', 'rank', 'wealth_level', 'fame', 'infamy',
+            'criminal_record', 'honors', 'notoriety', 'public_opinion', 'standing', 'prestige',
+            'disgrace', 'legacy', 'influence',
+        ],
+        'Resources': [
+            'finances', 'income', 'debts', 'property_owned', 'assets', 'possessions_notable',
+            'dependents', 'employer', 'patron', 'savings', 'inheritance', 'liabilities',
+            'business_owned', 'sponsor',
+        ],
+        'Affiliation': [
+            'allegiance', 'membership', 'oath_sworn', 'rank_in_group', 'defected_from',
+            'loyalty_target', 'faction_membership', 'sworn_enemy', 'sworn_ally', 'patronage',
+            'guild_membership',
+        ],
+        // ── daily life ────────────────────────────────────────────────────────────────
+        'Daily Life': [
+            'career', 'vocation', 'daily_routine', 'home', 'current_location',
+            'residence_type', 'transport', 'carried_items', 'pets', 'schedule', 'hobbies', 'diet',
+            'current_activity', 'workplace', 'commute', 'errands', 'leisure', 'companions_present',
+        ],
+    },
+    Places: {
+        'Identity': ['place_type', 'place_name', 'owner', 'founding', 'place_naming_origin', 'place_aliases', 'place_status'],
+        'Layout': ['feature', 'rooms', 'entrances', 'architecture', 'scale', 'layout_secret', 'hidden_area', 'decor', 'furnishings', 'floor_plan', 'levels', 'exits', 'notable_object_in_place'],
+        'Function': ['function', 'purpose', 'services', 'capacity', 'current_use', 'former_use', 'amenities', 'operating_hours'],
+        'Atmosphere': ['atmosphere', 'lighting', 'sounds', 'smells', 'mood_of_place', 'cleanliness', 'temperature', 'ambiance', 'vibe'],
+        'Access & Security': ['access', 'defenses', 'guards', 'locks', 'hazards', 'hidden_entrance', 'restrictions', 'surveillance', 'entry', 'wards', 'traps', 'patrols'],
+        'Inhabitants': ['inhabitants', 'population', 'factions_present', 'notable_resident', 'wildlife', 'staff', 'regulars', 'crowd', 'ruler_of_place'],
+        'Condition': ['condition', 'damage', 'age_of_place', 'upkeep', 'ruin_state', 'abandonment', 'under_construction', 'contamination'],
+        'Environment': ['geography', 'climate', 'terrain', 'resources_local', 'flora', 'fauna', 'weather', 'natural_feature', 'water_source'],
+        'Significance': ['significance', 'history_of_place', 'events_here', 'sacred_status', 'strategic_value', 'reputation_of_place', 'sentimental_value', 'legend_of_place'],
+        'Position': ['location', 'neighbors', 'region', 'distance', 'travel_routes', 'jurisdiction', 'borders_place', 'accessibility', 'isolation'],
+    },
+    Things: {
+        'Identity': ['object', 'item_name', 'item_type', 'make', 'origin_of_item', 'model', 'brand', 'item_aliases'],
+        'Key Items': ['key_item', 'plot_object', 'macguffin', 'heirloom', 'gift', 'stolen_item', 'evidence', 'quest_item', 'token', 'keepsake'],
+        'Physical': ['properties', 'material', 'size', 'color', 'appearance_of_item', 'age_of_item', 'weight_of_item', 'shape', 'texture', 'markings_on_item'],
+        'Weapons': ['weapon', 'firearm', 'blade', 'ammunition', 'range', 'weapon_condition', 'armor_item', 'explosive', 'shield', 'damage_type', 'reach'],
+        'Tech & Tools': ['tech', 'gadget', 'vehicle', 'device', 'machine', 'tool', 'software', 'controls', 'instrument', 'apparatus', 'power_source', 'interface'],
+        'Substances': ['substance', 'drug', 'poison', 'medicine', 'food', 'drink', 'fuel', 'reagent', 'potion', 'chemical', 'sample', 'ration'],
+        'Magic & Special': ['enchantment', 'artifact', 'power', 'curse', 'charge_remaining', 'activation', 'special_property', 'relic', 'sigil', 'bound_spirit', 'attunement'],
+        'Function': ['use', 'capability', 'malfunction', 'requirement', 'side_effect', 'operation', 'maintenance', 'compatibility'],
+        'Provenance': ['ownership', 'previous_owner', 'acquisition', 'location_of_item', 'hidden_location', 'claim_disputed', 'maker', 'lost_status'],
+        'Value': ['currency', 'worth', 'rarity', 'market_value', 'sentimental_worth', 'condition_of_item', 'demand', 'legality'],
+        'Documents': ['document', 'letter', 'map', 'record', 'contract', 'book', 'message', 'photograph', 'note', 'ledger', 'inscription', 'recording'],
+    },
+    Relationships: {
+        // ABSTRACT/topical leaves ONLY — who↔who is the subj:/with: pair-tag, never a leaf.
+        'Origin': ['history', 'how_they_met', 'first_impression', 'origin_of_bond', 'turning_point', 'shared_history', 'introduction'],
+        'Family': ['family_ties', 'parent_child', 'siblings', 'marriage', 'kinship', 'guardianship', 'estrangement', 'adoption', 'extended_kin', 'spousal', 'in_laws', 'ancestral_tie'],
+        'Bonds': ['friendship', 'companionship', 'mentorship', 'partnership', 'acquaintance', 'found_family', 'camaraderie', 'fellowship', 'bond_strength'],
+        'Romance': ['romance', 'attraction', 'courtship', 'intimacy', 'commitment', 'exclusivity', 'jealousy', 'heartbreak', 'infidelity', 'unrequited', 'engagement', 'breakup', 'flirtation', 'affair', 'longing'],
+        'Conflict': ['rivalry', 'tension', 'enmity', 'grudge', 'feud', 'betrayal', 'conflict_cause', 'cold_war', 'hostility', 'vendetta', 'falling_out'],
+        'Power': ['power_dynamic', 'dominance', 'dependency', 'control', 'leverage', 'hierarchy', 'servitude', 'authority_over', 'submission', 'influence_over', 'mutual_dependence'],
+        'Trust & Standing': ['trust', 'respect', 'suspicion', 'reputation_between', 'reconciliation', 'distrust', 'contempt', 'affection', 'resentment', 'forgiveness', 'loyalty_felt', 'admiration', 'disappointment'],
+        'Obligation': ['debt', 'favor', 'promise', 'alliance', 'contract_between', 'oath', 'loyalty_between', 'blood_oath', 'duty_owed', 'mutual_aid', 'conspiracy_shared'],
+        'Dynamics': ['communication_style', 'recurring_pattern', 'distance', 'status_of_relationship', 'secret_between', 'last_interaction', 'frequency', 'role_in_pair', 'shared_activity'],
+    },
+    Events: {
+        'Scenes': ['scene', 'encounter', 'conversation', 'action', 'arrival', 'departure', 'gesture', 'meeting', 'outing', 'reunion'],
+        'Milestones': ['milestone', 'first_time', 'achievement', 'loss', 'birth', 'death', 'wedding', 'point_of_no_return', 'escalation', 'graduation', 'promotion', 'coming_of_age_event'],
+        'Conflict': ['conflict', 'fight', 'battle', 'argument', 'chase', 'escape', 'ambush', 'standoff', 'defeat', 'victory', 'resolution', 'duel', 'siege', 'confrontation'],
+        'Agreements': ['agreement', 'deal', 'bargain', 'oath_sworn', 'contract_signed', 'alliance_formed', 'surrender', 'promise_made', 'truce', 'negotiation', 'pact'],
+        'Revelations': ['revelation', 'confession', 'discovery', 'secret_revealed', 'betrayal_revealed', 'truth_told', 'lie_exposed', 'realization', 'unmasking', 'admission'],
+        'Change': ['change', 'transformation', 'decision', 'turning_point', 'status_change', 'relocation', 'departure_event', 'death_event', 'gain', 'reversal', 'awakening'],
+        'Plans': ['plan', 'scheme', 'intention', 'threat_made', 'prediction', 'deadline_set', 'mission', 'goal_set', 'appointment', 'preparation', 'warning'],
+        'Incidents': ['accident', 'crime', 'disaster', 'injury_event', 'rescue', 'theft', 'gift_given', 'mishap', 'sabotage', 'outburst'],
+        'Sequence': ['step', 'journey_leg', 'timeline_beat', 'phase_event', 'episode'],
+    },
+    World: {
+        'Lore': ['lore', 'myth', 'legend', 'prophecy', 'creation_story', 'cosmology', 'ancient_lore', 'world_premise', 'planes', 'origin_of_conflict'],
+        'Rules': ['rule', 'law', 'magic_system', 'physics_rule', 'taboo', 'custom_rule', 'code', 'limitation', 'hard_rule', 'natural_law', 'forbidden_act'],
+        'Factions': ['faction', 'organization', 'guild', 'government_body', 'military', 'cult', 'corporation', 'gang', 'noble_house', 'crime_syndicate', 'order', 'council'],
+        'Culture': ['culture', 'tradition', 'ritual', 'holiday', 'etiquette', 'art', 'cuisine', 'dress_norm', 'language_world', 'festival', 'custom', 'taboo_cultural', 'norm', 'folklore'],
+        'Politics': ['politics', 'ruler', 'regime', 'conflict_world', 'treaty', 'succession', 'diplomacy', 'power_struggle', 'rebellion', 'political_structure', 'faction_conflict', 'alliance_world'],
+        'Economy': ['economy', 'trade', 'currency_world', 'industry', 'resource', 'scarcity', 'market', 'class_system', 'trade_route', 'commodity', 'guild_economy'],
+        'History': ['history', 'war', 'founding_event', 'golden_age', 'fall', 'ancient_event', 'recent_event', 'fallen_empire', 'dynasty', 'cataclysm'],
+        'Geography': ['geography', 'region', 'nation', 'landmark', 'terrain_world', 'climate_world', 'map', 'borders', 'continent', 'settlement', 'wilderness'],
+        'Species & Peoples': ['species', 'race', 'world_bloodline', 'world_ancestry', 'monster', 'creature_type', 'demographics', 'tribe', 'people_group', 'beast'],
+        'Religion': ['deity', 'faith', 'church', 'afterlife', 'sacred_site', 'religious_order', 'heresy', 'pantheon', 'doctrine', 'relic_holy'],
+        'Technology Level': ['tech_level', 'invention', 'infrastructure', 'communication_world', 'transport_world', 'lost_technology', 'forbidden_science', 'innovation', 'energy_source'],
+        'Threats': ['threat_world', 'enemy_force', 'plague', 'prophecy_doom', 'looming_danger', 'hazard_world', 'invasion', 'famine', 'apocalypse'],
+        // ── Time folds in here (former Time category) ─────────────────────────────────
+        'Calendar': ['time', 'date', 'year', 'season', 'month', 'day_of_week', 'era', 'age_of_world', 'historical_timeline'],
+        'Clock': ['time_of_day', 'hour', 'duration', 'elapsed_time', 'moment'],
+        'Schedule': ['deadline', 'recurring_event', 'anniversary', 'curfew', 'shift', 'appointment_time'],
+        'Cycles': ['cycle', 'phase', 'festival_date', 'market_day', 'lunar_phase', 'seasonal_cycle'],
+        'Reckoning': ['timekeeping_system', 'calendar_system', 'time_since', 'countdown', 'epoch'],
+    },
+    Unsorted: {
+        // The always-read escape hatch + a thin triage staging lane (still resolves like any leaf).
+        'Triage': ['misc', 'ambiguous', 'pending_promotion', 'meta_note', 'correction', 'ooc'],
+    },
 };
 
 // Per-category fallback aspect (used when Agent 3 omits/invalid `aspect:`, OR when a pre-redesign
@@ -193,35 +387,99 @@ const DEFAULT_ASPECT = {
     Unsorted: 'misc',
 };
 
-// BACK-COMPAT aspect map (PRE-REDESIGN Layer-2 vocab -> nearest NEW label). Facts stored before
-// the granular-taxonomy redesign carry an old aspect (identity/appearance/body/status/role/
-// background/mood/goals/behavior/skills, plus the old Places/Things/Events/World/Relationships
-// vocab). On READ, deriveAspect routes an old aspect that is NOT in the new vocab to its nearest
-// new label here; anything still unknown falls to the category default. This keeps existing facts
-// retrievable under the new menu without a migration write. Keys are lowercased.
+// SYNONYM / BACK-COMPAT aspect map (raw aspect -> CANONICAL leaf). This is the synonym layer:
+// it routes (a) PRE-REDESIGN Layer-2 vocab that was renamed (`body`->`appearance`, `goals`->
+// `current_goal`, ...) and (b) common SYNONYMS the Scribe/legacy facts may emit for a canonical
+// leaf (`phobias`->`fears`, `tattoo`->`tattoos`, `occupation`->`career`, `lover`->`romance`, ...)
+// onto the single canonical leaf for that concept. One canonical leaf per concept — synonyms live
+// HERE, never as parallel leaves in TAXONOMY.
+//
+// On READ, normalizeAspect: exact-leaf hit returns as-is; ELSE a synonym/legacy entry whose mapped
+// target is a VALID leaf for THIS category resolves to the canonical leaf (logged as
+// `fact.remapped` / LEGACY_ASPECT_REMAP); else the category default. The per-category validity
+// guard means an entry only fires where the canonical target actually exists (no cross-category
+// leakage), so a synonym can be listed once and safely ignored in categories that lack the target.
+// This keeps existing facts retrievable under the new menu without a migration write. Keys are
+// lowercased. Entries whose key is ALSO a valid leaf are inert (the exact-leaf hit wins first) but
+// kept for documentation/intent.
 const LEGACY_ASPECT_MAP = {
-    // People (old 10-aspect set)
+    // ── People: pre-redesign renamed aspects ──────────────────────────────────────────
     identity:   'identity',
     appearance: 'appearance',
     body:       'appearance',   // old `body` (physiology+marks) -> appearance (marks/look)
     background: 'childhood',    // old `background` (origin/past) -> childhood (formative past)
     role:       'career',       // old `role` (job/function) -> career
-    // `status` (People current-state) stays `status` (still in new vocab) — no entry needed.
+    // `status` (People current-state) stays `status` (still a leaf) — exact-leaf hit, no remap.
     mood:       'mood',
     goals:      'current_goal', // old `goals` -> current_goal
+    goal:       'current_goal',
     behavior:   'habits',       // old `behavior` (tells/mannerisms) -> habits
     skills:     'skills',
-    // Places (old: residence/public/region/feature)
+    // ── People: common synonyms -> canonical leaf ─────────────────────────────────────
+    phobias:    'fears',
+    phobia:     'fears',
+    fear:       'fears',
+    afraid_of:  'fears',
+    looks:      'appearance',
+    physical:   'appearance',
+    physique:   'build',
+    tattoo:     'tattoos',
+    scar:       'scars',
+    piercing:   'piercings',
+    occupation: 'career',
+    job:        'career',
+    profession: 'career',
+    clothing:   'current_clothing',
+    clothes:    'current_clothing',
+    outfit:     'current_clothing',
+    money:      'finances',
+    wealth:     'finances',
+    personality:'temperament',
+    trait:      'core_trait',
+    flaws:      'flaw',
+    belief:     'beliefs',
+    value:      'values',
+    motive:     'motivation',
+    desire:     'desires',
+    ambition:   'ambitions',
+    dream:      'dreams',
+    orientation_sexual: 'orientation',
+    kink:       'kinks',
+    habit:      'habits',
+    vice:       'vices',
+    secret:     'secrets',
+    skill:      'skills',
+    talent:     'talents',
+    language:   'languages',
+    residence_place: 'home',     // a person's home (vs Places residence)
+    location:   'current_location', // a PERSON's location -> current_location (Places has own `location`)
+    routine:    'daily_routine',
+    pet:        'pets',
+    hobby:      'hobbies',
+    self_concept_self: 'self_concept',
+    // ── Places (old: residence/public/region/feature) ─────────────────────────────────
     residence:  'function',     // a dwelling -> what the place is for
     public:     'function',
-    region:     'geography',
-    // Things (old: object/key-item/substance) — `key-item` had a hyphen
+    region:     'geography',    // inert when `region` is itself a leaf (exact hit wins); kept for old facts
+    decor_place:'decor',
+    // ── Things (old: object/key-item/substance) — `key-item` had a hyphen ──────────────
     'key-item': 'key_item',
-    // Relationships (old: bond/tension/history) — `tension`/`history` still in new vocab
+    keyitem:    'key_item',
+    item:       'object',
+    gear:       'tool',
+    armor:      'armor_item',
+    food_item:  'food',
+    value_of_item: 'worth',
+    // ── Relationships (old: bond/tension/history) ─────────────────────────────────────
     bond:       'friendship',   // old generic `bond` -> friendship (closest abstract tie)
-    // Events (old: milestone/scene/action) — all three still in new vocab; no entry needed.
-    // World (old: rule/lore/faction/time) — all four still in new vocab; no entry needed.
-    // Unsorted -> misc (still the only label).
+    lover:      'romance',
+    love:       'romance',
+    relationship_status: 'status_of_relationship',
+    // ── Events / World — most old labels are still leaves (exact-leaf hit, no remap) ───
+    // World old `time` stays a leaf (folded into the Calendar sub-area). No entry needed.
+    historical_event: 'history',
+    // ── Unsorted -> misc (still a leaf). ──────────────────────────────────────────────
+    ambiguous_misc: 'misc',
 };
 
 /**
@@ -268,20 +526,36 @@ export function mapLegacyCategory(category, fact) {
 }
 
 /**
- * The fixed Layer-2 aspect vocab for a Layer-1 category (after legacy-mapping the name).
- * Returns Unsorted's vocab for an unknown category so a custom bucket still has a default.
+ * FLATTENER — the bridge from the nested 3-level TAXONOMY (`{ subArea: [leaf, ...] }`) back to
+ * the FLAT per-category leaf array the rest of the system has always consumed. Every consumer
+ * that needs "the list of leaves for this category" (aspectVocabFor, normalizeAspect, the menus,
+ * the Database tab) routes through here, so the nested shape is purely organizational and the
+ * FLAT-per-category contract is preserved with ZERO behavior change. Returns Unsorted's leaves
+ * for an unknown category so a custom bucket still has a default. Pure (the vocab is a constant).
+ * @param {string} category - a Layer-1 category name (legacy names accepted; canon-mapped here)
+ * @returns {string[]} the flat array of leaf aspects under that category, in tree order
+ */
+export function flatVocab(category) {
+    const canon = mapLegacyCategory(category);
+    const node = TAXONOMY[canon] || TAXONOMY.Unsorted;
+    return Object.values(node).flat();
+}
+
+/**
+ * The fixed Layer-2 aspect vocab (FLAT leaf array) for a Layer-1 category (after legacy-mapping
+ * the name). Thin alias over flatVocab kept for back-compat with existing callers (settings.js
+ * Database tab, summarizeMenu*, etc.) — same flat shape as before the 3-level reshape.
  * @param {string} category
  * @returns {string[]}
  */
 export function aspectVocabFor(category) {
-    const canon = mapLegacyCategory(category);
-    return TAXONOMY[canon] || TAXONOMY.Unsorted;
+    return flatVocab(category);
 }
 
-/** The default/fallback aspect for a (legacy-mapped) category. */
+/** The default/fallback aspect for a (legacy-mapped) category (first leaf of flatVocab). */
 export function defaultAspectFor(category) {
     const canon = mapLegacyCategory(category);
-    return DEFAULT_ASPECT[canon] || (TAXONOMY[canon] && TAXONOMY[canon][0]) || 'misc';
+    return DEFAULT_ASPECT[canon] || flatVocab(canon)[0] || 'misc';
 }
 
 /**
@@ -2882,17 +3156,41 @@ export function summarizeMenu(databases) {
 }
 
 /**
- * FULL-vocab view of the taxonomy: every Layer-1 category and ALL its Layer-2 labels, in
- * fixed order, regardless of what's stored. This is the COMPANION to summarizeMenu's
- * non-empty planner tier — used where the FULL fixed list is needed:
- *   (a) Agent 3 (note-taker) — so it files into the SAME fixed vocab consistently, and
- *   (b) the Database UI tab skeleton (so the user sees the whole taxonomy).
- * Pure / no DB needed (the vocab is a code constant). One category per line.
- * Example line: `People: status, identity, origin, ...`.
+ * FULL-vocab view of the taxonomy: every Layer-1 category and ALL its Layer-2 leaf labels, in
+ * fixed order, regardless of what's stored. FLAT (one category per line) for back-compat — the
+ * nested 3-level shape is flattened via flatVocab. COMPANION to summarizeMenu's non-empty planner
+ * tier; used where the FULL FLAT list is needed (the Database UI tab skeleton; any caller wanting
+ * the old single-line-per-category shape). Pure / no DB needed (the vocab is a code constant).
+ * Example line: `People: status, identity, name, ...`.
  * @returns {string} Multi-line full-vocab menu (one category per line). Never empty.
  */
 export function fullTaxonomyMenu() {
-    return L1_CATEGORIES.map(cat => `${cat}: ${(TAXONOMY[cat] || []).join(', ')}`).join('\n');
+    return L1_CATEGORIES.map(cat => `${cat}: ${flatVocab(cat).join(', ')}`).join('\n');
+}
+
+/**
+ * GROUPED (3-level) view of the taxonomy for the SCRIBE drill: every Layer-1 category, its
+ * SUB-AREAS, and each sub-area's leaves, rendered compactly so the note-taker navigates
+ * families→leaves rather than scanning ~1000 flat labels. Replaces fullTaxonomyMenu in the
+ * Scribe prompt (the note-taker picks the MOST SPECIFIC leaf after committing to a category ▸
+ * sub-area, which measurably reduces the "collapse to the coarse default" failure). This is a
+ * ONE-time prompt-size increase — there is NO second/drill LLM call; the whole grouped tree ships
+ * in the single Scribe prompt. The leaf written to `fact.aspect` is still a flat leaf string,
+ * validated by normalizeAspect against flatVocab — the sub-area is navigation only, never stored.
+ * Format (one line per sub-area):  `Category ▸ SubArea: leaf, leaf, …`.
+ * Pure / no DB needed (the vocab is a code constant). Never empty.
+ * @returns {string} Multi-line grouped menu (one line per category▸sub-area). Never empty.
+ */
+export function groupedTaxonomyMenu() {
+    const lines = [];
+    for (const cat of L1_CATEGORIES) {
+        const node = TAXONOMY[cat];
+        if (!node) continue;
+        for (const [subArea, leaves] of Object.entries(node)) {
+            lines.push(`${cat} ▸ ${subArea}: ${leaves.join(', ')}`);
+        }
+    }
+    return lines.join('\n');
 }
 
 /**

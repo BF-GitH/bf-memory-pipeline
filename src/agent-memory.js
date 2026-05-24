@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
+import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES, groupedTaxonomyMenu } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 import * as host from './host.js';
@@ -51,15 +51,9 @@ TEMPORARY-VS-LASTING (you only see ~2 recent messages):
 
 FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 - LAYER 1 \`Category\` (the domain), one of: People, Places, Things, Relationships, Events, World, Unsorted. (World = rules/lore/factions/setting. Unsorted = catch-all when none fit.)
-- LAYER 2 \`aspect:\` — a GRANULAR sub-bucket WITHIN the category. Pick the MOST SPECIFIC label that matches, from the FIXED menu for that category:
-    People → status, identity, origin, career, finances, reputation, allegiance, appearance, body_marks, wardrobe, current_clothing, speech_style, health, injuries, mood, beliefs, values, morals, fears, desires, sexuality, current_goal, ambitions, habits, vices, secrets, skills, knowledge, childhood, family_origin, upbringing, education, trauma, home, daily_routine, current_location, carried_items
-    Places → feature, function, atmosphere, access, inhabitants, condition, geography, significance
-    Things → object, key_item, weapon, substance, tech, properties, ownership, currency
-    Relationships → history, family_ties, friendship, romance, attraction, rivalry, tension, trust, debt, alliance, power_dynamic
-    Events → scene, milestone, action, conflict, agreement, revelation, change, plan
-    World → lore, rule, faction, culture, politics, economy, history, geography, time
-    Unsorted → misc
-  Pick the SINGLE most specific matching label (e.g. a phobia → \`fears\`, a current job → \`career\`, an unpaid debt → \`finances\`, a tattoo → \`body_marks\`). If NOTHING fits, file to \`Unsorted\` + \`aspect:misc\` (the always-read escape hatch) rather than guessing. If unsure WITHIN a category, omit \`aspect:\` (a category default is used). NEVER invent an aspect outside the menu.
+- LAYER 2 \`aspect:\` — a GRANULAR sub-bucket WITHIN the category. The menu is a TREE: each category groups its leaves into SUB-AREAS (shown as \`Category ▸ Sub-area: leaf, leaf, …\`). DRILL it: first decide the category, then the matching sub-area, then pick the SINGLE most specific LEAF from that sub-area. Only the LEAF goes in \`aspect:\` — the sub-area is just navigation, never written. The FIXED menu:
+${groupedTaxonomyMenu()}
+  Pick the SINGLE most specific matching LEAF (e.g. a phobia → \`People ▸ Fears & Wounds → fears\`, a current job → \`People ▸ Daily Life → career\`, an unpaid debt → \`People ▸ Resources → finances\`, a tattoo → \`People ▸ Marks & Modifications → tattoos\`). If NOTHING fits, file to \`Unsorted\` + \`aspect:misc\` (the always-read escape hatch) rather than guessing. If unsure WITHIN a category, omit \`aspect:\` (a category/sub-area default is used). NEVER invent an aspect outside the menu.
 - The CHARACTER a fact is about is NOT a category or aspect — it is a TAG. Tag it with \`| with:@<name>\` (use \`@npc\` for an unnamed/incidental person). The same character can appear under many categories/aspects.
 - RELATIONSHIPS are character-AGNOSTIC topics (history/friendship/romance/tension/trust/...), NOT keyed by person. For a relationship fact, ALWAYS emit the pair-tag — \`| subj:@<A>\` (whose relationship) AND \`| with:@<B>\` (toward whom) — plus an abstract relationship \`aspect:\`. E.g. \`+ Relationships/a_b_trust = broken | aspect:trust | subj:@<A> | with:@<B> | !3 | kind:state\`.
 
