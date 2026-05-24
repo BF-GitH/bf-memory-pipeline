@@ -257,6 +257,16 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
         const mainOut = Number(memoryResult?.mainOutput) || 0; // usually 0 on the inline path
         const netIn = (aIn + a1In + a3In) - bIn;
         const failed = !!cancelled || (agent1Ran && !agent1Ok) || (agent3Ran && !agent3Ok);
+        // Observability: stamp the DB context this run executed against, so every per-turn
+        // summary line says which profile/avatar it touched (read-only — no behavior change).
+        // activeProfile from settings; avatar from the live host context (same inline pattern
+        // used elsewhere in this file). dbFactsAtStart is intentionally omitted: this summary
+        // path is synchronous and getAllDatabases() is async — counting facts here would force a
+        // signature/timing change, which is out of scope for logging-only.
+        let activeProfile = null;
+        let avatar = null;
+        try { activeProfile = getSettings()?.activeDbProfile || null; } catch { /* read-only */ }
+        try { avatar = SillyTavern.getContext().characters?.[SillyTavern.getContext().characterId]?.avatar || null; } catch { /* read-only */ }
         addDebugLog('info',
             `[${runId}] SUMMARY ${cancelled ? '(cancelled) ' : ''}` +
             `dur=${duration}ms | Agent1=${agent1Ran ? (agent1Ok ? 'ok' : 'failed') : 'skipped'} | ` +
@@ -277,6 +287,9 @@ function logRunSummary({ runId, startTime, baselineInput, actualInput, draftResu
                     },
                     facts: { NEW: nNew, UPDATED: nUpd, SKIPPED: nSkip, EVICTED: nEvict },
                     tokens: { baselineIn: bIn, actualIn: aIn, a1In, a1Out, a3In, a3Out, mainOut, netIn },
+                    // DB context this run ran against (observability stamp).
+                    activeProfile,
+                    avatar,
                 },
             },
         );

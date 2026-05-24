@@ -1949,12 +1949,32 @@ async function loadAllDatabases(avatar) {
         const attachStamp = attachmentSnapshotStamp(avatar, attachMap);
         const attachHasData = Object.keys(attachMap).some(c => (attachMap[c]?.facts || []).length > 0);
 
+        // Observability: cheap before/after fact+category census of the two maps involved in a
+        // migrate/rehydrate. "before" = the IDB state about to be replaced; "after" = the
+        // attachment data adopted in. Seeing before<after (e.g. 5 -> 65) flags a clobber where an
+        // OLDER snapshot was pulled over newer working data. Read-only — no behavior change.
+        const countCats = (m) => (m && typeof m === 'object') ? Object.keys(m).length : 0;
+        const countFacts = (m) => {
+            if (!m || typeof m !== 'object') return 0;
+            let n = 0;
+            for (const k of Object.keys(m)) n += (m[k]?.facts || []).length;
+            return n;
+        };
+        const idbDatabases = (rec && rec.databases) ? rec.databases : {};
+
         // CASE A — MIGRATION: no IDB record yet, but attachments hold facts. Seed IDB ONCE,
         // adopting the snapshot stamp so a later device compare is meaningful. Serve attachments.
         if (idbStamp < 0 && attachHasData) {
             await idbPutDatabases(avatar, attachMap, attachStamp || Date.now());
             addDebugLog('info', 'Migrated legacy attachment DBs into IndexedDB', {
-                subsystem: 'db', event: 'db.migrated', data: { categories: Object.keys(attachMap).length },
+                subsystem: 'db', event: 'db.migrated', data: {
+                    categories: Object.keys(attachMap).length,
+                    avatar,
+                    attachStamp, idbStamp,
+                    // before = IDB being replaced (none here: idbStamp<0); after = adopted attachment data.
+                    categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
+                    categoriesAfter: countCats(attachMap), factsAfter: countFacts(attachMap),
+                },
             });
             return attachMap;
         }
@@ -1964,7 +1984,13 @@ async function loadAllDatabases(avatar) {
         if (attachHasData && attachStamp > idbStamp) {
             await idbPutDatabases(avatar, attachMap, attachStamp);
             addDebugLog('info', 'Rehydrated IndexedDB from newer attachment snapshot', {
-                subsystem: 'db', event: 'db.rehydrated', data: { attachStamp, idbStamp },
+                subsystem: 'db', event: 'db.rehydrated', data: {
+                    attachStamp, idbStamp, avatar,
+                    // before = IDB state being overwritten; after = attachment data rehydrated in.
+                    // before > after means an OLD snapshot clobbered newer working data.
+                    categoriesBefore: countCats(idbDatabases), factsBefore: countFacts(idbDatabases),
+                    categoriesAfter: countCats(attachMap), factsAfter: countFacts(attachMap),
+                },
             });
             return attachMap;
         }

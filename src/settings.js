@@ -2585,6 +2585,22 @@ async function deleteDbProfile(profileName) {
 // it now only tracks the last chat we LOADED to skip redundant loads.
 let lastAutoLoadedChat = '';
 
+// Observability: the chatId we were on BEFORE the current CHAT_CHANGED, so the chat.switch /
+// chat.disconnect logs can report a "from -> to" transition. Updated at the END of the
+// CHAT_CHANGED handler. Not used for any storage/profile decision — logging only.
+let _lastChatId = '';
+
+/**
+ * Heuristic branch detector for observability logs. ST names branched chats with a
+ * "Branch #N" segment (e.g. "<name> - <date> - Branch #1"). Read-only — used only to tag
+ * log entries, never to drive storage/profile behavior.
+ * @param {string} chatId
+ * @returns {boolean}
+ */
+function isBranchChat(chatId) {
+    return typeof chatId === 'string' && /Branch\s*#/i.test(chatId);
+}
+
 function getCurrentChatId() {
     const context = getContext();
     // ST stores the current chat filename (unique per chat)
@@ -3072,8 +3088,15 @@ async function autoSaveDbProfile() {
         // Persistence is handled at extraction time via saveCurrentToActiveProfile()
         // called from pipeline.js after every Agent 3 write (capture-at-write).
 
+        // Observability: track HOW this chat resolved its DB so a single consolidated db.connect
+        // event can tell the whole connect story (linked / auto-created / suppressed / none). This
+        // only records what the existing branches already decided — it changes no behavior.
+        const isBranch = isBranchChat(chatId);
+        let linkState = 'none';
+
         // Check if this chat has a linked profile
         let profileToLoad = findProfileForChat(chatId);
+        if (profileToLoad) linkState = 'linked';
 
         // RESPECT EXPLICIT UNLINK: if the user detached THIS chat from every profile (via the
         // Manage popup / "Unlink current chat" button), do NOT auto-create or re-link a profile
@@ -3092,6 +3115,22 @@ async function autoSaveDbProfile() {
                 subsystem: 'settings', event: 'profile.autolinkSuppressed', actor: 'USER', reason: 'EXPLICIT_UNLINK',
                 data: { chatId },
             });
+            // Consolidated connect summary for the suppressed case: no profile reloaded over the
+            // working store. factsLoaded/categories reflect whatever is already live in the store.
+            try {
+                const { getAllDatabases } = await import('./database.js');
+                const live = await getAllDatabases();
+                const cats = Object.keys(live || {});
+                const factsLoaded = cats.reduce((n, c) => n + ((live[c]?.facts || []).length), 0);
+                addDebugLog('info', `DB connect: chat ${chatId} -> (unlinked, suppressed) ${factsLoaded} facts`, {
+                    subsystem: 'db', event: 'db.connect', actor: 'SYSTEM',
+                    data: {
+                        chatId, resolvedProfile: null, linkState: 'unlinked-suppressed',
+                        factsLoaded, categories: cats.length,
+                        source: factsLoaded > 0 ? 'idb' : 'empty', isBranch,
+                    },
+                });
+            } catch { /* logging-only: best-effort */ }
             lastAutoLoadedChat = chatId;
             return;
         }
@@ -3118,9 +3157,13 @@ async function autoSaveDbProfile() {
                     subsystem: 'import', event: 'db.seeded', actor: 'SYSTEM',
                     data: { profileName: chatLabel, chatId, categoriesSeeded: Object.keys(seeded) },
                 });
+                linkState = 'auto-created';
             } else {
                 // Profile with that name exists, link this chat to it
                 linkChatToProfile(chatLabel, chatId);
+                // A pre-existing same-named profile we just linked to is, for connect-story
+                // purposes, a linked load (not a fresh auto-create).
+                linkState = 'linked';
             }
             profileToLoad = chatLabel;
         }
@@ -3150,6 +3193,34 @@ async function autoSaveDbProfile() {
             refreshLinkedChatsField();
             addDebugLog('info', `Auto-loaded DB profile "${profileToLoad}" (linked to chat ${chatId})`, {
                 subsystem: 'import', event: 'profile.switched', actor: 'SYSTEM', reason: 'AUTO_LOADED', data: { profileName: profileToLoad, chatId },
+            });
+
+            // Consolidated connect summary (one line tells the whole connect story). Census the
+            // working store right after the load so factsLoaded/categories reflect what actually
+            // landed. source: 'profile' when facts came in from the dbProfile, 'empty' when the
+            // resolved profile carried zero facts (e.g. fresh skeleton). Read-only.
+            try {
+                const live = await getAllDatabases();
+                const cats = Object.keys(live || {});
+                const factsLoaded = cats.reduce((n, c) => n + ((live[c]?.facts || []).length), 0);
+                addDebugLog('info', `DB connect: chat ${chatId} -> profile "${profileToLoad}" (${linkState}) ${factsLoaded} facts`, {
+                    subsystem: 'db', event: 'db.connect', actor: 'SYSTEM',
+                    data: {
+                        chatId, resolvedProfile: profileToLoad, linkState,
+                        factsLoaded, categories: cats.length,
+                        source: factsLoaded > 0 ? 'profile' : 'empty', isBranch,
+                    },
+                });
+            } catch { /* logging-only: best-effort */ }
+        } else {
+            // No profile resolved AND not the suppressed path (e.g. no chatLabel to name one).
+            // Emit a connect summary so the absence of a DB context is still visible in the log.
+            addDebugLog('info', `DB connect: chat ${chatId} -> (no profile resolved)`, {
+                subsystem: 'db', event: 'db.connect', actor: 'SYSTEM',
+                data: {
+                    chatId, resolvedProfile: null, linkState: 'none',
+                    factsLoaded: null, categories: null, source: 'empty', isBranch,
+                },
             });
         }
 
@@ -3980,6 +4051,31 @@ export async function initSettings() {
 
     // --- Auto-save DB profile on chat change (named after current chat) ---
     context.eventSource?.on(context.eventTypes?.CHAT_CHANGED, async () => {
+        // Observability: capture the transition BEFORE any reload runs. `_lastChatId` is the chat
+        // we are leaving; getCurrentChatId() is the one we just entered. Logging only — these reads
+        // never influence profile resolution / rehydrate / snapshot.
+        const fromChatId = _lastChatId;
+        const toChatId = getCurrentChatId();
+
+        // chat.disconnect: what was active on the chat we are LEAVING (active profile at the moment
+        // of exit). Skipped on the very first switch (no prior chat) to avoid a noise line.
+        if (fromChatId && fromChatId !== toChatId) {
+            addDebugLog('info', `Leaving chat ${fromChatId} (active profile "${extensionSettings?.activeDbProfile || ''}")`, {
+                subsystem: 'db', event: 'db.disconnect', actor: 'SYSTEM',
+                data: {
+                    chatId: fromChatId,
+                    activeProfile: extensionSettings?.activeDbProfile || null,
+                    isBranch: isBranchChat(fromChatId),
+                },
+            });
+        }
+
+        // chat.switch: explicit "left -> entered" transition (info so it shows by default).
+        addDebugLog('info', `Chat switch: ${fromChatId || '(none)'} -> ${toChatId || '(none)'}`, {
+            subsystem: 'db', event: 'chat.switch', actor: 'SYSTEM',
+            data: { from: fromChatId || null, to: toChatId || null, isBranch: isBranchChat(toChatId) },
+        });
+
         // FIX #59: flush the OUTGOING chat's debug-log tail to its own file BEFORE we swap the
         // buffer to the new chat — otherwise the last few (esp. verbose) lines of the chat you're
         // leaving are lost. Targets the tracked old chatId (the live one has already advanced).
@@ -3994,7 +4090,15 @@ export async function initSettings() {
         reloadReflectionFromChat();
         reloadPyramidFromChat();
         reloadEntitiesUI();
+
+        // Remember which chat we're now on so the NEXT switch can report an accurate
+        // "from -> to". Logging-only state; never read by storage/profile logic.
+        _lastChatId = toChatId;
     });
+
+    // Seed the switch tracker with the chat present at init, so the first real switch reports a
+    // correct "from". Logging-only.
+    _lastChatId = getCurrentChatId();
 
     // Initial load: pull any previously-persisted log entries + facts for the current chat
     reloadDebugLogFromChat();
