@@ -2196,26 +2196,35 @@ export function markFactsUsed(usedFactRefs) {
 
 /**
  * Drain the pending used-fact buffer against a LIVE databases map, bumping useCount += 1 and
- * setting lastUsedAt = now on each matching stored fact object IN PLACE — so the bumps ride
- * the caller's already-scheduled save (no extra write). Called at the start of the post-reply
- * extraction (runMemoryExtraction) before its own saves. Idempotent per turn: the buffer is
- * cleared once applied, so a fact is bumped at most once per turn even if it surfaced in
+ * setting lastUsedAt = now on each matching stored fact object IN PLACE. Called at the start of
+ * the post-reply extraction (runMemoryExtraction) before its own saves. Idempotent per turn: the
+ * buffer is cleared once applied, so a fact is bumped at most once per turn even if it surfaced in
  * multiple tiers. NEVER deletes. Logs a single strengthening summary at debug level so it
  * doesn't spam the default Debug view.
+ *
+ * PERSISTENCE CONTRACT — returns the SET of categories it actually bumped so the caller can make
+ * the bumps durable. saveDatabase(db) is a per-category read-modify-write that merges only the
+ * passed category into the avatar's stored record (reading the OTHER categories from disk, not
+ * from this in-memory map). So a bump on a category the extraction ALSO re-saves rides that save
+ * for free (same object), but a bump on a used-but-NOT-extracted category would never reach the
+ * working store (the profile copy isn't the load source). The caller therefore persists exactly
+ * the bumped categories the extraction didn't already save — minimal, proportionate I/O, never a
+ * full extra pass.
  * @param {Object<string, DatabaseSchema>} databases - the live map about to be persisted
  * @param {string} [runId] - turn id to tag the log with (threaded from the extraction run)
- * @returns {number} count of facts strengthened
+ * @returns {string[]} unique category names that had at least one fact strengthened
  */
 export function applyBufferedFactUsage(databases, runId) {
-    if (_pendingUsedFactIds.size === 0) return 0;
+    if (_pendingUsedFactIds.size === 0) return [];
     // Snapshot + clear up front so a re-entrant call (or a thrown error mid-loop) can't
     // double-apply or strand the buffer.
     const pending = _pendingUsedFactIds;
     _pendingUsedFactIds = new Set();
-    if (!databases || typeof databases !== 'object') return 0;
+    if (!databases || typeof databases !== 'object') return [];
 
     const now = Date.now();
     const strengthened = []; // { id, useCount } for the debug log
+    const bumpedCategories = new Set();
     for (const id of pending) {
         const sep = id.indexOf(':');
         if (sep < 0) continue;
@@ -2228,15 +2237,16 @@ export function applyBufferedFactUsage(databases, runId) {
         fact.useCount = Math.max(0, Math.floor(Number(fact.useCount) || 0)) + 1;
         fact.lastUsedAt = now;
         strengthened.push({ id, useCount: fact.useCount });
+        bumpedCategories.add(cat);
     }
 
     if (strengthened.length > 0) {
         addDebugLog('debug', `Strengthened ${strengthened.length} used fact(s) (use-it-or-lose-it)`, {
             runId, subsystem: 'retrieval', event: 'fact.strengthened', reason: 'INJECTED_INTO_WRITER',
-            data: { count: strengthened.length, at: now, facts: strengthened },
+            data: { count: strengthened.length, at: now, facts: strengthened, categories: [...bumpedCategories] },
         });
     }
-    return strengthened.length;
+    return [...bumpedCategories];
 }
 
 /**

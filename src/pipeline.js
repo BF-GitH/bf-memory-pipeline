@@ -1029,7 +1029,7 @@ async function runMemoryExtraction() {
         // run committed nothing extractable: if any category it touches isn't otherwise re-saved,
         // saveCurrentToActiveProfile (called whenever updates>0 OR usage was applied) snapshots
         // the whole live map, and a turn with zero buffered facts is a no-op. Threads the run id.
-        const usageBumps = applyBufferedFactUsage(databases, runId);
+        const usageBumpCats = applyBufferedFactUsage(databases, runId);
 
         // Gather up to agent3ContextMessages prior messages for richer context. Default = 2
         // means the latest user + AI exchange (current behavior preserved). The target is
@@ -1157,11 +1157,34 @@ async function runMemoryExtraction() {
             }, 2000);
         }
 
+        // USE-IT-OR-LOSE-IT durability: make the bumps reach the WORKING store (IDB/attachment —
+        // the load source), not just the profile. saveDatabase is a per-category RMW that reads
+        // OTHER categories from disk, so a bump only persists if its category is re-saved. The
+        // extraction (applyUpdates) already re-saved every category it CHANGED, and those carry
+        // their bumps for free (same in-memory object). Here we persist only the bumped categories
+        // the extraction did NOT change — typically 0, occasionally 1–2 — so a used-but-unedited
+        // fact's strengthening isn't silently dropped on reload. Proportionate, never a full pass.
+        if (usageBumpCats.length > 0) {
+            const savedByExtraction = new Set((memoryResult.updates || [])
+                .filter(u => u.changed)
+                .map(u => u.category));
+            for (const cat of usageBumpCats) {
+                if (savedByExtraction.has(cat)) continue; // already rode the extraction's save
+                if (!databases[cat]) continue;            // defensive: bumped cat must exist
+                try {
+                    await saveDatabase(databases[cat]);
+                } catch (e) {
+                    addDebugLog('fail', `[${runId}] Failed to persist use-bump for "${cat}": ${e.message || e}`, {
+                        runId, subsystem: 'retrieval', event: 'fact.strengthened', reason: 'PERSIST_FAILED',
+                    });
+                }
+            }
+        }
+
         // Persist to the captured DB profile slot (capture-at-write). Also persist when the only
-        // change this turn was use-it-or-lose-it strengthening (usageBumps > 0) so the bumps that
-        // rode the live map aren't lost when the extraction itself produced no updates — this is
-        // the SAME save call, not a standalone one (it snapshots the whole live map either way).
-        if (memoryResult.updates.length > 0 || usageBumps > 0) {
+        // change this turn was use-it-or-lose-it strengthening so the profile snapshot stays in
+        // sync with the working store even on a turn that produced no extraction updates.
+        if (memoryResult.updates.length > 0 || usageBumpCats.length > 0) {
             await saveCurrentToActiveProfile(capturedDbProfile);
         }
     } catch (err) {
