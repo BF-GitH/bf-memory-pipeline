@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './ag
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow, markFactsUsed, applyBufferedFactUsage } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun } from './settings.js';
@@ -908,6 +908,14 @@ async function runPipelineInline(data) {
     if (success) {
         addDebugLog('pass', 'Memory context injected into prompt');
         pipelineJustInjected = true; // prevent double-injection on second event fire
+        // USE-IT-OR-LOSE-IT: this is the SINGLE commit point — these exact facts were injected
+        // into the Writer's context, so they've earned strengthening. Stage them (by
+        // identity-stable category:key) in the use buffer; the next post-reply extraction save
+        // drains it onto the freshly-loaded fact objects, so the bumps ride that existing save
+        // with NO extra per-turn write. (retrieval.facts are the chosen {fact, category} refs
+        // for every path: finder, deterministic fallback, speculative.) Thread the run id so the
+        // strengthening log groups under this turn.
+        markFactsUsed(retrieval.facts);
     } else {
         addDebugLog('fail', 'Failed to inject memory context');
     }
@@ -1013,6 +1021,15 @@ async function runMemoryExtraction() {
 
         // Load databases (Agent 3's existing-DB context).
         const databases = await getAllDatabases();
+
+        // USE-IT-OR-LOSE-IT: drain the use buffer staged by the inline pipeline's injection this
+        // turn onto these freshly-loaded fact objects BEFORE the extraction's own writes. Mutates
+        // in place; the bumps then persist via the saveDatabase/saveCurrentToActiveProfile this
+        // function already performs at the end — NO standalone save is added. Safe even when the
+        // run committed nothing extractable: if any category it touches isn't otherwise re-saved,
+        // saveCurrentToActiveProfile (called whenever updates>0 OR usage was applied) snapshots
+        // the whole live map, and a turn with zero buffered facts is a no-op. Threads the run id.
+        const usageBumps = applyBufferedFactUsage(databases, runId);
 
         // Gather up to agent3ContextMessages prior messages for richer context. Default = 2
         // means the latest user + AI exchange (current behavior preserved). The target is
@@ -1140,8 +1157,11 @@ async function runMemoryExtraction() {
             }, 2000);
         }
 
-        // Persist to the captured DB profile slot (capture-at-write).
-        if (memoryResult.updates.length > 0) {
+        // Persist to the captured DB profile slot (capture-at-write). Also persist when the only
+        // change this turn was use-it-or-lose-it strengthening (usageBumps > 0) so the bumps that
+        // rode the live map aren't lost when the extraction itself produced no updates — this is
+        // the SAME save call, not a standalone one (it snapshots the whole live map either way).
+        if (memoryResult.updates.length > 0 || usageBumps > 0) {
             await saveCurrentToActiveProfile(capturedDbProfile);
         }
     } catch (err) {

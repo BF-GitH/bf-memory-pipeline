@@ -38,6 +38,47 @@ const RECENCY_WEIGHT = 0.35;
 // Half-lives in days (recency term = 0.5 ** (ageDays / halfLife)).
 const HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
 
+// USE-IT-OR-LOSE-IT (use-driven salience). A fact that actually gets injected into the
+// Writer's context is "used" — we bump useCount + lastUsedAt (see markFactsUsed). Usage feeds
+// BOTH keep-score (salienceScore) and slot-rank (retrievalSalience) two ways:
+//   1. RECENCY REFRESH: effective age is measured from max(lastUpdated, lastUsedAt), so using a
+//      fact refreshes it exactly like an update would (it resists kind-decay → stays hot).
+//   2. FREQUENCY BONUS: a small log-scaled, CAPPED additive term from useCount. Log-scaling
+//      means the first few uses help most and the bonus saturates, so a frequently-used minor
+//      fact nudges up the ranking without ever overpowering a foundational importance-5 fact:
+//      a full importance term is IMPORTANCE_WEIGHT*(5/5)=0.65, while the use bonus is capped at
+//      USE_BONUS_CAP (0.20) — roughly the value of one importance point — so importance stays
+//      the dominant signal. Bounded by design; never grows unbounded with use.
+// Net effect: "use it" (recently/frequently injected) keeps a fact hot and wins scarce slots;
+// "lose it" (never injected) decays on recency alone and drifts cold — but is NEVER deleted.
+const USE_BONUS_WEIGHT = 0.06;
+const USE_BONUS_CAP = 0.20;
+
+/**
+ * Bounded, log-scaled frequency bonus from a fact's useCount, shared by both salience
+ * functions so keep-score and slot-rank strengthen identically. Returns 0 for unused facts.
+ * @param {*} useCount
+ * @returns {number} additive bonus in [0, USE_BONUS_CAP]
+ */
+export function useBonus(useCount) {
+    const n = Number(useCount);
+    if (!Number.isFinite(n) || n <= 0) return 0;
+    return Math.min(USE_BONUS_CAP, USE_BONUS_WEIGHT * Math.log1p(n));
+}
+
+/**
+ * Effective recency timestamp for salience: the MORE RECENT of lastUpdated and lastUsedAt.
+ * Using a fact refreshes it the same way an update does, so a frequently-injected fact resists
+ * kind-decay even if its stored value hasn't changed. Returns 0 when neither is set.
+ * @param {{lastUpdated?: number, lastUsedAt?: number}} fact
+ * @returns {number} ms epoch (0 = never updated/used → treated as very old)
+ */
+export function effectiveRecencyTs(fact) {
+    const upd = Number(fact?.lastUpdated) || 0;
+    const used = Number(fact?.lastUsedAt) || 0;
+    return Math.max(upd, used);
+}
+
 /**
  * Clamp an importance value to an integer 1-5, defaulting when absent/invalid.
  * @param {*} v
@@ -456,11 +497,15 @@ function salienceScore(fact, now) {
     }
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
-    const last = Number(fact?.lastUpdated) || 0;
-    const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500; // never-updated → very old
+    // USE-IT-OR-LOSE-IT: measure age from the MORE RECENT of lastUpdated/lastUsedAt, so a fact
+    // that keeps getting injected refreshes its recency exactly like an update would.
+    const last = effectiveRecencyTs(fact);
+    const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500; // never-updated/used → very old
     const halfLife = HALF_LIFE_DAYS[kind] || HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife); // 1 (fresh) → 0 (ancient)
-    return IMPORTANCE_WEIGHT * (importance / 5) + RECENCY_WEIGHT * recency;
+    // Bounded log-scaled frequency bonus so often-injected facts resist cold-tiering without
+    // overpowering a foundational importance-5 fact (cap ≈ one importance point).
+    return IMPORTANCE_WEIGHT * (importance / 5) + RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
 }
 
 function getContext() {
@@ -2060,6 +2105,11 @@ function normalizeSalienceFields(fact) {
     if (fact && fact.kind !== undefined && fact.kind !== null && String(fact.kind).trim()) {
         out.kind = normalizeKind(fact.kind);
     }
+    // USE-IT-OR-LOSE-IT: stamp use-tracking fields with safe defaults so every fact carries
+    // them from creation (the strengthening machinery in both salience fns assumes presence).
+    // Preserve any incoming non-zero values (e.g. a fact rehydrated/imported with prior usage).
+    out.useCount = Math.max(0, Math.floor(Number(fact?.useCount) || 0));
+    out.lastUsedAt = Math.max(0, Math.floor(Number(fact?.lastUsedAt) || 0));
     return out;
 }
 
@@ -2084,7 +2134,109 @@ function mergeSalience(existing, incoming) {
     const incKind = incoming && incoming.kind !== undefined && incoming.kind !== null && String(incoming.kind).trim();
     if (incKind) out.kind = normalizeKind(incoming.kind);
     else if (existing && existing.kind) out.kind = normalizeKind(existing.kind);
+    // USE-IT-OR-LOSE-IT: a merge must PRESERVE accumulated strengthening — keep the HIGHER of
+    // each so a bare re-mention (which carries no usage) never resets a fact's earned salience.
+    const exUse = Math.max(0, Math.floor(Number(existing?.useCount) || 0));
+    const incUse = Math.max(0, Math.floor(Number(incoming?.useCount) || 0));
+    out.useCount = Math.max(exUse, incUse);
+    const exUsedAt = Math.max(0, Math.floor(Number(existing?.lastUsedAt) || 0));
+    const incUsedAt = Math.max(0, Math.floor(Number(incoming?.lastUsedAt) || 0));
+    out.lastUsedAt = Math.max(exUsedAt, incUsedAt);
     return out;
+}
+
+// =============================================================================
+// USE-IT-OR-LOSE-IT — use-driven fact strengthening (never-delete).
+//
+// When a fact is actually committed into the Writer's injected context (the single
+// commit point in runPipelineInline), it has earned its slot — we want it to STAY hot and
+// keep winning scarce retrieval slots. So we bump useCount + lastUsedAt, which both
+// salience functions fold in (recency refresh + bounded frequency bonus). Facts that never
+// get injected decay on recency alone and drift cold — but are NEVER deleted.
+//
+// PERSISTENCE CHOICE — DEFERRED MODULE-LEVEL BUFFER (no extra per-turn write). The inline
+// pipeline runs PRE-reply; the only post-reply DB write the system already does is the
+// Scribe's extraction save (runMemoryExtraction → applyUpdates/saveDatabase +
+// saveCurrentToActiveProfile). We must NOT add a standalone saveDatabase just for usage
+// marks (gratuitous I/O is the enemy at infinite scale). Mutating the retrieved fact objects
+// in place is ALSO unsafe to rely on across the pre/post-reply boundary: getAllDatabases()
+// hands out a per-turn CACHED map that can be invalidated between the inline run and the
+// extraction (CHAT_CHANGED invalidates; the extraction's own writes reload fresh objects), so
+// an in-place bump on a stale object could be discarded before the next save. THEREFORE we
+// STAGE the used facts' `category:key` ids in a module-level buffer (markFactsUsed) and DRAIN
+// it (applyBufferedFactUsage) at the START of the next extraction — against the FRESHLY-loaded
+// databases the extraction is about to persist anyway. The bumps then ride that same save with
+// zero extra I/O. This is correct because the buffer keys are identity-stable (category:key)
+// and the drain resolves them against whatever objects are currently authoritative.
+// =============================================================================
+
+// Pending used-fact ids (`category:key`) accumulated since the last drain. A Set dedupes a
+// fact that surfaced in multiple tiers in one turn so it's only bumped once per drain.
+let _pendingUsedFactIds = new Set();
+
+/**
+ * Record that a set of facts were committed into the Writer's injected context this turn, so
+ * the next extraction save STRENGTHENS them (useCount/lastUsedAt). Stages identity-stable
+ * `category:key` ids in a module-level buffer rather than mutating now — see the rationale
+ * block above (the per-turn DB cache may be invalidated before the post-reply save, so an
+ * in-place bump can't be relied on; the buffer is drained against the freshly-loaded map the
+ * extraction is about to persist). Accepts the retrieval result shape `{fact, category}` (the
+ * `fact.key` carries identity). NEVER deletes anything; never triggers its own save.
+ * @param {Array<{fact: {key?: string}, category?: string}>} usedFactRefs
+ */
+export function markFactsUsed(usedFactRefs) {
+    if (!Array.isArray(usedFactRefs)) return;
+    for (const ref of usedFactRefs) {
+        const cat = ref?.category;
+        const key = ref?.fact?.key;
+        if (!cat || !key) continue;
+        _pendingUsedFactIds.add(`${cat}:${key}`);
+    }
+}
+
+/**
+ * Drain the pending used-fact buffer against a LIVE databases map, bumping useCount += 1 and
+ * setting lastUsedAt = now on each matching stored fact object IN PLACE — so the bumps ride
+ * the caller's already-scheduled save (no extra write). Called at the start of the post-reply
+ * extraction (runMemoryExtraction) before its own saves. Idempotent per turn: the buffer is
+ * cleared once applied, so a fact is bumped at most once per turn even if it surfaced in
+ * multiple tiers. NEVER deletes. Logs a single strengthening summary at debug level so it
+ * doesn't spam the default Debug view.
+ * @param {Object<string, DatabaseSchema>} databases - the live map about to be persisted
+ * @param {string} [runId] - turn id to tag the log with (threaded from the extraction run)
+ * @returns {number} count of facts strengthened
+ */
+export function applyBufferedFactUsage(databases, runId) {
+    if (_pendingUsedFactIds.size === 0) return 0;
+    // Snapshot + clear up front so a re-entrant call (or a thrown error mid-loop) can't
+    // double-apply or strand the buffer.
+    const pending = _pendingUsedFactIds;
+    _pendingUsedFactIds = new Set();
+    if (!databases || typeof databases !== 'object') return 0;
+
+    const now = Date.now();
+    const strengthened = []; // { id, useCount } for the debug log
+    for (const id of pending) {
+        const sep = id.indexOf(':');
+        if (sep < 0) continue;
+        const cat = id.slice(0, sep);
+        const key = id.slice(sep + 1);
+        const db = databases[cat];
+        if (!db || !Array.isArray(db.facts)) continue;
+        const fact = db.facts.find(f => f && f.key === key);
+        if (!fact) continue; // fact may have been superseded/renamed since — skip, never error
+        fact.useCount = Math.max(0, Math.floor(Number(fact.useCount) || 0)) + 1;
+        fact.lastUsedAt = now;
+        strengthened.push({ id, useCount: fact.useCount });
+    }
+
+    if (strengthened.length > 0) {
+        addDebugLog('debug', `Strengthened ${strengthened.length} used fact(s) (use-it-or-lose-it)`, {
+            runId, subsystem: 'retrieval', event: 'fact.strengthened', reason: 'INJECTED_INTO_WRITER',
+            data: { count: strengthened.length, at: now, facts: strengthened },
+        });
+    }
+    return strengthened.length;
 }
 
 /**

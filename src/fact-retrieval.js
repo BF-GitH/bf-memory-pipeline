@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -442,11 +442,15 @@ const RETRIEVAL_COLD_PENALTY = 1000;
 function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
-    const last = Number(fact?.lastUpdated) || 0;
+    // USE-IT-OR-LOSE-IT: rank from the MORE RECENT of lastUpdated/lastUsedAt (using a fact
+    // refreshes it like an update) plus a bounded log-scaled frequency bonus from useCount, so
+    // recently/frequently-injected facts win scarce slots. Same blend as the keep-score
+    // (salienceScore), sharing useBonus/effectiveRecencyTs so the two never drift apart.
+    const last = effectiveRecencyTs(fact);
     const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
     const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife);
-    const base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency;
+    const base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
     return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
 }
 
@@ -822,22 +826,29 @@ export async function explainFactRetrieval(key, keywords = []) {
         if (match) break;
     }
 
+    // USE-IT-OR-LOSE-IT: surface the use-driven ranking signals on every matched-fact result so
+    // the probe shows WHY a fact ranks where it does (how often/recently it was injected).
+    const useInfo = match ? {
+        useCount: Math.max(0, Math.floor(Number(match.fact?.useCount) || 0)),
+        lastUsedAt: Math.max(0, Math.floor(Number(match.fact?.lastUsedAt) || 0)),
+    } : {};
+
     let reason, detail;
     if (!match) {
         reason = 'NEVER_MATCHED';
         detail = { searched: wantCat ? `${wantCat}/${wantKey}` : wantKey, note: 'no stored fact with that key' };
     } else if (!isActiveFact(match.fact)) {
         reason = 'SUPERSEDED_INACTIVE';
-        detail = { key: match.fact.key, category: match.category, note: 'fact is a superseded/inactive history snapshot' };
+        detail = { key: match.fact.key, category: match.category, note: 'fact is a superseded/inactive history snapshot', ...useInfo };
     } else if (!isFactVisible(match.fact)) {
         reason = 'KNOWNBY_INVISIBLE';
-        detail = { key: match.fact.key, category: match.category, knownBy: match.fact.knownBy || [] };
+        detail = { key: match.fact.key, category: match.category, knownBy: match.fact.knownBy || [], ...useInfo };
     } else {
         // Active + visible: would it have matched the given keywords?
         const kw = (keywords || []).filter(Boolean);
         const hit = kw.length ? searchFacts({ [match.category]: { category: match.category, facts: [match.fact] } }, kw).length > 0 : false;
         reason = hit ? 'WOULD_ADMIT' : (kw.length ? 'NO_KEYWORD_MATCH' : 'ACTIVE_VISIBLE');
-        detail = { key: match.fact.key, category: match.category, tier: 'unknown', testedKeywords: kw, keywordHit: hit };
+        detail = { key: match.fact.key, category: match.category, tier: 'unknown', testedKeywords: kw, keywordHit: hit, ...useInfo };
     }
 
     addDebugLog('info', `Why-not probe "${key}": ${reason}`, {
