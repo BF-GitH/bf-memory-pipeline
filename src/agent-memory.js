@@ -13,6 +13,10 @@ function getSettingsSafe() {
 
 export const DEFAULT_MEMORY_PROMPT = `You extract LASTING facts from roleplay messages between {{user}} (the human player) and {{char}} (the AI character). Many ordinary back-and-forth messages have ZERO facts — but a high-signal turn (introductions, backstory, biographical reveals, world lore) can be DENSE. Capture all of it: aim for ~5 facts on a normal turn, but go higher (up to ~12) when a message genuinely discloses that much. Missing a clearly-stated reveal is worse than one extra fact.
 
+# READ THE WHOLE MESSAGE — INCLUDING DIALOGUE
+
+Read the ENTIRE message, narration AND spoken dialogue. Do NOT skim the narration and ignore what characters SAY. Spoken dialogue is often the BEST signal for who a character is, how they change, and how they feel about others — confessions, admissions, opinions, threats, promises, and reveals almost always live in quotes. Extract characterizing facts from what people SAY, not just from narration. A line like a character admitting a fear, naming a relationship, or stating a value is exactly the kind of lasting fact you must capture. (Still skip pure reported/historical speech and [OOC:] — see ROLEPLAY MARKUP.)
+
 # CRITICAL RULES
 
 ATOMIC VALUES ONLY:
@@ -34,11 +38,15 @@ ROLEPLAY MARKUP:
 
 DO NOT STORE:
 - Negative/absence facts ("no favorite color revealed") — just omit.
-- Transient emotions (one-off "felt scared"). Only store if recurring 2+ scenes.
+- Pure moment-to-moment emotion that reads as scene atmosphere (a fleeting "felt scared" with no bearing on who they are). But DO record a behavior or habit that MIGHT be lasting even if you only see it once (see TEMPORARY-VS-LASTING below) — don't drop it just because you can't yet confirm it recurs.
 - Sensory atmosphere (light, smell, weather).
-- Verbatim dialogue unless it encodes a concrete fact.
 - Generic biology ("breathing", "heart beat").
 - Items momentarily in hand. Only \`carries / owns / wears\` persists.
+(Verbatim dialogue is NOT stored as a fact VALUE — but a meaningful line CAN be captured in the note field; see CONTEXT NOTE below.)
+
+TEMPORARY-VS-LASTING (you only see ~2 recent messages):
+- You often CAN'T tell a one-off from a lasting trait — e.g. a character smoking once vs. being a habitual smoker, an angry outburst vs. a hot temper. Do NOT skip these.
+- RECORD it anyway. If you can confidently file it (a clear habit/trait/state), use the proper category + aspect. If it's genuinely uncertain whether it lasts, file it to \`Unsorted\` + \`aspect:misc\` with a low importance (\`!1\`/\`!2\`) and an honest \`conf:low\`. A later re-evaluation pass will promote it to a real aspect if it recurs, or drop it if it was a one-off — so capturing it is cheap and losing it is the real cost.
 
 FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 - LAYER 1 \`Category\` (the domain), one of: People, Places, Things, Relationships, Events, World, Unsorted. (World = rules/lore/factions/setting. Unsorted = catch-all when none fit.)
@@ -58,6 +66,7 @@ FILING — TWO FIXED LAYERS (pick BOTH on every fact):
 
 #MEM
 + Category/key_snake_case = atomic value | aspect:identity | with:@<name> | @WhoKnows1,WhoKnows2 | #tag1,tag2 | rel:related_keys | @src:user | track:<track_name> | !3 | kind:trait | scope:character | at:<PLACE> | aka:nickname,role | conf:high | >context note
++ Category/key_snake_case | aspect:revelation | subj:@<name> | !4 | kind:event | >"verbatim quote or summary"   ← VALUE-LESS form: no \`=\`; the note carries the whole fact
 .
 #WHY <one sentence>
 
@@ -65,7 +74,21 @@ If nothing: just \`.\` immediately.
 
 SOURCE TAG (optional but preferred): append \`| @src:user\` if the fact was disclosed in the [USER] message, or \`| @src:char\` if it came from the [CHAR] message. This attributes each fact to the correct message. If you cannot tell, omit it.
 
-CONTEXT NOTE (optional, RARE): append \`| >...\` with a SHORT prose note ONLY when the fact's meaning depends on the surrounding situation and would be misread without it — e.g. a strategic admission that only makes sense once you know another party baited it. Do NOT add a context note to ordinary facts; most facts have none. The note is stored separately and never affects keyword search.
+CONTEXT NOTE (optional): append \`| >...\` with a SHORT prose note. Use it for THREE things:
+  1. DISAMBIGUATION — when the fact's meaning depends on the surrounding situation and would be misread without it (e.g. an admission that only makes sense once you know another party baited it).
+  2. A MEANINGFUL VERBATIM QUOTE — when a single spoken line carries the moment better than any atomic value can: an emotionally important confession, a defining declaration, a characterizing line. Store the quote in the note: \`>"<the exact line>"\`.
+  3. A SHORT SUMMARY — when a complex, multi-part scene or an emotionally important beat can't be carried by tags/value alone, summarize it in one or two sentences in the note.
+Most ordinary facts still have NO note. The note is stored separately and never affects keyword search.
+
+VALUE↔NOTE — NEVER DUPLICATE: never put the SAME information in both the value and the note.
+- If the NOTE already carries the fact (a quote or summary that says it all), OMIT the value entirely — including the placeholder \`= true\`. Write just \`+ Category/key | aspect:... | >...note...\` (no \`=\`). The fact is valid with a note and no value.
+- If the VALUE alone says it, add NO note.
+Generic examples:
+  GOOD: \`+ <X>/<subject>_confession | aspect:revelation | >"<full quote>"\`   (value omitted — the quote IS the fact)
+  BAD:  \`+ <X>/<subject>_confession = true | aspect:revelation | >"<full quote>"\`   (\`= true\` duplicates nothing useful — drop it)
+  GOOD: \`+ <X>/<subject>_home | aspect:home | >after the <EVENT> he first took her to his modest city apartment\`   (value omitted — the note contains it)
+  BAD:  \`+ <X>/<subject>_home = modest city apartment | aspect:home | >after the <EVENT> he took her to his modest city apartment\`   (the place is in BOTH — keep ONE)
+When in doubt: if the note repeats the value, delete the value.
 
 ALIASES (optional, only when useful): append \`| aka:...\` with a few comma-separated SHORT alternative names a LATER message might use for this fact's subject — a nickname, a role, or a descriptor (e.g. for a specific person: a pet name or "the man by the window"). This helps retrieval find the fact when the chat paraphrases instead of using the literal value. Aliases are search-only and never shown verbatim. Omit unless an alternative name is genuinely likely.
 
@@ -111,7 +134,7 @@ ATOMIC FORMAT — always write this instead:
 
 + People/tell_name = defensive tell
 
-# EXAMPLES (6)
+# EXAMPLES
 
 ---
 Input: [USER:{{user}}] "I'm <NAME>. I work at <ORG> in <CITY> as a <ROLE>. I love <FOOD>, I'm allergic to <ALLERGEN>, and honestly I'm exhausted today."
@@ -184,6 +207,23 @@ Input: [CHAR:{{char}}] "After what you did, I don't trust you anymore." *to {{us
 #WHY A relationship fact → ABSTRACT aspect (\`trust\`), NOT keyed by character; the who↔who rides the pair-tag \`subj:@{{char}}\` + \`with:@{{user}}\`. Trust changed → \`~\` supersedes.
 
 ---
+Input: [CHAR:{{char}}] *Voice cracking.* "I never told anyone this, but I've loved you since the day we met."
+
+#MEM
++ Events/char_confession | aspect:revelation | subj:{{char}} | with:@{{user}} | @{{char}},{{user}} | #confession,romance | @src:char | !4 | kind:event | >"I never told anyone this, but I've loved you since the day we met."
++ Relationships/char_user_romance = in love | aspect:romance | subj:@{{char}} | with:@{{user}} | @{{char}},{{user}} | #romance | @src:char | !4 | kind:state
+.
+#WHY The confession lives in DIALOGUE — the best signal here. The verbatim line matters emotionally, so it goes in the NOTE and the value is OMITTED entirely (no \`= true\`) — value↔note no-duplication. A separate abstract Relationships fact captures the durable state ("in love") that retrieval keys on.
+
+---
+Input: [CHAR:{{char}}] *Lights a cigarette, takes one drag, stubs it out.*
+
+#MEM
++ Unsorted/char_smoking = smoked once | aspect:misc | subj:{{char}} | @{{char}} | #habit | @src:char | !1 | kind:state | conf:low | >smoked a single cigarette this scene; unclear if a habit
+.
+#WHY Could be a one-off or a real habit — you can't tell from one message. RECORD it anyway to \`Unsorted\`/\`misc\` at low importance + \`conf:low\`; a later re-evaluation promotes it to People/vices if it recurs, or drops it as a one-off.
+
+---
 Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then continues on to the <PLACE_C>.*
 
 #MEM
@@ -198,7 +238,7 @@ Input: [CHAR:{{char}}] *Leaves the <PLACE_A> and walks to the <PLACE_B>, then co
 
 CAPTURE clearly-stated reveals even on a long turn: names, ages, origins, family, occupation, relationships, species, abilities, possessions, world facts, and lasting traits stated as fact are all worth storing. Don't drop them just because the message is long or you already have a few facts.
 
-Only SKIP when something is genuinely ambiguous, hypothetical, or a one-off transient. A clearly-disclosed fact should be captured even if you're slightly unsure of phrasing — atomize it conservatively. Reserve skipping for the truly uncertain; a wrong/verbose fact poisons retrieval, but a dropped clear reveal is the bug we're fixing.`;
+Only SKIP when something is purely hypothetical, [OOC:], reported/historical speech, or pure scene atmosphere. A clearly-disclosed fact should be captured even if you're slightly unsure of phrasing — atomize it conservatively. Do NOT skip a behavior/trait just because you can't yet tell if it lasts — record it (to its proper aspect if clear, else Unsorted/misc with conf:low); a later re-evaluation pass promotes or drops it. A wrong/verbose fact poisons retrieval, but a dropped clear reveal is the bug we're fixing.`;
 
 /**
  * Run Agent 3: Analyze message and update databases
@@ -309,7 +349,12 @@ function summarizeDatabases(databases) {
             if (fact.active === false) continue;
             const known = fact.knownBy?.length ? ` | @${fact.knownBy.join(',')}` : '';
             const tags = fact.tags?.length ? ` | #${fact.tags.join(',')}` : '';
-            lines.push(`${category}/${fact.key} = ${fact.value}${known}${tags}`);
+            // Value-less facts (note carries the fact) render as `key | >note` so the
+            // Scribe sees the full picture and doesn't re-extract it as missing.
+            const hasValue = String(fact.value ?? '').trim() !== '';
+            const note = (typeof fact.context === 'string' && fact.context.trim()) ? ` | >${fact.context.trim()}` : '';
+            const head = hasValue ? `${category}/${fact.key} = ${fact.value}` : `${category}/${fact.key}${note}`;
+            lines.push(`${head}${known}${tags}`);
         }
     }
     return lines.join('\n');
@@ -375,12 +420,29 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null) {
         line = line.slice(1).trim();
 
         // Parse: Category/key = value | @KnownBy | #tags
-        // Split on = first (rejoin if value contains =)
+        // VALUE-LESS FACTS (value/note no-duplication rule): a fact may OMIT the value
+        // entirely when its note (`>...`) carries the whole fact — written as
+        // `+ Category/key | aspect:... | >note` with NO `=`. We must NOT drop these.
+        // Detect the path-vs-rest split by the FIRST delimiter (`=` or `|`):
+        //   - if `=` comes first (or there's no `|`), it's the classic `key = value | ...`.
+        //   - if `|` comes first, there's no value — path is everything before the `|`
+        //     and `rest` starts with an empty value segment (so segments[0] === '').
         const eqIdx = line.indexOf('=');
-        if (eqIdx < 0) continue;
-
-        const pathPart = line.slice(0, eqIdx).trim();
-        const rest = line.slice(eqIdx + 1).trim();
+        const barIdx = line.indexOf('|');
+        let pathPart, rest;
+        if (eqIdx >= 0 && (barIdx < 0 || eqIdx < barIdx)) {
+            // Classic form: value present before any marker.
+            pathPart = line.slice(0, eqIdx).trim();
+            rest = line.slice(eqIdx + 1).trim();
+        } else if (barIdx >= 0) {
+            // Value-less form: no `=` before the first marker. Empty value; markers follow.
+            pathPart = line.slice(0, barIdx).trim();
+            rest = line.slice(barIdx); // keep the leading `|` so segments[0] is '' (empty value)
+        } else {
+            // Neither `=` nor `|`: a bare `+ Category/key` with no value and no markers.
+            pathPart = line.trim();
+            rest = '';
+        }
 
         // Parse category/key from path
         const slashIdx = pathPart.indexOf('/');

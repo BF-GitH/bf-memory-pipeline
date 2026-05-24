@@ -24,7 +24,7 @@
 // how large the DB has grown. A failure degrades gracefully — it never breaks the
 // pipeline (mirrors the existing agent fallbacks).
 
-import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase } from './database.js';
+import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog, setReflection } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -37,10 +37,22 @@ const MAX_TRACK_STEPS = 6;
 const MAX_SUMMARY_CHARS = 1200;
 // Cap synthesized observations per pass (defensive — the prompt asks for 0-5).
 const MAX_OBSERVATIONS = 8;
+// Re-evaluation pass: max uncertain facts (Unsorted/misc + stale states) reconsidered
+// per run — keeps the prompt bounded and the apply step cheap.
+const MAX_REEVAL_CANDIDATES = 15;
+// A current-state fact is "stale" (a re-eval candidate) once it hasn't been touched for
+// this long — it may be a one-off the extractor recorded that never recurred.
+const REEVAL_STALE_STATE_MS = 24 * 60 * 60 * 1000; // 24h of wall-clock since last update
 
 export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss.
 
 Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS you can infer ACROSS the material that are NOT already plainly stored as a single fact — e.g. "<SUBJECT> manipulates others for resources", "<SUBJECT> distrusts authority", "<SUBJECT> deflects with humor when vulnerable". Each is one short atomic clause. Only emit an observation you are genuinely confident the evidence supports, and that adds something the existing facts do not already say. If nothing rises above the existing facts, emit none.
+
+You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
+- PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
+- DROP — it was a confirmed one-off / no longer true / noise: discard it.
+- KEEP — still genuinely uncertain: leave it where it is for a later pass.
+Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fact by its exact id shown in brackets.
 
 # OUTPUT FORMAT (exactly this, nothing else)
 
@@ -48,8 +60,13 @@ Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS yo
 + <subject>_<short_pattern_key> = <atomic pattern clause>
 + <subject>_<short_pattern_key> = <atomic pattern clause>
 .
+#REEVAL
++ <id> = promote | <Category> | <aspect>
++ <id> = drop
++ <id> = keep
+.
 
-If there are no observations, put a single "." under #OBS. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Do not invent facts not supported by the material.`;
+If there are no observations, put a single "." under #OBS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Do not invent facts not supported by the material.`;
 
 /**
  * Build the compact, bounded input bundle for the reflection pass.
@@ -61,7 +78,37 @@ If there are no observations, put a single "." under #OBS. Keep observation keys
  * @param {Object} args.databases - all fact databases
  * @returns {string} the user-prompt data block
  */
-function buildReflectInput({ scene, databases }) {
+/**
+ * Collect uncertain facts worth a re-evaluation verdict: everything filed to
+ * Unsorted/misc, plus stale current-state facts (kind:state not touched for
+ * REEVAL_STALE_STATE_MS). Bounded to MAX_REEVAL_CANDIDATES (oldest first — the
+ * least-recently-confirmed are the best promote/drop candidates). Each candidate
+ * carries a stable id (`category::key`) so a verdict can be mapped back to the fact.
+ * @param {Object} databases
+ * @returns {Array<{id:string, category:string, key:string, fact:object}>}
+ */
+function collectReevalCandidates(databases) {
+    const now = Date.now();
+    const out = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || fact.active === false || fact.track) continue; // skip history snapshots + timeline steps
+            const aspect = String(fact.aspect || '').toLowerCase();
+            const kind = String(fact.kind || '').toLowerCase();
+            const isMisc = category === 'Unsorted' || aspect === 'misc';
+            const lastUpdated = Number(fact.lastUpdated) || 0;
+            const isStaleState = kind === 'state' && lastUpdated > 0 && (now - lastUpdated) >= REEVAL_STALE_STATE_MS;
+            if (isMisc || isStaleState) {
+                out.push({ id: `${category}::${fact.key}`, category, key: fact.key, fact });
+            }
+        }
+    }
+    // Oldest-confirmed first, then cap.
+    out.sort((a, b) => (Number(a.fact.lastUpdated) || 0) - (Number(b.fact.lastUpdated) || 0));
+    return out.slice(0, MAX_REEVAL_CANDIDATES);
+}
+
+function buildReflectInput({ scene, databases, reevalCandidates = [] }) {
     const parts = [];
 
     // FIX #12: the prior "story so far" summary is intentionally NOT prepended anymore — the
@@ -107,7 +154,20 @@ function buildReflectInput({ scene, databases }) {
     }
     if (factSummary) parts.push(`## Stored facts (current)\n${factSummary}`);
 
-    parts.push('\nNow output ONLY the #OBS section.');
+    // Re-evaluation candidates (uncertain Unsorted/misc + stale states). Each line is
+    // `[id] Category/key = value (note)` so the model can return a verdict per id.
+    if (Array.isArray(reevalCandidates) && reevalCandidates.length) {
+        const reLines = reevalCandidates.map(c => {
+            const f = c.fact;
+            const val = String(f.value ?? '').trim();
+            const note = (typeof f.context === 'string' && f.context.trim()) ? ` >${f.context.trim()}` : '';
+            const body = val ? ` = ${val}` : '';
+            return `[${c.id}] ${c.category}/${c.key}${body}${note}`;
+        });
+        parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
+    }
+
+    parts.push('\nNow output ONLY the #OBS and #REEVAL sections.');
     return parts.join('\n\n');
 }
 
@@ -118,7 +178,7 @@ function buildReflectInput({ scene, databases }) {
  * @returns {{summary: string, observations: Array<{key:string,value:string}>}}
  */
 export function parseReflectResult(response) {
-    const out = { summary: '', observations: [] };
+    const out = { summary: '', observations: [], reevals: [] };
     if (!response || !response.trim()) return out;
 
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
@@ -132,8 +192,8 @@ export function parseReflectResult(response) {
         out.summary = s;
     }
 
-    // #OBS lines: `+ key = value`.
-    const obsMatch = text.match(/#OBS\s*([\s\S]*?)$/i);
+    // #OBS lines: `+ key = value`. Bounded BEFORE #REEVAL so it can't swallow it.
+    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
     if (obsMatch) {
         const block = obsMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -152,6 +212,35 @@ export function parseReflectResult(response) {
                 if (!key || !value) continue;
                 out.observations.push({ key, value });
                 if (out.observations.length >= MAX_OBSERVATIONS) break;
+            }
+        }
+    }
+
+    // #REEVAL lines: `+ <id> = promote | <Category> | <aspect>` / `= drop` / `= keep`.
+    // The id is the candidate's `category::key` token emitted in the prompt.
+    const reMatch = text.match(/#REEVAL\s*([\s\S]*?)$/i);
+    if (reMatch) {
+        const block = reMatch[1].trim();
+        if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
+            for (const rawLine of block.split('\n')) {
+                let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
+                if (!line || line === '.' || !line.startsWith('+')) continue;
+                line = line.slice(1).trim();
+                const eqIdx = line.indexOf('=');
+                if (eqIdx < 0) continue;
+                // The id may be wrapped in [brackets] as printed in the prompt — strip them.
+                let id = line.slice(0, eqIdx).trim().replace(/^\[|\]$/g, '').trim();
+                const verdictPart = line.slice(eqIdx + 1).trim();
+                const segs = verdictPart.split('|').map(s => s.trim()).filter(Boolean);
+                const verdict = (segs[0] || '').toLowerCase();
+                if (!id || !verdict) continue;
+                if (verdict.startsWith('promote')) {
+                    out.reevals.push({ id, verdict: 'promote', category: segs[1] || '', aspect: (segs[2] || '').toLowerCase() });
+                } else if (verdict.startsWith('drop')) {
+                    out.reevals.push({ id, verdict: 'drop' });
+                } else {
+                    out.reevals.push({ id, verdict: 'keep' });
+                }
             }
         }
     }
@@ -210,10 +299,15 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
 
         const systemPrompt = substitute(settings?.reflectionPrompt || DEFAULT_REFLECT_PROMPT);
 
+        // Re-evaluation: gather uncertain facts (Unsorted/misc + stale states) so the SAME
+        // reflection LLM call can also issue promote/drop/keep verdicts on them. Bounded.
+        const reevalCandidates = collectReevalCandidates(databases);
+        const reevalById = new Map(reevalCandidates.map(c => [c.id, c]));
+
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, databases }));
+        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
@@ -263,8 +357,73 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             }
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}`);
-        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, tokensIn, tokensOut };
+        // RE-EVALUATION: apply promote/drop verdicts on the uncertain candidates. PROMOTE
+        // moves the fact to its proper Layer-1 category + aspect (and bumps importance so it
+        // stops looking transient); DROP removes a confirmed one-off; KEEP/unknown is a no-op.
+        // Cheap, bounded by MAX_REEVAL_CANDIDATES, and logged with reasons. Best-effort.
+        let promoted = 0, dropped = 0;
+        const reevalModified = new Set();
+        for (const v of (parsed.reevals || [])) {
+            const cand = reevalById.get(v.id);
+            if (!cand) continue; // hallucinated id — skip
+            const fromDb = databases[cand.category];
+            if (!fromDb) continue;
+            const fact = (fromDb.facts || []).find(f => f.key === cand.key && f.active !== false);
+            if (!fact) continue; // already gone (deduped/superseded since collection)
+
+            if (v.verdict === 'drop') {
+                removeFact(fromDb, cand.key);
+                reevalModified.add(cand.category);
+                dropped++;
+                addDebugLog('info', `[${runId}] Re-eval DROP: [${cand.category}] ${cand.key} = "${String(fact.value ?? '').slice(0, 60)}"`, {
+                    subsystem: 'db', event: 'fact.reeval_dropped', reason: 'CONFIRMED_ONE_OFF',
+                    data: { category: cand.category, key: cand.key },
+                });
+                continue;
+            }
+
+            if (v.verdict === 'promote') {
+                const newCat = L1_CATEGORIES.includes(v.category) ? v.category : cand.category;
+                const newAspect = normalizeAspect(v.aspect, newCat);
+                // Re-typed from an uncertain misc/state into a confirmed lasting fact: lift to a
+                // durable trait and a non-trivial importance so it survives eviction. Carry the
+                // fact's content + tags forward unchanged.
+                const moved = {
+                    ...fact,
+                    category: newCat,
+                    aspect: newAspect,
+                    kind: 'trait',
+                    importance: Math.max(3, Number(fact.importance) || 0),
+                    source: `reflection_reeval_${runId}`,
+                };
+                delete moved.lastUpdated; // upsertFact stamps a fresh one
+                if (newCat !== cand.category) {
+                    if (!databases[newCat]) databases[newCat] = createEmptyDatabase(newCat);
+                    upsertFact(databases[newCat], moved);
+                    removeFact(fromDb, cand.key);
+                    reevalModified.add(cand.category);
+                    reevalModified.add(newCat);
+                } else {
+                    upsertFact(fromDb, moved);
+                    reevalModified.add(cand.category);
+                }
+                promoted++;
+                addDebugLog('info', `[${runId}] Re-eval PROMOTE: [${cand.category}] ${cand.key} → ${newCat}/${newAspect}`, {
+                    subsystem: 'db', event: 'fact.reeval_promoted', reason: 'CONFIRMED_LASTING',
+                    data: { fromCategory: cand.category, toCategory: newCat, key: cand.key, aspect: newAspect },
+                });
+            }
+        }
+        for (const category of reevalModified) {
+            try { await saveDatabase(databases[category]); }
+            catch (err) { addDebugLog('fail', `[${runId}] Re-eval failed to save "${category}": ${err.message || err}`); }
+        }
+        if (promoted || dropped) {
+            addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
+        }
+
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, reeval(+${promoted}/-${dropped})`);
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, promoted, dropped, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
         return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };

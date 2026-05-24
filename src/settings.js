@@ -110,11 +110,6 @@ const DEFAULT_SETTINGS = {
     // pipeline.js — only the debug-log preview is substring'd, never the prompt).
     agent1ContextMessages: 5,
     agent3ContextMessages: 5,
-    // Per-message char limit applied when formatting recent messages for Agent 1 (the
-    // draft planner). Raised from a hard 500 to 2000 (matching the bumped character-card
-    // limit) so Agent 1 sees the full back half of longer turns instead of a truncated
-    // view. Clamped 200..8000 in validateSettings.
-    draftMsgCharLimit: 2000,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -222,7 +217,6 @@ function validateSettings(s) {
     s.agent1ContextMessages = Math.floor(clamp(s.agent1ContextMessages, 1, 50, 5));
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
-    s.draftMsgCharLimit = Math.floor(clamp(s.draftMsgCharLimit, 200, 8000, 2000));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
@@ -2160,16 +2154,6 @@ export async function initSettings() {
         extensionSettings.agent1ContextMessages = val;
         $('#bf_mem_agent1_context_val').text(val);
         if (before !== val) addDebugLog('debug', `Agent 1 context messages: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'agent1ContextMessages' }, before, after: val });
-        saveSettings();
-    });
-
-    // Agent 1 per-message char limit slider (refinement #5)
-    $('#bf_mem_draft_charlimit').val(extensionSettings.draftMsgCharLimit);
-    $('#bf_mem_draft_charlimit_val').text(extensionSettings.draftMsgCharLimit);
-    $('#bf_mem_draft_charlimit').on('input', function () {
-        const val = parseInt($(this).val());
-        extensionSettings.draftMsgCharLimit = val;
-        $('#bf_mem_draft_charlimit_val').text(val);
         saveSettings();
     });
 

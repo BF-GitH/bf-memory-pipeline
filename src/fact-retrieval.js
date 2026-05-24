@@ -688,13 +688,25 @@ function formatFactsForWriter(results) {
     for (const { fact, category, tier } of results) {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
+        const hasValue = String(fact.value ?? '').trim() !== '';
+        const note = (typeof fact.context === 'string' && fact.context.trim()) ? fact.context.trim() : '';
         // Keep the KEY (Feature #2b) so the writer sees `Category/key = value` and can
-        // tell similar facts apart and use them precisely.
-        let line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
-        // Feature #3: surface the optional context note for TOP-TIER (primary) facts
-        // only, to bound tokens. Secondary/tertiary lines never carry context.
-        if (tier === 'primary' && typeof fact.context === 'string' && fact.context.trim()) {
-            line += ` — ${fact.context.trim()}`;
+        // tell similar facts apart and use them precisely. VALUE-LESS facts (no `value`,
+        // the note carries the whole fact — value/note no-duplication rule) drop the
+        // `= value` part and surface the note as the fact body instead.
+        let line;
+        if (hasValue) {
+            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
+            // Feature #3: surface the optional context note for TOP-TIER (primary) facts
+            // only, to bound tokens. Secondary/tertiary lines never carry context.
+            if (tier === 'primary' && note) line += ` — ${note}`;
+        } else if (note) {
+            // No value: the note IS the fact. Show it across all tiers so the meaning
+            // isn't lost (a value-less fact with no note would be empty otherwise).
+            line = `${prefix} ${category}/${fact.key}: ${note}`;
+        } else {
+            // Degenerate: neither value nor note — keep the key so it's still visible.
+            line = `${prefix} ${category}/${fact.key}`;
         }
         lines.push(line);
     }

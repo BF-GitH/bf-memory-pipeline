@@ -295,17 +295,16 @@ function getRecentMessages(count) {
 }
 
 /**
- * Format messages for Agent 1
- * Per-message char limit is configurable (draftMsgCharLimit, default 2000) — the old
- * hard 500-char clip truncated Agent 1's view of recent messages, hiding the back half
- * of longer turns. 2000 matches the character-card limit bumped elsewhere. Clamped in
- * validateSettings so a bad value can't blank or explode the prompt.
+ * Format messages for Agent 1 (Drafter)
+ * Messages are passed in FULL — there is no per-message char cap. The old
+ * draftMsgCharLimit truncated each message and hid the back half of longer turns,
+ * costing the Drafter context. The message COUNT is still bounded by
+ * agent1ContextMessages upstream.
  */
 function formatMessagesForDraft(messages) {
-    const limit = Math.max(200, getSettings()?.draftMsgCharLimit || 2000);
     return messages.map((msg, idx) => {
         const role = msg.is_user ? 'USER' : 'AI';
-        return `Message ${idx + 1}: ${role}: ${msg.mes.substring(0, limit)}`;
+        return `Message ${idx + 1}: ${role}: ${msg.mes}`;
     }).join('\n');
 }
 
