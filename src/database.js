@@ -2502,7 +2502,7 @@ export function upsertFact(db, fact) {
             db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
             addDebugLog('debug', `Sequence step added: [${db.category}] ${seqFact.key} (track ${seqFact.track}, ord ${ord})`, {
                 subsystem: 'db', event: 'fact.created',
-                data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: factAspect(seqFact), track: seqFact.track, ord, isSequence: true },
+                data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: deriveAspect(seqFact), track: seqFact.track, ord, isSequence: true },
             });
         }
         db.updatedAt = Date.now();
@@ -2550,7 +2550,7 @@ export function upsertFact(db, fact) {
             if (fromKey !== intoKey) {
                 addDebugLog('debug', `Merged parallel state key: [${db.category}] ${fromKey} → ${intoKey}`, {
                     subsystem: 'db', event: 'fact.merged', reason: 'PARALLEL_KEY_DEDUP',
-                    data: { category: db.category, fromKey, intoKey, subject: deriveSubject(fact), aspect: factAspect(fact) },
+                    data: { category: db.category, fromKey, intoKey, subject: deriveSubject(fact), aspect: deriveAspect(fact) },
                 });
             }
         }
@@ -2616,7 +2616,7 @@ export function upsertFact(db, fact) {
             addDebugLog('info', `Fact superseded: [${db.category}] ${existing.key} (old kept as ${snapshotKey})`, {
                 subsystem: 'db', event: 'fact.superseded',
                 reason: supersedesSignal ? 'EXPLICIT_SUPERSEDE_MARKER' : 'STATE_CHANGED_HEURISTIC',
-                data: { category: db.category, key: existing.key, snapshotKey, subject: deriveSubject(existing), aspect: factAspect(existing) },
+                data: { category: db.category, key: existing.key, snapshotKey, subject: deriveSubject(existing), aspect: deriveAspect(existing) },
                 before: oldSupersededValue, after: fact.value,
             });
             return db;
@@ -2634,7 +2634,7 @@ export function upsertFact(db, fact) {
         } else {
             addDebugLog('info', `Fact updated: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
-                data: { category: db.category, key: existing.key, subject: deriveSubject(existing), aspect: factAspect(existing), via: matchVia },
+                data: { category: db.category, key: existing.key, subject: deriveSubject(existing), aspect: deriveAspect(existing), via: matchVia },
                 before: oldValue, after: fact.value,
             });
         }
@@ -2642,7 +2642,7 @@ export function upsertFact(db, fact) {
         db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
         addDebugLog('info', `Fact created: [${db.category}] ${fact.key}`, {
             subsystem: 'db', event: 'fact.created',
-            data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: factAspect(fact) },
+            data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: deriveAspect(fact) },
         });
     }
     db.updatedAt = Date.now();
@@ -2694,7 +2694,12 @@ function stripSupersededSuffix(key) {
  */
 export function deriveSubject(fact) {
     if (!fact) return '';
-    const explicit = String(fact.subject || '').trim().toLowerCase();
+    // Defensive `@`-strip (composes with the parser-side strip in agent-memory.js): a stored
+    // subject must NEVER carry the Scribe's `@<name>` sigil — a leading `@` would break the
+    // `key.startsWith(subject + '_')` facet/dedup check, the bySubject index, and the focus
+    // filter. Strip it on read so any legacy `@`-polluted fact self-heals (lowercased/trimmed
+    // consistently with how subjects are normalized elsewhere).
+    const explicit = String(fact.subject || '').trim().toLowerCase().replace(/^@/, '').trim();
     if (explicit) return resolveGenericSubjectToken(explicit);
     const key = String(fact.key || '').trim().toLowerCase();
     if (!key) return '';
@@ -2730,7 +2735,10 @@ const _RESERVED_USER_SUBJECT = new Set(['user', '{{user}}', 'persona']);
  * @returns {string}
  */
 function resolveGenericSubjectToken(token) {
-    const t = String(token || '').trim().toLowerCase();
+    // Defensive `@`-strip: an incoming token may still carry the Scribe's `@<name>` sigil (e.g.
+    // `@char`/`@{{char}}`). Strip it so the reserved-token lookup below matches the bare form
+    // (`@char` → `char`) and no `@`-prefixed literal is ever returned as a subject.
+    const t = String(token || '').trim().toLowerCase().replace(/^@/, '').trim();
     if (!t) return '';
     let real = '';
     try {

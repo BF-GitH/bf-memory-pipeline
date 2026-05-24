@@ -111,6 +111,8 @@ SCOPE (recommended): append \`| scope:character|place|event\`. \`character\` = s
 
 INVOLVED (recommended): append \`| with:@<A>,@<B>\` listing the participants/entities IN the fact — this is the CHARACTER TAG axis (distinct from @WhoKnows = who KNOWS it). If omitted the system auto-fills it from names in the value. Use it especially to NAME an unnamed person (see NPC below).
 
+WHO KNOWS (optional — only for SECRETS): append \`| @<name1>,<name2>\` listing who KNOWS the fact ONLY when the knowledge is RESTRICTED — a secret, a private confession, something one party is hiding. Do NOT add it to ordinary facts: when omitted it defaults to the present pair (the speaking character + the user), which is what you want for anything openly shared. Use it to keep a secret out of reach of characters who shouldn't know it yet.
+
 NPC DRAWER (important): for a fact about an UNNAMED or one-off/incidental person (a passing stranger, "the man by the window", an unnamed waiter), file it under the shared subject by writing \`| subj:npc\` AND name the person in \`| with:the man by the window\` (the descriptor). Keep the category/aspect/kind as normal. This stops walk-ons from cluttering the store; a later step promotes them once they get a real name.
 
 LOCATION (optional, events): for an \`scope:event\` fact, append \`| at:<PLACE>\` naming WHERE it happened (a place subject/key). Pair with \`with:\` (who) so the event links place⇄people. Example: \`+ Events/char_admission = ... | aspect:milestone | scope:event | at:<PLACE> | with:@<NAME>\`.
@@ -663,7 +665,15 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
             // When omitted, the subject is DERIVED from the key prefix at storage time.
             const subjMatch = seg.match(/^subj\s*:\s*(.+)$/i);
             if (subjMatch) {
-                subject = subjMatch[1].trim();
+                // 3-layer model: the Scribe writes the subject as `@<name>` (e.g. `subj:@<name>`,
+                // and the generic `@char`/`@{{char}}`). Strip the leading `@` sigil so the STORED
+                // subject is the bare name — a `@`-prefixed subject silently breaks the bySubject
+                // index, the focus filter, factAspect/findParallelStateKey state-dedup (their
+                // `key.startsWith(subject + '_')` check), so it must never reach storage. The
+                // bare token then composes with the keystone name-resolution below
+                // (resolveGenericNames maps `char`/`{{char}}` → the real name). DISTINCT from the
+                // `with:` partner tag, which intentionally keeps its own `@`-stripped name list.
+                subject = subjMatch[1].trim().replace(/^@/, '').trim();
                 continue;
             }
 
@@ -818,6 +828,23 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         if (!importanceStated) {
             importance = inferImportance(category, kind, key, resolvedAspect);
             inferred.push('importance');
+        }
+
+        // WHO-KNOWS default (knownBy axis): the Scribe rarely emits `@WhoKnows`, and an EMPTY
+        // knownBy is treated as "everyone knows" downstream (fact-retrieval visibility). That
+        // leaves the secret-knowledge axis effectively unused. When omitted, DEFAULT it to the
+        // PRESENT PAIR — the resolved source character + the user persona (the same real names
+        // already threaded in for the keystone resolution) — so "both present parties know it" is
+        // the baseline and a later third-party reveal can be modeled by an explicit list.
+        // CONSERVATIVE: this is intentionally broad (both present parties, never narrower than the
+        // speaker alone), `@`-stripped + de-duped; if NEITHER name resolves we leave knownBy empty
+        // so the fact stays globally visible rather than being hidden by an empty-but-non-default
+        // list. Markers like `@everyone`/`@all` the model DID emit are left untouched.
+        if (Array.isArray(knownBy) && knownBy.length === 0) {
+            const present = [names?.charName, names?.userName]
+                .map(n => String(n || '').trim().replace(/^@/, '').trim())
+                .filter(Boolean);
+            knownBy = [...new Set(present)];
         }
 
         const update = {

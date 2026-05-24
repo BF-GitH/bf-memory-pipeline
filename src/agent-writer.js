@@ -172,6 +172,21 @@ export function buildWriterInjection(draft, factsFormatted, sceneBlock = '') {
 }
 
 /**
+ * Best-effort fire-and-forget debug log from the synchronous injection seam. settings.js is
+ * imported lazily to dodge the agent-writer <-> settings import cycle; we do NOT await (this seam
+ * runs inside ST's synchronous CHAT_COMPLETION_PROMPT_READY handler and must return its boolean
+ * immediately). Logging must never break injection — all errors are swallowed.
+ * @param {string} level
+ * @param {string} message
+ * @param {object} [opts]
+ */
+function writerLog(level, message, opts = {}) {
+    import('./settings.js')
+        .then(({ addDebugLog }) => { try { addDebugLog(level, message, opts); } catch { /* never throw */ } })
+        .catch(() => { /* settings unavailable — logging is non-essential */ });
+}
+
+/**
  * Inject the memory context into the chat completion prompt
  * Called via CHAT_COMPLETION_PROMPT_READY event
  * @param {object} data - Prompt data from ST event
@@ -186,25 +201,73 @@ export function injectMemoryContext(data, injection, options = {}) {
     if (!injection) return false;
     const trimToLast = Math.max(0, options.trimToLast || 0);
 
-    // Try chat completion format (array of messages)
-    if (data && data.chat && Array.isArray(data.chat)) {
-        if (trimToLast > 0) trimChatHistory(data.chat, trimToLast);
-        return injectIntoMessages(data.chat, injection);
+    // Try the known message-array container shapes IN ORDER. Different ST builds deliver the
+    // CHAT_COMPLETION_PROMPT_READY array under different property names; we try each so memory
+    // reaches the Writer on more builds than just the documented `data.chat`. The pipeline caller
+    // reads `data.chat || data.messages` for its baseline count, so those two are the primary
+    // shapes; the rest are defensive fallbacks for builds that nest the array elsewhere.
+    const arrCandidate = firstMessageArray(data);
+    if (arrCandidate) {
+        if (trimToLast > 0) trimChatHistory(arrCandidate, trimToLast);
+        return injectIntoMessages(arrCandidate, injection);
     }
 
-    // Try messages array format
-    if (data && data.messages && Array.isArray(data.messages)) {
-        if (trimToLast > 0) trimChatHistory(data.messages, trimToLast);
-        return injectIntoMessages(data.messages, injection);
-    }
-
-    // Text completion format: prompt is a single string, no per-message trimming possible
+    // Text completion format: prompt is a single string, no per-message trimming possible.
     if (data && typeof data.prompt === 'string') {
         data.prompt = injection + '\n\n' + data.prompt;
         return true;
     }
 
+    // FAILURE PATH: no usable prompt container on this ST build. DUMP what was actually received
+    // so the next exported Debug log reveals the real container shape (instead of a bare "Failed
+    // to inject"). Fire-and-forget — this seam is synchronous and must return its boolean now.
+    writerLog('fail', 'injectMemoryContext: no usable prompt container on this event payload', {
+        subsystem: 'writer', event: 'inject.failed', reason: 'NO_CONTAINER',
+        data: describeInjectPayload(data),
+    });
     return false;
+}
+
+/**
+ * Return the first usable message-ARRAY container on a CHAT_COMPLETION_PROMPT_READY payload,
+ * trying the known shapes in order: the documented `data.chat`, then `data.messages`, then a
+ * couple of nested fallbacks some ST builds use (`data.prompt` when it is itself an array,
+ * `data.chatCompletion`, `data.messageArray`). Returns null when none is an array. Empty arrays
+ * ARE returned (a no-op chat is still a valid injection target — injectIntoMessages pushes into
+ * it rather than dropping memory on a greeting/first turn).
+ * @param {object} data
+ * @returns {Array|null}
+ */
+function firstMessageArray(data) {
+    if (!data || typeof data !== 'object') return null;
+    const candidates = [data.chat, data.messages, data.prompt, data.chatCompletion, data.messageArray];
+    for (const c of candidates) {
+        if (Array.isArray(c)) return c;
+    }
+    return null;
+}
+
+/**
+ * Build a compact, non-throwing diagnostic of a CHAT_COMPLETION_PROMPT_READY payload for the
+ * fail-level inject log: the keys present on `data` and the type/length of the candidate
+ * containers, so a maintainer reading the exported log can see exactly which container shape the
+ * user's ST build delivered. Never includes message CONTENT (privacy + log size).
+ * @param {*} data
+ * @returns {object}
+ */
+function describeInjectPayload(data) {
+    const out = { dataType: typeof data, keys: [] };
+    if (!data || typeof data !== 'object') return out;
+    try { out.keys = Object.keys(data); } catch { /* exotic object — leave keys empty */ }
+    const describe = (v) => {
+        if (Array.isArray(v)) return { type: 'array', length: v.length };
+        if (typeof v === 'string') return { type: 'string', length: v.length };
+        return { type: typeof v };
+    };
+    out.chat = describe(data.chat);
+    out.messages = describe(data.messages);
+    out.prompt = describe(data.prompt);
+    return out;
 }
 
 /**
@@ -234,7 +297,15 @@ function trimChatHistory(messages, keepLast) {
  * @returns {boolean}
  */
 function injectIntoMessages(messages, injection) {
-    if (!Array.isArray(messages) || messages.length === 0) return false;
+    if (!Array.isArray(messages)) return false;
+
+    // Empty messages array (greeting / first turn): a no-op chat is still a valid injection
+    // target — PUSH the system message rather than dropping memory by returning false.
+    if (messages.length === 0) {
+        messages.push({ role: 'system', content: injection });
+        console.log('[BFMemory] Memory context injected into empty prompt');
+        return true;
+    }
 
     // Find the last user message
     let lastUserIdx = -1;
