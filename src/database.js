@@ -5,11 +5,20 @@
 import { addDebugLog } from './settings.js';
 
 const DB_PREFIX = 'bf_memory_db_';
-// Deliberate per-category fact cap. This is a token-cost product decision: every
-// stored fact can end up in the retrieval/injection budget, so the owner caps it
-// to keep prompts cheap. Raise this only as a conscious cost tradeoff. Eviction
-// beyond this cap is now logged (FIX #4) instead of happening silently.
-const MAX_FACTS_PER_DB = 50;
+// INFINITE FACTS — NEVER DELETE. We no longer evict/delete facts when a category grows.
+// The store is durable (IndexedDB working copy + attachment snapshot) and UNBOUNDED per
+// category, so correctness ("never lose a fact") is guaranteed. What was the old eviction
+// cap is now a SOFT HOT-SET SIZE: when a category holds more than this many ACTIVE
+// non-sequence facts, the LOWEST-salience overflow is COLD-TIERED (cold:true) instead of
+// deleted. Cold facts stay on disk + in the snapshot, are deprioritized by retrieval/menu,
+// and are UN-COLDED the instant they're re-mentioned/updated or directly matched by a query
+// (relevance resurrects them). Sequence/track facts and high-importance facts are never
+// cold-tiered. Raising HOT_SET_SIZE only widens the always-hot working set (a token-cost
+// tradeoff); it never affects whether a fact is kept (everything is kept).
+const HOT_SET_SIZE = 50;
+// Importance at/above which a fact is PROTECTED from cold-tiering regardless of recency —
+// foundational identity facts (importance 5) stay hot even in a huge store.
+const COLD_TIER_PROTECT_IMPORTANCE = 5;
 
 // Salience defaults (importance/kind feature). Applied when a fact lacks the field so
 // older facts behave sensibly. importance is 1-5 (3 = neutral), kind is trait/state/event.
@@ -17,12 +26,13 @@ export const DEFAULT_IMPORTANCE = 3;
 export const DEFAULT_KIND = 'trait';
 const VALID_KINDS = new Set(['trait', 'state', 'event']);
 
-// Salience-aware eviction tuning (saveDatabase). A fact's keep-score blends normalized
+// Salience-aware COLD-TIERING tuning (saveDatabase). A fact's keep-score blends normalized
 // importance with a recency term, and `kind` sets how fast recency decays:
 //   score = IMPORTANCE_WEIGHT*(importance/5) + RECENCY_WEIGHT*recencyDecay(age, kind)
-// Traits decay slowly (long half-life → near-permanent protection for foundational
-// identity facts even when stale); states/events decay fast so transient goals/moods
-// lose to permanent traits when the cap forces a cut. Lowest score is evicted first.
+// Traits decay slowly (long half-life → near-permanent hot protection for foundational
+// identity facts even when stale); states/events decay fast so transient goals/moods are
+// the first to be COLD-TIERED (NOT deleted) when the hot-set overflows. Lowest score is
+// cold-tiered first; the fact is never removed.
 const IMPORTANCE_WEIGHT = 0.65;
 const RECENCY_WEIGHT = 0.35;
 // Half-lives in days (recency term = 0.5 ** (ageDays / halfLife)).
@@ -341,6 +351,49 @@ export function deriveScope(fact) {
  */
 export function isActiveFact(fact) {
     return !(fact && fact.active === false);
+}
+
+/**
+ * True when a fact is HOT (in the preferred working set) — the default. A fact is cold ONLY
+ * when explicitly flagged `cold === true` by the salience-aware cold-tiering in saveDatabase.
+ * Absent/false `cold` => hot, so every fact written before this feature is hot (back-compat).
+ * Cold facts are NEVER deleted: they stay durable in IDB + the snapshot and remain queryable
+ * (relevance can resurrect them); they are only deprioritized by retrieval/menu.
+ * @param {FactSchema} fact
+ * @returns {boolean}
+ */
+export function isHotFact(fact) {
+    return !(fact && fact.cold === true);
+}
+
+/**
+ * True when a fact is COLD (deprioritized overflow). Convenience inverse of isHotFact.
+ * @param {FactSchema} fact
+ * @returns {boolean}
+ */
+export function isColdFact(fact) {
+    return !!(fact && fact.cold === true);
+}
+
+/**
+ * UN-COLD a fact in place (resurrection). Clears the `cold` flag and logs `fact.resurfaced`
+ * (standing debug-logging rule) so the Debug tab shows a cold fact was pulled back into the
+ * hot working set because it was re-mentioned/updated or directly matched a query. No-op (and
+ * no log) when the fact was already hot. Returns true when it actually un-colded.
+ * @param {FactSchema} fact - the stored fact object (mutated in place)
+ * @param {string} category - owning category (for the log)
+ * @param {string} reason - structured reason code (e.g. 'COLD_REACTIVATED')
+ * @param {string} [detail] - optional human note (e.g. what touched it)
+ * @returns {boolean}
+ */
+export function uncoldFact(fact, category, reason = 'COLD_REACTIVATED', detail = '') {
+    if (!fact || fact.cold !== true) return false;
+    delete fact.cold;
+    addDebugLog('info', `Fact resurfaced (un-cold): [${category}] ${fact.key}${detail ? ` — ${detail}` : ''}`, {
+        subsystem: 'db', event: 'fact.resurfaced', reason,
+        data: { category, key: fact.key, salienceScore: Number(salienceScore(fact, Date.now()).toFixed(3)) },
+    });
+    return true;
 }
 
 /**
@@ -937,6 +990,74 @@ export async function getDatabase(category) {
 }
 
 /**
+ * RANK-NOT-EVICT cold-tiering (replaces the old cap-based DELETION). When a category's ACTIVE
+ * HOT non-sequence facts exceed HOT_SET_SIZE, mark the LOWEST-salience overflow `cold:true` in
+ * place — NEVER deleting anything. Cold facts stay durable + queryable; they're just
+ * deprioritized by retrieval/menu until re-mentioned/matched (which un-colds them).
+ *
+ * PROTECTED (never cold-tiered): sequence/track facts (ordered chains), superseded/inactive
+ * history snapshots (already lowest priority, handled by isActiveFact), and high-importance
+ * facts (importance >= COLD_TIER_PROTECT_IMPORTANCE — foundational identity stays hot). Among
+ * the remaining demotable facts we keep the HIGHEST-salience HOT_SET_SIZE hot and cold-tier the
+ * rest, lowest salience first (importance + kind-modulated recency — same blend the old eviction
+ * used). Idempotent: a fact already cold and still in the overflow stays cold (no re-log).
+ *
+ * Logs `fact.demoted` (level info, reason COLD_TIERED_LOW_SALIENCE) per newly-cold fact. NEVER
+ * logs a deletion — there are none. Mutates db.facts entries in place; returns nothing.
+ * @param {DatabaseSchema} db
+ */
+function coldTierOverflow(db) {
+    if (!db || !Array.isArray(db.facts)) return;
+    const now = Date.now();
+
+    // Candidates that may be cold-tiered: ACTIVE, non-sequence, below the protect-importance
+    // floor. Everything else is structurally protected and always counts as hot.
+    const demotable = [];
+    for (const f of db.facts) {
+        if (!f || typeof f !== 'object') continue;
+        if (!isActiveFact(f)) continue;                                  // history snapshots: not in the hot set
+        if (isSequenceFact(f)) continue;                                 // ordered chains: never cold-tiered
+        if (clampImportance(f.importance) >= COLD_TIER_PROTECT_IMPORTANCE) continue; // foundational: stay hot
+        demotable.push(f);
+    }
+
+    // The hot working set is bounded by HOT_SET_SIZE across the demotable pool: keep the
+    // highest-salience HOT_SET_SIZE hot, cold-tier the remainder (lowest salience first).
+    if (demotable.length <= HOT_SET_SIZE) {
+        // Under budget — nothing should be cold. Resurrect any fact that was previously cold
+        // (e.g. the store shrank via supersession) so we don't strand stale cold flags.
+        for (const f of demotable) {
+            if (f.cold === true) uncoldFact(f, db.category, 'COLD_REACTIVATED', 'hot-set no longer over budget');
+        }
+        return;
+    }
+
+    // Sort descending by salience; the first HOT_SET_SIZE are hot, the tail is cold.
+    const ranked = demotable.slice().sort((a, b) => salienceScore(b, now) - salienceScore(a, now));
+    const keepHot = ranked.slice(0, HOT_SET_SIZE);
+    const goCold = ranked.slice(HOT_SET_SIZE);
+
+    // Anything that climbed back into the hot slice but was flagged cold gets resurrected.
+    for (const f of keepHot) {
+        if (f.cold === true) uncoldFact(f, db.category, 'COLD_REACTIVATED', 'rose back into hot set');
+    }
+
+    // Cold-tier the overflow tail. Only NEWLY-cold facts are flagged + logged (idempotent).
+    for (const f of goCold) {
+        if (f.cold === true) continue; // already cold; leave as-is (no re-log)
+        f.cold = true;
+        addDebugLog('info', `Fact cold-tiered (kept, deprioritized): [${db.category}] ${f.key} (score ${salienceScore(f, now).toFixed(2)}, imp ${clampImportance(f.importance)}, ${normalizeKind(f.kind)})`, {
+            subsystem: 'db', event: 'fact.demoted', reason: 'COLD_TIERED_LOW_SALIENCE',
+            data: {
+                category: db.category, key: f.key,
+                salienceScore: Number(salienceScore(f, now).toFixed(3)),
+                hotSetSize: HOT_SET_SIZE,
+            },
+        });
+    }
+}
+
+/**
  * Save a database (create or overwrite)
  * @param {DatabaseSchema} db
  */
@@ -950,96 +1071,12 @@ export async function saveDatabase(db) {
     // concurrent read mid-upload can't latch onto a now-stale snapshot.
     invalidateDatabaseCache();
 
-    // Enforce max facts limit.
-    if (db.facts.length > MAX_FACTS_PER_DB) {
-        const evictCount = db.facts.length - MAX_FACTS_PER_DB;
-        // Feature #4 + salience — continuity-aware, salience-aware eviction. A sequence
-        // track is a contiguous chain (step ords 1..N); eviction must NOT punch holes
-        // mid-chain or wipe a whole track. Policy:
-        //   1) Evict NON-sequence facts first, LOWEST salience score first (importance +
-        //      kind-modulated recency) so foundational traits survive and transient
-        //      states/goals are shed first — replaces the old plain oldest-first rule.
-        //   2) If still over cap, trim each track from its OLDEST steps inward (lowest
-        //      ord first), keeping the latest steps so the recent chain (and the
-        //      "current" tail used by retrieval) stays intact and contiguous (unchanged).
-        const now = Date.now();
-        const seqFacts = db.facts.filter(isSequenceFact);
-        const nonSeqFacts = db.facts.filter(f => !isSequenceFact(f));
-
-        // Step 1: drop lowest-salience non-sequence facts (sort descending so pop() takes
-        // the lowest score). Record the score on each evicted fact for the debug log.
-        nonSeqFacts.sort((a, b) => salienceScore(b, now) - salienceScore(a, now));
-        const evicted = [];
-        let overflow = (nonSeqFacts.length + seqFacts.length) - MAX_FACTS_PER_DB;
-        while (overflow > 0 && nonSeqFacts.length > 0) {
-            const f = nonSeqFacts.pop();
-            f.__evictScore = salienceScore(f, now); // transient annotation for logging
-            evicted.push(f);
-            overflow--;
-        }
-
-        // Step 2: if non-sequence facts weren't enough, trim oldest steps PER track
-        // (lowest ord first) so each chain loses its tail-end history, never a hole.
-        if (overflow > 0 && seqFacts.length > 0) {
-            const byTrack = new Map();
-            for (const f of seqFacts) {
-                if (!byTrack.has(f.track)) byTrack.set(f.track, []);
-                byTrack.get(f.track).push(f);
-            }
-            // Round-robin across tracks, evicting the lowest-ord (oldest) step each pass,
-            // so no single track is wiped while another keeps deep history.
-            const trackQueues = [...byTrack.values()].map(arr =>
-                arr.slice().sort((a, b) => (Number(a.ord) || 0) - (Number(b.ord) || 0)));
-            let progress = true;
-            while (overflow > 0 && progress) {
-                progress = false;
-                for (const q of trackQueues) {
-                    if (overflow <= 0) break;
-                    if (q.length > 1) { // never let a track drop below its newest step
-                        evicted.push(q.shift());
-                        overflow--;
-                        progress = true;
-                    }
-                }
-            }
-            // Last resort (every track down to 1 step and still over): drop oldest singletons.
-            if (overflow > 0) {
-                const singles = trackQueues.flat().sort((a, b) => (a.lastUpdated || 0) - (b.lastUpdated || 0));
-                while (overflow > 0 && singles.length > 0) { evicted.push(singles.shift()); overflow--; }
-            }
-        }
-
-        const evictedSet = new Set(evicted);
-        db.facts = db.facts.filter(f => !evictedSet.has(f));
-        // NON-SILENT eviction (FIX #4): the old code dropped facts with only a
-        // console.warn, so late-session facts vanished from exports with no trace
-        // in the user-visible debug log. Surface it. (Cap value unchanged — see
-        // MAX_FACTS_PER_DB note; raising it is the owner's cost decision.)
-        console.warn(`[BFMemory] DB "${db.category}" has ${db.facts.length + evictCount} facts, evicting ${evictCount} lowest-salience`);
-        // Report the score reason: each non-sequence eviction shows key, score, importance
-        // and kind so the user can see WHY it lost. Track-step evictions have no score.
-        const evictedDesc = evicted.map(f => {
-            if (typeof f.__evictScore === 'number') {
-                const imp = clampImportance(f.importance);
-                const kind = normalizeKind(f.kind);
-                return `${f.key || '?'} (score ${f.__evictScore.toFixed(2)}, imp ${imp}, ${kind})`;
-            }
-            return `${f.key || '?'} (track step)`;
-        }).filter(Boolean).join(', ');
-        // Structured eviction detail: which keys lost and their losing salience score
-        // (track-step evictions have no salience score → null).
-        const evictedDetail = evicted.map(f => ({
-            key: f.key || '?',
-            salienceScore: typeof f.__evictScore === 'number' ? Number(f.__evictScore.toFixed(2)) : null,
-            importance: clampImportance(f.importance),
-            kind: normalizeKind(f.kind),
-        }));
-        for (const f of evicted) delete f.__evictScore; // strip transient annotation (don't persist)
-        addDebugLog('fail', `Evicted ${evictCount} fact(s) from "${db.category}" (cap ${MAX_FACTS_PER_DB}, lowest-salience non-sequence first then oldest track steps): ${evictedDesc}`, {
-            subsystem: 'db', event: 'fact.evicted', reason: 'CAP_EXCEEDED_LOW_SALIENCE',
-            data: { category: db.category, cap: MAX_FACTS_PER_DB, evictCount, evictedKeys: evictedDetail.map(e => e.key), evicted: evictedDetail },
-        });
-    }
+    // INFINITE FACTS — RANK, NEVER EVICT. We do NOT delete facts when a category grows. Instead,
+    // when the ACTIVE hot working set overflows HOT_SET_SIZE, the lowest-salience overflow is
+    // COLD-TIERED (cold:true) — kept on disk (IDB + snapshot), still queryable, just deprioritized
+    // by retrieval/menu until it's re-mentioned or directly matched (which un-colds it). This block
+    // mutates the `cold` flag in place; NO fact is ever removed from db.facts.
+    coldTierOverflow(db);
 
     // HYBRID WRITE. Prefer IDB as the fast working store; the durable attachment snapshot is
     // written on a throttled cadence (scheduleSnapshot) rather than on every fact write. On ANY
@@ -1291,6 +1328,11 @@ export function upsertFact(db, fact) {
     }
     if (existingIdx >= 0) {
         const existing = db.facts[existingIdx];
+        // RESURRECTION: re-mentioning/updating a fact is relevance — pull it back into the hot
+        // working set (un-cold) if it had been cold-tiered. Cleared on `existing` so the spreads
+        // below can't carry a stale `cold:true` onto the advanced/updated fact. (A no-op
+        // re-mention of an already-hot fact does nothing; uncoldFact only logs on a real change.)
+        uncoldFact(existing, db.category, 'COLD_REACTIVATED', 'updated/re-mentioned');
         // Merge relationships (union) rather than replace, so prior tier links survive.
         const mergedRels = mergeRelationships(existing.relationships, fact.relationships);
         // Preserve context across merges: a new write keeps the old context note unless
@@ -1809,17 +1851,28 @@ export function searchFacts(databases, keywords) {
         }
     }
 
-    // Cap primary results: if too many, demote extras to secondary
+    // Cap primary results: if too many, demote extras to secondary. COLD DEPRIORITIZATION
+    // (infinite-facts): demote COLD-tiered matches out of primary FIRST so HOT facts keep the
+    // scarce primary slots — cold facts are still kept (as secondary, bounded by MAX_SECONDARY
+    // downstream) and remain findable; they just lose ties for the top tier to hot facts.
     const primaryResults = results.filter(r => r.tier === 'primary');
     if (primaryResults.length > MAX_PRIMARY) {
-        // Keep the first MAX_PRIMARY as primary, demote the rest
-        let primaryCount = 0;
+        let toDemote = primaryResults.length - MAX_PRIMARY;
+        // Pass 1: demote cold primary matches first (oldest iteration order among cold).
         for (const result of results) {
+            if (toDemote <= 0) break;
+            if (result.tier === 'primary' && isColdFact(result.fact)) {
+                result.tier = 'secondary';
+                toDemote--;
+            }
+        }
+        // Pass 2: if still over cap (not enough cold to demote), demote remaining hot extras
+        // by iteration order (unchanged from the original behavior).
+        for (const result of results) {
+            if (toDemote <= 0) break;
             if (result.tier === 'primary') {
-                primaryCount++;
-                if (primaryCount > MAX_PRIMARY) {
-                    result.tier = 'secondary';
-                }
+                result.tier = 'secondary';
+                toDemote--;
             }
         }
     }
@@ -1943,10 +1996,15 @@ export function summarizeMenu(databases) {
         const found = findDbByCategory(dbs, cat);
         if (!found) continue;
         const [name, db] = found;
-        // Count active facts per Layer-2 aspect.
+        // Count active HOT facts per Layer-2 aspect. Cold-tiered facts (infinite-facts feature)
+        // are deprioritized: they're hidden from the PLANNER menu so the planner doesn't
+        // proactively open a drawer for low-salience overflow — but they remain fully QUERYABLE
+        // (keyword/exact/fuzzy match paths still admit them, which un-colds on re-mention), so
+        // hiding them from the menu loses no recall, it just stops them inflating the menu.
         const counts = new Map();
         for (const fact of (db.facts || [])) {
             if (!isActiveFact(fact)) continue;
+            if (!isHotFact(fact)) continue;
             const asp = deriveAspect(fact);
             counts.set(asp, (counts.get(asp) || 0) + 1);
         }
@@ -2325,6 +2383,16 @@ export async function deleteDebugLogFile(chatId) {
  * @property {string} [location] - OPTIONAL where-link for an event (location-link feature): a
  *   place key/subject naming WHERE the fact happened. Emitted by Agent 3 via the `at:` marker on
  *   events. Pairs with `involved` (who) for place⇄event⇄people retrieval. Absent on older facts.
+ * @property {boolean} [cold] - OPTIONAL hot/cold tier flag (infinite-facts feature). ABSENT or
+ *   `false` => HOT (the default for every fact ever written). Set to `true` by coldTierOverflow
+ *   when a category's active hot non-sequence facts exceed HOT_SET_SIZE — the LOWEST-salience
+ *   overflow is cold-tiered instead of DELETED. A cold fact is NEVER removed (stays durable in
+ *   IDB + the attachment snapshot) and stays QUERYABLE, but is deprioritized by retrieval/menu
+ *   (it fills working-set slots last and is hidden from the planner menu / requestable inventory
+ *   unless directly matched). It is UN-COLDED when re-mentioned/updated (upsertFact) or directly
+ *   matched by a query (relevance resurrects it). Sequence/track facts and high-importance facts
+ *   (importance >= COLD_TIER_PROTECT_IMPORTANCE) are never cold-tiered. Backward-compatible:
+ *   facts without `cold` are hot.
  */
 
 /**

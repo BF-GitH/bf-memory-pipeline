@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
+import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -429,6 +429,13 @@ function resolveExactKeys(databases, requests) {
 const RETRIEVAL_IMPORTANCE_WEIGHT = 0.65;
 const RETRIEVAL_RECENCY_WEIGHT = 0.35;
 const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7 };
+// COLD DEPRIORITIZATION (infinite-facts feature). A cold-tiered fact is still FINDABLE (it
+// remains in db.facts and passes through every match path unchanged), but when overflow tiers
+// are capped we want HOT facts to fill the limited slots FIRST. A large fixed penalty pushes
+// cold candidates below every hot candidate in the salience ranking, so a cold fact only takes
+// a capped slot when no hot fact contends for it — i.e. it surfaces on a direct/strong match
+// (exact-key, keyword, fuzzy all still admit it) but loses ties for scarce slots to hot facts.
+const RETRIEVAL_COLD_PENALTY = 1000;
 function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
@@ -436,7 +443,8 @@ function retrievalSalience(fact, now) {
     const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
     const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife);
-    return RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency;
+    const base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency;
+    return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
 }
 
 /**
