@@ -291,6 +291,19 @@
     margin-bottom: 6px;
 }
 
+/* User-added (overlay) taxonomy marker — distinguishes custom labels from built-ins. */
+.bf-mem-custom-chip {
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--SmartThemeQuoteColor, #6cae75);
+    border: 1px solid var(--SmartThemeQuoteColor, #6cae75);
+    border-radius: 3px;
+    padding: 0 4px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
 .bf-mem-db-card-actions {
     display: flex;
     gap: 4px;

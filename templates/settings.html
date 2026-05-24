@@ -496,6 +496,39 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                     <div class="bf-mem-section-body">
                         <div id="bf_mem_db_stats" class="bf-mem-db-stats">Loading...</div>
                         <div id="bf_mem_db_list" class="bf-mem-db-list"></div>
+
+                        <!-- Add your own taxonomy labels (user overlay, global across chats) -->
+                        <details class="bf-mem-addlabel" style="margin-top:8px;">
+                            <summary style="cursor:pointer;font-weight:bold;">
+                                <i class="fa-solid fa-tags"></i> Add your own label
+                            </summary>
+                            <small class="bf-mem-hint">Add custom categories (Layer 1) and aspects/leaves (Layer 2) on top of the built-in taxonomy. Global across chats. Built-ins can't be removed.</small>
+
+                            <!-- Add a Layer-2 leaf -->
+                            <div class="bf-mem-field" style="margin-top:6px;">
+                                <label>New aspect (Layer 2 leaf)</label>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                                    <select id="bf_mem_addleaf_category" class="text_pole" style="flex:0 0 auto;min-width:120px;"></select>
+                                    <input type="text" id="bf_mem_addleaf_subarea" class="text_pole" placeholder="Sub-area (optional)" style="flex:1 1 120px;min-width:100px;" />
+                                    <input type="text" id="bf_mem_addleaf_name" class="text_pole" placeholder="Leaf name, e.g. bioluminescence" style="flex:1 1 160px;min-width:120px;" />
+                                    <button id="bf_mem_addleaf_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-plus"></i> Add aspect
+                                    </button>
+                                </div>
+                            </div>
+
+                            <!-- Add a Layer-1 category -->
+                            <div class="bf-mem-field" style="margin-top:6px;">
+                                <label>New category (Layer 1)</label>
+                                <div class="bf-mem-profile-row" style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+                                    <input type="text" id="bf_mem_addcat_name" class="text_pole" placeholder="Category name, e.g. Factions" style="flex:1 1 160px;min-width:120px;" />
+                                    <button id="bf_mem_addcat_btn" class="menu_button" style="flex:0 0 auto;">
+                                        <i class="fa-solid fa-plus"></i> Add category
+                                    </button>
+                                </div>
+                            </div>
+                        </details>
+
                         <div class="bf-mem-db-actions">
                             <button id="bf_mem_browse_db" class="menu_button">
                                 <i class="fa-solid fa-eye"></i> View All Facts

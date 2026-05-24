@@ -520,9 +520,97 @@ export function mapLegacyCategory(category, fact) {
             for (const canon of L1_CATEGORIES) {
                 if (canon.toLowerCase() === c) return canon;
             }
+            // A USER-ADDED overlay category (any case) — normalize to its canonical spelling so
+            // facts file there and the Database tab/menu recognize it as a real bucket.
+            for (const canon of overlayCategories()) {
+                if (canon.toLowerCase() === c) return canon;
+            }
             // Genuinely unknown/custom — keep verbatim so we never silently drop a real bucket.
             return category;
     }
+}
+
+// =============================================================================
+// USER TAXONOMY OVERLAY (persisted, GLOBAL across chats)
+// =============================================================================
+// The built-in TAXONOMY (above) is a CODE CONSTANT. On top of it we merge an optional USER
+// OVERLAY persisted in the extension settings object (settings.js DEFAULT_SETTINGS.taxonomyOverlay)
+// so a user can ADD their own Layer-1 categories and Layer-2 leaves from the Database tab without
+// touching code. The overlay is DATA-ONLY and ADDITIVE — it can never remove or shadow a built-in
+// (the 7 fixed L1 + ~939 leaves always survive); it only widens the effective vocab. Shape:
+//   { categories: string[],                         // extra L1 names
+//     aspects:    { [category]: string[] },         // extra leaves per category
+//     subAreas:   { [category]: { [subArea]: string[] } } } // OPTIONAL grouping for the menu
+// Read via host.getExtensionSettings() (database.js already imports host) so there is NO static
+// settings.js -> database.js import cycle. The AI-expansion flow (a LATER task) writes to the SAME
+// overlay shape.
+//
+// PERFORMANCE: flatVocab is called per-fact in hot paths (buildMemoryIndex), so we DO NOT re-read
+// settings + rebuild the merged array on every call. Instead we MEMOIZE the merged per-category
+// leaf vocab in `_overlayVocabMemo` and the canonical category set in `_overlayCatsMemo`; the
+// settings UI calls invalidateTaxonomyOverlayCache() after any add to drop the memo. Reading the
+// overlay once to (re)build the memo is the only settings read on the hot path.
+
+/** @type {Map<string, string[]>|null} memoized merged (built-in + overlay) flat vocab per canon category. */
+let _overlayVocabMemo = null;
+/** @type {string[]|null} memoized list of overlay-added L1 category names (canon-cased). */
+let _overlayCatsMemo = null;
+
+/**
+ * Drop the memoized merged taxonomy so the next flatVocab/category read rebuilds it from the
+ * current overlay. Call this AFTER any persisted overlay change (settings UI add). Cheap.
+ * @returns {void}
+ */
+export function invalidateTaxonomyOverlayCache() {
+    _overlayVocabMemo = null;
+    _overlayCatsMemo = null;
+}
+
+/**
+ * Read the raw persisted overlay object from extension settings, null-safe. Always returns a
+ * well-formed shape (empty arrays/objects) so callers never branch on absence. Pure read.
+ * @returns {{categories: string[], aspects: Object<string,string[]>, subAreas: Object<string,Object<string,string[]>>}}
+ */
+export function getTaxonomyOverlay() {
+    const ov = host.getExtensionSettings()?.taxonomyOverlay;
+    return {
+        categories: Array.isArray(ov?.categories) ? ov.categories : [],
+        aspects: (ov?.aspects && typeof ov.aspects === 'object' && !Array.isArray(ov.aspects)) ? ov.aspects : {},
+        subAreas: (ov?.subAreas && typeof ov.subAreas === 'object' && !Array.isArray(ov.subAreas)) ? ov.subAreas : {},
+    };
+}
+
+/**
+ * The list of user-added Layer-1 category names (memoized), normalized so a built-in name in
+ * any case is NOT re-added (built-ins always win). Used by mapLegacyCategory (so an overlay
+ * category resolves to itself as canonical) and the skeleton/menu builders.
+ * @returns {string[]} extra canonical category names not already in L1_CATEGORIES
+ */
+function overlayCategories() {
+    if (_overlayCatsMemo) return _overlayCatsMemo;
+    const builtinLower = new Set(L1_CATEGORIES.map(c => c.toLowerCase()));
+    const seen = new Set();
+    const out = [];
+    for (const raw of getTaxonomyOverlay().categories) {
+        const name = String(raw || '').trim();
+        if (!name) continue;
+        const lc = name.toLowerCase();
+        if (builtinLower.has(lc) || seen.has(lc)) continue; // never shadow a built-in / dedup
+        seen.add(lc);
+        out.push(name);
+    }
+    _overlayCatsMemo = out;
+    return out;
+}
+
+/**
+ * The full effective set of canonical Layer-1 categories: the 7 built-ins followed by any
+ * user-added overlay categories (Unsorted stays the built-in catch-all; overlay cats append
+ * after it, like custom buckets always have). Used to widen the skeleton + menus.
+ * @returns {string[]}
+ */
+export function effectiveCategories() {
+    return [...L1_CATEGORIES, ...overlayCategories()];
 }
 
 /**
@@ -531,14 +619,37 @@ export function mapLegacyCategory(category, fact) {
  * that needs "the list of leaves for this category" (aspectVocabFor, normalizeAspect, the menus,
  * the Database tab) routes through here, so the nested shape is purely organizational and the
  * FLAT-per-category contract is preserved with ZERO behavior change. Returns Unsorted's leaves
- * for an unknown category so a custom bucket still has a default. Pure (the vocab is a constant).
+ * for an unknown category so a custom bucket still has a default.
+ *
+ * USER OVERLAY: the built-in leaves are followed by any overlay `aspects[category]` leaves
+ * (deduped, built-ins win), memoized per canon category so this stays cheap on the hot path.
+ * An install with an EMPTY overlay returns byte-identically to the built-in-only array.
  * @param {string} category - a Layer-1 category name (legacy names accepted; canon-mapped here)
  * @returns {string[]} the flat array of leaf aspects under that category, in tree order
  */
 export function flatVocab(category) {
     const canon = mapLegacyCategory(category);
+    if (!_overlayVocabMemo) _overlayVocabMemo = new Map();
+    const cached = _overlayVocabMemo.get(canon);
+    if (cached) return cached;
+
     const node = TAXONOMY[canon] || TAXONOMY.Unsorted;
-    return Object.values(node).flat();
+    const builtin = Object.values(node).flat();
+    // Overlay leaves for this canon category (or an overlay-only custom category, which has no
+    // built-in node so `builtin` is Unsorted's list — its overlay leaves still merge in).
+    const extra = getTaxonomyOverlay().aspects[canon];
+    if (!Array.isArray(extra) || extra.length === 0) {
+        _overlayVocabMemo.set(canon, builtin);
+        return builtin;
+    }
+    const have = new Set(builtin);
+    const merged = builtin.slice();
+    for (const raw of extra) {
+        const leaf = String(raw || '').trim().toLowerCase();
+        if (leaf && !have.has(leaf)) { have.add(leaf); merged.push(leaf); }
+    }
+    _overlayVocabMemo.set(canon, merged);
+    return merged;
 }
 
 /**
@@ -603,6 +714,48 @@ export function deriveAspect(fact) {
 }
 
 /**
+ * Canonicalize a USER-ENTERED leaf surface form to the snake_case style of the built-in vocab:
+ * lowercase, trim, strip a leading article (a/an/the), collapse whitespace + hyphens to a single
+ * `_`, and drop any leftover non `[a-z0-9_]` punctuation. Returns '' for empty/garbage input so
+ * callers can reject it. Mirrors the leaf-naming convention (snake_case, one word-run per concept).
+ * @param {*} v - raw user input
+ * @returns {string} a canonical snake_case leaf, or '' when nothing usable remains
+ */
+export function canonicalizeLeafSurface(v) {
+    let s = String(v ?? '').trim().toLowerCase();
+    if (!s) return '';
+    s = s.replace(/^(?:a|an|the)\s+/, '');          // strip a leading article
+    s = s.replace(/[\s\-]+/g, '_');                  // spaces / hyphens -> single underscore
+    s = s.replace(/[^a-z0-9_]+/g, '');               // drop other punctuation
+    s = s.replace(/_+/g, '_').replace(/^_+|_+$/g, ''); // collapse / trim underscores
+    return s;
+}
+
+/**
+ * DEDUP CHECK for a user-added leaf: given a CANONICAL surface (from canonicalizeLeafSurface) and
+ * a category, decide whether it is ALREADY COVERED by the effective vocab (built-in + overlay) or
+ * the synonym/legacy map. Returns the canonical leaf it collides with, or '' when the surface is
+ * genuinely new and safe to add. One canonical leaf per concept — synonyms route to their target.
+ *   - exact hit in the effective per-category vocab            -> that leaf (already a leaf)
+ *   - a synonym/legacy alias whose target is valid HERE        -> the target leaf
+ * @param {string} canonicalSurface - output of canonicalizeLeafSurface
+ * @param {string} category - a Layer-1 category name (legacy/overlay names accepted)
+ * @returns {string} the existing canonical leaf it duplicates, or '' if new
+ */
+export function findExistingLeaf(canonicalSurface, category) {
+    const a = String(canonicalSurface || '').trim().toLowerCase();
+    if (!a) return '';
+    const vocab = flatVocab(category);
+    if (vocab.includes(a)) return a; // already a real leaf (built-in or overlay)
+    // Known synonym/legacy alias whose canonical target is valid for THIS category's vocab.
+    if (Object.prototype.hasOwnProperty.call(LEGACY_ASPECT_MAP, a)) {
+        const mapped = LEGACY_ASPECT_MAP[a];
+        if (vocab.includes(mapped)) return mapped;
+    }
+    return '';
+}
+
+/**
  * Build the empty Layer-1 skeleton: a `{ category -> empty DatabaseSchema }` map covering
  * every canonical Layer-1 category, with ZERO facts. Used to SEED the menu / Database tab
  * so the full taxonomy is present from turn 1 even before any fact lands. These skeleton
@@ -613,7 +766,10 @@ export function deriveAspect(fact) {
  */
 export function buildSkeletonDatabases() {
     const out = {};
-    for (const cat of L1_CATEGORIES) out[cat] = createEmptyDatabase(cat);
+    // Built-in L1 first, then any user-added overlay categories (effectiveCategories) so a
+    // custom bucket shows in the Database tab / menu even before a fact lands. Empty overlay
+    // => identical to the built-in-only skeleton.
+    for (const cat of effectiveCategories()) out[cat] = createEmptyDatabase(cat);
     return out;
 }
 
@@ -3165,7 +3321,9 @@ export function summarizeMenu(databases) {
  * @returns {string} Multi-line full-vocab menu (one category per line). Never empty.
  */
 export function fullTaxonomyMenu() {
-    return L1_CATEGORIES.map(cat => `${cat}: ${flatVocab(cat).join(', ')}`).join('\n');
+    // effectiveCategories = built-in L1 + any user-added overlay categories; flatVocab merges
+    // overlay leaves per category. Empty overlay => byte-identical to the built-in-only menu.
+    return effectiveCategories().map(cat => `${cat}: ${flatVocab(cat).join(', ')}`).join('\n');
 }
 
 /**
@@ -3182,12 +3340,43 @@ export function fullTaxonomyMenu() {
  * @returns {string} Multi-line grouped menu (one line per category▸sub-area). Never empty.
  */
 export function groupedTaxonomyMenu() {
+    const overlay = getTaxonomyOverlay();
     const lines = [];
-    for (const cat of L1_CATEGORIES) {
+    for (const cat of effectiveCategories()) {
         const node = TAXONOMY[cat];
-        if (!node) continue;
-        for (const [subArea, leaves] of Object.entries(node)) {
-            lines.push(`${cat} ▸ ${subArea}: ${leaves.join(', ')}`);
+        // Built-in sub-areas first (skip for an overlay-only category, which has no node).
+        if (node) {
+            for (const [subArea, leaves] of Object.entries(node)) {
+                lines.push(`${cat} ▸ ${subArea}: ${leaves.join(', ')}`);
+            }
+        }
+        // USER OVERLAY leaves for this category. Place each leaf under its declared sub-area
+        // (overlay.subAreas[cat][subArea]) when given; everything else groups under "Custom".
+        const extra = Array.isArray(overlay.aspects[cat]) ? overlay.aspects[cat] : [];
+        if (!extra.length) continue;
+        const declared = (overlay.subAreas[cat] && typeof overlay.subAreas[cat] === 'object') ? overlay.subAreas[cat] : {};
+        // Map leaf -> its declared sub-area (first match wins); the rest fall under "Custom".
+        const leafSub = new Map();
+        for (const [subArea, leaves] of Object.entries(declared)) {
+            for (const l of (Array.isArray(leaves) ? leaves : [])) {
+                const leaf = String(l || '').trim().toLowerCase();
+                if (leaf && !leafSub.has(leaf)) leafSub.set(leaf, String(subArea));
+            }
+        }
+        // Group overlay leaves by sub-area, preserving insertion order; built-in leaves are
+        // excluded (they already rendered above) so we never duplicate a label.
+        const builtinLeaves = node ? new Set(Object.values(node).flat()) : new Set();
+        const groups = new Map(); // subArea -> leaf[]
+        for (const raw of extra) {
+            const leaf = String(raw || '').trim().toLowerCase();
+            if (!leaf || builtinLeaves.has(leaf)) continue;
+            const sub = leafSub.get(leaf) || 'Custom';
+            if (!groups.has(sub)) groups.set(sub, []);
+            const arr = groups.get(sub);
+            if (!arr.includes(leaf)) arr.push(leaf);
+        }
+        for (const [subArea, leaves] of groups) {
+            if (leaves.length) lines.push(`${cat} ▸ ${subArea}: ${leaves.join(', ')}`);
         }
     }
     return lines.join('\n');

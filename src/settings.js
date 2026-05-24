@@ -210,6 +210,16 @@ const DEFAULT_SETTINGS = {
     writerFormat: '',
     dbProfiles: {},
     activeDbProfile: '',
+    // USER TAXONOMY OVERLAY (persisted, GLOBAL across chats). Extra Layer-1 categories and
+    // Layer-2 leaves the user added from the Database tab, merged ON TOP of the built-in
+    // TAXONOMY by database.js (flatVocab/effectiveCategories/groupedTaxonomyMenu). DATA-ONLY +
+    // ADDITIVE — never removes/shadows a built-in. Default empty => behaves byte-identically to
+    // the built-in-only taxonomy. Shape:
+    //   categories: string[]                         — extra L1 names
+    //   aspects:    { [category]: string[] }         — extra leaves per category (snake_case)
+    //   subAreas:   { [category]: { [subArea]: string[] } } — OPTIONAL grouping for the menu
+    // The AI-expansion flow (a later task) writes to this SAME overlay.
+    taxonomyOverlay: { categories: [], aspects: {}, subAreas: {} },
     // schemaVersion intentionally NOT in defaults: the merge-missing-defaults loop
     // would otherwise pre-fill it for existing users and short-circuit the migration.
     // migrateLegacySettings() sets it after running.
@@ -302,6 +312,16 @@ function validateSettings(s) {
     if (typeof s.activeDbProfile !== 'string')   s.activeDbProfile = '';
     if (!s.dbProfiles || typeof s.dbProfiles !== 'object' || Array.isArray(s.dbProfiles)) {
         s.dbProfiles = {};
+    }
+    // User taxonomy overlay: coerce to the well-formed { categories[], aspects{}, subAreas{} }
+    // shape so database.js can read it without defensive branching. Absent/malformed => empty.
+    if (!s.taxonomyOverlay || typeof s.taxonomyOverlay !== 'object' || Array.isArray(s.taxonomyOverlay)) {
+        s.taxonomyOverlay = { categories: [], aspects: {}, subAreas: {} };
+    } else {
+        const ov = s.taxonomyOverlay;
+        if (!Array.isArray(ov.categories)) ov.categories = [];
+        if (!ov.aspects || typeof ov.aspects !== 'object' || Array.isArray(ov.aspects)) ov.aspects = {};
+        if (!ov.subAreas || typeof ov.subAreas !== 'object' || Array.isArray(ov.subAreas)) ov.subAreas = {};
     }
     return s;
 }
@@ -1576,18 +1596,146 @@ function setupTabs() {
 
 // --- Database View ---
 
+/**
+ * Populate the "Add aspect" category dropdown with the built-in L1 order followed by any
+ * user-added (custom) categories, preserving the current selection when possible. Custom
+ * categories are suffixed " (custom)" so they're distinguishable.
+ * @param {string[]} builtinOrder - MENU_CATEGORY_ORDER (built-in L1)
+ * @param {Set<string>} customCats - user-added overlay category names
+ * @returns {void}
+ */
+function populateAddLabelCategoryDropdown(builtinOrder, customCats) {
+    const select = document.getElementById('bf_mem_addleaf_category');
+    if (!select) return;
+    const prev = select.value;
+    const names = [...builtinOrder, ...[...customCats].filter(c => !builtinOrder.includes(c))];
+    select.innerHTML = names.map(c =>
+        `<option value="${escapeHtml(c)}">${escapeHtml(c)}${customCats.has(c) ? ' (custom)' : ''}</option>`
+    ).join('');
+    if (prev && names.includes(prev)) select.value = prev;
+}
+
+/**
+ * Add a user Layer-2 leaf to the persisted taxonomy overlay (with dedup). Normalizes the surface
+ * form, checks it against the EXISTING effective vocab + synonyms for the category; if already
+ * covered, it logs a dedup redirect and does NOT add a duplicate. Otherwise it appends the leaf
+ * (and its optional sub-area) to settings.taxonomyOverlay, persists, invalidates the taxonomy
+ * memo, and refreshes the Database view.
+ * @param {string} category - target Layer-1 category (built-in or custom)
+ * @param {string} rawLeaf - raw user leaf input
+ * @param {string} [rawSubArea] - optional sub-area grouping for the menu
+ * @returns {Promise<void>}
+ */
+async function addUserLeaf(category, rawLeaf, rawSubArea) {
+    const {
+        canonicalizeLeafSurface, findExistingLeaf, invalidateTaxonomyOverlayCache, mapLegacyCategory,
+    } = await import('./database.js');
+    const cat = mapLegacyCategory(category); // canonical spelling (built-in or overlay)
+    const leaf = canonicalizeLeafSurface(rawLeaf);
+    if (!leaf) {
+        toastr.warning('Enter a valid aspect name.', 'BF Memory');
+        return;
+    }
+    // Dedup: already a leaf or a known synonym of an existing leaf for this category.
+    const existing = findExistingLeaf(leaf, cat);
+    if (existing) {
+        addDebugLog('info', `Label not added — "${leaf}" already covered by "${existing}" (${cat})`, {
+            subsystem: 'settings', event: 'label.merged', reason: 'SYNONYM_DEDUP', actor: 'USER',
+            data: { tier: 'aspect', category: cat, label: leaf, existing },
+        });
+        toastr.info(`"${leaf}" is already covered by "${existing}".`, 'BF Memory');
+        return;
+    }
+
+    // Persist into the overlay (well-formed shape guaranteed by validateSettings).
+    const ov = extensionSettings.taxonomyOverlay = extensionSettings.taxonomyOverlay || { categories: [], aspects: {}, subAreas: {} };
+    if (!Array.isArray(ov.aspects[cat])) ov.aspects[cat] = [];
+    ov.aspects[cat].push(leaf);
+    const subArea = String(rawSubArea || '').trim();
+    if (subArea) {
+        if (!ov.subAreas[cat] || typeof ov.subAreas[cat] !== 'object') ov.subAreas[cat] = {};
+        if (!Array.isArray(ov.subAreas[cat][subArea])) ov.subAreas[cat][subArea] = [];
+        ov.subAreas[cat][subArea].push(leaf);
+    }
+    saveSettings();
+    invalidateTaxonomyOverlayCache();
+    addDebugLog('pass', `Custom aspect added: "${leaf}" → ${cat}${subArea ? ` (${subArea})` : ''}`, {
+        subsystem: 'settings', event: 'label.added', actor: 'USER',
+        data: { tier: 'aspect', category: cat, label: leaf, subArea: subArea || undefined },
+    });
+    toastr.success(`Added aspect "${leaf}" to ${cat}.`, 'BF Memory');
+    const nameEl = document.getElementById('bf_mem_addleaf_name');
+    const subEl = document.getElementById('bf_mem_addleaf_subarea');
+    if (nameEl) nameEl.value = '';
+    if (subEl) subEl.value = '';
+    refreshDatabaseView();
+}
+
+/**
+ * Add a user Layer-1 category to the persisted taxonomy overlay (with dedup against built-ins +
+ * existing overlay categories). Persists, invalidates the taxonomy memo, and refreshes the view.
+ * @param {string} rawName - raw user category name
+ * @returns {Promise<void>}
+ */
+async function addUserCategory(rawName) {
+    const { MENU_CATEGORY_ORDER, effectiveCategories, invalidateTaxonomyOverlayCache } = await import('./database.js');
+    // Keep the user's casing but trim; reject empty.
+    const name = String(rawName || '').trim().replace(/\s+/g, ' ');
+    if (!name) {
+        toastr.warning('Enter a category name.', 'BF Memory');
+        return;
+    }
+    const lc = name.toLowerCase();
+    const existing = effectiveCategories().find(c => c.toLowerCase() === lc);
+    if (existing) {
+        const isBuiltin = MENU_CATEGORY_ORDER.some(c => c.toLowerCase() === lc);
+        addDebugLog('info', `Category not added — "${name}" already exists as "${existing}"`, {
+            subsystem: 'settings', event: 'label.merged', reason: 'SYNONYM_DEDUP', actor: 'USER',
+            data: { tier: 'category', category: name, label: name, existing },
+        });
+        toastr.info(`Category "${existing}" already exists${isBuiltin ? ' (built-in)' : ''}.`, 'BF Memory');
+        return;
+    }
+    if (!confirm(`Add a new top-level category "${name}"?`)) return;
+
+    const ov = extensionSettings.taxonomyOverlay = extensionSettings.taxonomyOverlay || { categories: [], aspects: {}, subAreas: {} };
+    if (!Array.isArray(ov.categories)) ov.categories = [];
+    ov.categories.push(name);
+    saveSettings();
+    invalidateTaxonomyOverlayCache();
+    addDebugLog('pass', `Custom category added: "${name}"`, {
+        subsystem: 'settings', event: 'label.added', actor: 'USER',
+        data: { tier: 'category', category: name, label: name },
+    });
+    toastr.success(`Added category "${name}".`, 'BF Memory');
+    const nameEl = document.getElementById('bf_mem_addcat_name');
+    if (nameEl) nameEl.value = '';
+    refreshDatabaseView();
+}
+
 async function refreshDatabaseView() {
-    const { getAllDatabases, withSkeleton, MENU_CATEGORY_ORDER, aspectVocabFor, deriveAspect, isActiveFact } = await import('./database.js');
+    const {
+        getAllDatabases, withSkeleton, MENU_CATEGORY_ORDER, aspectVocabFor, deriveAspect,
+        isActiveFact, isColdFact, effectiveCategories, flatVocab,
+    } = await import('./database.js');
     const real = await getAllDatabases();
     // 3-layer model: overlay the empty Layer-1 skeleton so the FULL taxonomy (every category,
     // count 0 when empty) is always shown — never "No databases yet". The skeleton is purely
     // in-memory here (no empty files are written; categories persist only when a fact lands).
+    // The skeleton already includes user-added overlay categories (effectiveCategories).
     const databases = withSkeleton(real);
     // Stable Layer-1 order first, then any custom extras.
     const ordered = [];
     for (const c of MENU_CATEGORY_ORDER) if (databases[c]) ordered.push(c);
     for (const c of Object.keys(databases)) if (!ordered.includes(c)) ordered.push(c);
     const categories = ordered;
+
+    // Custom (user-added) markers so the UI can distinguish overlay labels from built-ins.
+    const customCats = new Set(effectiveCategories().filter(c => !MENU_CATEGORY_ORDER.includes(c)));
+    const overlay = extensionSettings?.taxonomyOverlay || { aspects: {} };
+
+    // Keep the "Add aspect" category dropdown in sync with the effective category set.
+    populateAddLabelCategoryDropdown(MENU_CATEGORY_ORDER, customCats);
 
     const statsEl = document.getElementById('bf_mem_db_stats');
     const listEl = document.getElementById('bf_mem_db_list');
@@ -1600,24 +1748,36 @@ async function refreshDatabaseView() {
     listEl.innerHTML = categories.map(cat => {
         const db = databases[cat];
         const factCount = db.facts.length;
+        // Never-delete / cold-tier: the old 50-cap is gone, so show the real count plus how many
+        // are cold-tiered (deprioritized but kept), not a fake "/50".
+        const coldCount = db.facts.filter(f => { try { return isColdFact(f); } catch { return false; } }).length;
+        const countLabel = coldCount ? `${factCount} (${coldCount} cold)` : `${factCount}`;
+        const isCustomCat = customCats.has(cat);
+        // Overlay (user-added) leaves for this category, so we can chip them in the breakdown.
+        const overlayLeaves = new Set((Array.isArray(overlay.aspects?.[cat]) ? overlay.aspects[cat] : [])
+            .map(l => String(l || '').trim().toLowerCase()));
         const knowers = [...new Set(db.facts.flatMap(f => f.knownBy || []))];
-        // Layer-2 aspect breakdown: show the full fixed vocab for this category with active
-        // counts (0 when empty) so the skeleton is visible even before any fact lands.
+        // Layer-2 aspect breakdown: show the full effective vocab for this category (built-in +
+        // overlay) with active counts (0 when empty) so the skeleton is visible from turn 1.
         const aspectCounts = new Map();
         for (const f of db.facts) {
             if (!isActiveFact(f)) continue;
             const a = deriveAspect(f);
             aspectCounts.set(a, (aspectCounts.get(a) || 0) + 1);
         }
-        const aspectStr = aspectVocabFor(cat).map(a => `${a}:${aspectCounts.get(a) || 0}`).join(', ');
+        const aspectStr = flatVocab(cat).map(a => {
+            const label = `${a}:${aspectCounts.get(a) || 0}`;
+            return overlayLeaves.has(a) ? `${label}*` : label;
+        }).join(', ');
         return `
             <div class="bf-mem-db-card" data-category="${escapeHtml(cat)}">
                 <div class="bf-mem-db-card-header">
-                    <span class="bf-mem-db-card-name">${escapeHtml(cat)}</span>
-                    <span class="bf-mem-db-card-count">${factCount}/50</span>
+                    <span class="bf-mem-db-card-name">${escapeHtml(cat)}${isCustomCat ? ' <span class="bf-mem-custom-chip" title="User-added category">custom</span>' : ''}</span>
+                    <span class="bf-mem-db-card-count">${escapeHtml(countLabel)}</span>
                 </div>
                 <div class="bf-mem-db-card-meta">
                     <div class="bf-mem-db-card-aspects">${escapeHtml(aspectStr)}</div>
+                    ${overlayLeaves.size ? '<small class="bf-mem-hint">* = your custom aspect</small>' : ''}
                     ${knowers.length ? `Known by: ${escapeHtml(knowers.join(', '))}` : ''}
                 </div>
                 <div class="bf-mem-db-card-actions">
@@ -2680,6 +2840,18 @@ export async function initSettings() {
     // --- Database Tab ---
     $('#bf_mem_refresh_db').on('click', () => refreshDatabaseView());
     $('#bf_mem_browse_db').on('click', () => showAllDatabases());
+
+    // Add-label (user taxonomy overlay) controls.
+    $('#bf_mem_addleaf_btn').on('click', () => {
+        addUserLeaf(
+            $('#bf_mem_addleaf_category').val(),
+            $('#bf_mem_addleaf_name').val(),
+            $('#bf_mem_addleaf_subarea').val(),
+        );
+    });
+    $('#bf_mem_addleaf_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addleaf_btn').trigger('click'); } });
+    $('#bf_mem_addcat_btn').on('click', () => addUserCategory($('#bf_mem_addcat_name').val()));
+    $('#bf_mem_addcat_name').on('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('#bf_mem_addcat_btn').trigger('click'); } });
     $('#bf_mem_export_db').on('click', async () => {
         const { getAllDatabases } = await import('./database.js');
         const databases = await getAllDatabases();
