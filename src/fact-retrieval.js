@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, searchFacts, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -85,6 +85,9 @@ export function isFactVisible(fact, names = null) {
  */
 export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const databases = await getAllDatabases();
+    // Build the per-turn in-memory fact index once (memoized; reused by every indexed query this
+    // turn). Keyword matching now resolves via this index instead of scanning every fact.
+    const index = await getMemoryIndex();
     const dbCount = Object.keys(databases).length;
     const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
     addDebugLog('info', `Retrieval: ${dbCount} databases loaded (${totalFacts} total facts)`);
@@ -107,7 +110,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     const exactIds = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
 
     // Search databases for direct (fuzzy) matches, skipping anything already resolved exactly.
-    for (const r of searchFacts(databases, allKeywords)) {
+    for (const r of searchFactsIndexed(index, databases, allKeywords)) {
         const id = `${r.category}:${r.fact.key}`;
         if (!exactIds.has(id)) {
             if (r.via == null) r.via = 'keyword';
@@ -149,7 +152,7 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     }
 
     // Search for fallback matches (these become secondary if not already found)
-    const fallbackResults = searchFacts(databases, [...fallbackKeywords]);
+    const fallbackResults = searchFactsIndexed(index, databases, [...fallbackKeywords]);
     const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
 
     for (const result of fallbackResults) {

@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './ag
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, deriveSubject, deriveScope, invalidateDatabaseCache, flushSnapshotNow } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun } from './settings.js';
@@ -582,6 +582,9 @@ async function runPipelineInline(data) {
     // Stage-2 finder candidates, and the deterministic-retrieval fallback. (Agent 3's
     // existing-DB context now loads separately on the post-reply extraction path.)
     const databases = await getAllDatabases();
+    // Per-turn in-memory fact index (memoized; built once, reused by the menu + Stage-2 branch
+    // collect below so neither walks the full fact set).
+    const index = await getMemoryIndex();
     // FIX #12 (dead-payload removal): the keys-only fact inventory (`Category/key`, no values)
     // is consumed ONLY by the deterministic-retrieval fallback (buildDeterministicRetrieval),
     // which runs only when the Stage-2 finder is OFF. When the finder is ON (default), Agent 1
@@ -591,7 +594,8 @@ async function runPipelineInline(data) {
     const wantFinder = settings.useFinderAgent !== false; // default true
     const factInventory = wantFinder ? '' : summarizeKeys(databases);
     // STAGE 1 menu: compact Category×aspect map (counts, NO values) Agent 1 picks branches from.
-    const factMenu = summarizeMenu(databases);
+    // Counts come from the index aggregate, not a full-fact walk.
+    const factMenu = summarizeMenuIndexed(index);
     addDebugLog('info', `Fact inventory for Agent 1: ${wantFinder ? 'skipped (finder on)' : (factInventory ? factInventory.split('\n').length + ' keys' : 'empty')}; menu: ${factMenu ? factMenu.split('\n').length + ' categories' : 'empty'}`);
 
     const agent1Start = Date.now();
@@ -716,7 +720,7 @@ async function runPipelineInline(data) {
         }
         // ALWAYS include active Unsorted facts (visibility-filtered), even on the fallback path.
         const existingKeys = new Set(det.facts.map(r => `${r.category}:${r.fact.key}`));
-        for (const { fact, category } of collectBranchFacts(databases, ['Unsorted'])) {
+        for (const { fact, category } of collectBranchFactsIndexed(index, ['Unsorted'])) {
             const id = `${category}:${fact.key}`;
             if (!existingKeys.has(id) && isFactVisible(fact)) {
                 det.facts.push({ fact, category, tier: 'primary' });
@@ -750,7 +754,7 @@ async function runPipelineInline(data) {
     if (wantFinder) {
         // STAGE 2: gather the FULL active facts under Agent 1's picked branches PLUS, always,
         // every active Unsorted fact (collectBranchFacts folds Unsorted in unconditionally).
-        const branchFacts = collectBranchFacts(databases, draftResult.branches);
+        const branchFacts = collectBranchFactsIndexed(index, draftResult.branches);
         // CHARACTER-TAG FILTER (3-layer model): branches are character-agnostic, so the gather
         // above returns EVERY character's facts in those aspects. When Agent 1 named the focus
         // character(s), narrow to facts about THEM plus general/world facts and DROP unrelated

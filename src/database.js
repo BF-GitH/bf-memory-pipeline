@@ -781,6 +781,10 @@ export function invalidateDatabaseCache() {
     _dbCache = null;
     _dbCacheAvatar = null;
     _dbCachePromise = null;
+    // The per-turn in-memory fact index is derived from the cached map, so it must be dropped
+    // on the SAME invalidation boundary (write / chat-change) — otherwise an indexed query
+    // could serve a stale (pre-write) candidate set. Cheap to rebuild lazily on next use.
+    invalidateMemoryIndex();
 }
 
 /**
@@ -812,6 +816,448 @@ export async function getAllDatabases() {
         }
     })();
     return _dbCachePromise;
+}
+
+// =============================================================================
+// PER-TURN IN-MEMORY FACT INDEX (scaling fix). The hot retrieval paths
+// (collectBranchFacts / searchFacts / summarizeMenu) used to SCAN EVERY fact in the
+// whole databases map on every call — O(all-facts) per call, several calls per turn.
+// With the 50-fact cap removed (infinite cold-tiered facts), a category can hold tens of
+// thousands of facts, so that scan is the scaling bottleneck.
+//
+// CHOICE — IN-MEMORY INDEX (not a per-fact IDB object store). The persistence layer keeps
+// its ONE-record-per-avatar shape (the whole { category:{facts:[]} } map), so the durable
+// snapshot, the IDB-unavailable fallback, the cold-tier RMW, and dedupeDatabase all stay
+// EXACTLY as they were — zero migration, zero new failure modes. Instead, the FIRST indexed
+// query in a turn builds three lookup maps ONCE from the already-cached map and memoizes them
+// keyed by avatar; subsequent lookups are O(matching facts). The index is invalidated on the
+// SAME boundary as the DB cache (any write / chat-change), so it can never serve a stale set.
+// Building the index is one O(all-facts) pass per turn (replacing the SEVERAL O(all) scans the
+// hot paths each did), and it is skipped entirely when no indexed query runs that turn.
+//
+// FALLBACK NOTE: nothing here touches IDB or attachments. When IDB is unavailable the index is
+// simply built from the attachment-loaded map (getAllDatabases already abstracts that), so the
+// fallback path benefits from the same speedup with no special-casing.
+// =============================================================================
+
+let _idxCache = null;        // { byCatAspect, bySubject, byToken, aspectCounts, totalFacts }
+let _idxCacheAvatar = null;  // avatar the index belongs to
+
+/** Drop the memoized per-turn fact index (called by invalidateDatabaseCache). */
+export function invalidateMemoryIndex() {
+    _idxCache = null;
+    _idxCacheAvatar = null;
+}
+
+/**
+ * Tokenize a fact's searchable text (key + value + tags + aliases) into lowercased word
+ * tokens of length > 3. Mirrors the granularity searchFacts/fuzzyFallback already use so the
+ * token index admits exactly the same facts a full scan would. Character-name words are NOT
+ * filtered here (they're filtered at query time, where the current names are known); the index
+ * is name-agnostic so it survives a mid-chat rename.
+ * @param {FactSchema} fact
+ * @returns {string[]} unique tokens
+ */
+function factTokens(fact) {
+    const text = `${fact.key || ''} ${fact.value || ''} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
+    const out = new Set();
+    for (const tok of text.split(/[^a-z0-9]+/)) {
+        if (tok.length > 3) out.add(tok);
+    }
+    return [...out];
+}
+
+/**
+ * Build the in-memory fact index from a databases map (pure; no IDB/attachment access). Indexes
+ * ONLY active facts (superseded history is never a retrieval target, matching every hot path's
+ * `isActiveFact` guard) into:
+ *   - byCatAspect: Map(`category||aspect` -> [{fact, category}])  — for collectBranchFacts.
+ *   - bySubject:   Map(subject -> [{fact, category}])              — subject-scoped narrowing.
+ *   - byToken:     Map(token -> [{fact, category}])                — for searchFacts keyword hits.
+ *   - aspectCounts: Map(category -> Map(aspect -> count of active HOT facts)) — for summarizeMenu.
+ * Lowercased category in byCatAspect keys (callers normalize the same way). The same fact object
+ * reference is shared across buckets (no copies) so downstream cold-resurrection mutations still
+ * hit the real stored object.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @returns {{byCatAspect: Map, bySubject: Map, byToken: Map, aspectCounts: Map, totalFacts: number}}
+ */
+export function buildMemoryIndex(databases) {
+    const byCatAspect = new Map();
+    const bySubject = new Map();
+    const byToken = new Map();
+    const aspectCounts = new Map();
+    let totalFacts = 0;
+
+    const add = (map, key, entry) => {
+        if (!key) return;
+        let arr = map.get(key);
+        if (!arr) { arr = []; map.set(key, arr); }
+        arr.push(entry);
+    };
+
+    for (const [category, db] of Object.entries(databases || {})) {
+        const catLower = category.toLowerCase();
+        for (const fact of (db.facts || [])) {
+            if (!fact || typeof fact !== 'object') continue;
+            if (!isActiveFact(fact)) continue; // index only currently-valid facts
+            totalFacts++;
+            const entry = { fact, category };
+            const aspect = deriveAspect(fact);
+            add(byCatAspect, `${catLower}||${aspect}`, entry);
+            add(bySubject, deriveSubject(fact), entry);
+            for (const tok of factTokens(fact)) add(byToken, tok, entry);
+            // Menu counts: active HOT facts only (cold-tiered overflow is hidden from the planner).
+            if (isHotFact(fact)) {
+                let m = aspectCounts.get(category);
+                if (!m) { m = new Map(); aspectCounts.set(category, m); }
+                m.set(aspect, (m.get(aspect) || 0) + 1);
+            }
+        }
+    }
+    return { byCatAspect, bySubject, byToken, aspectCounts, totalFacts };
+}
+
+/**
+ * Get the per-turn in-memory fact index for the CURRENT character, building it ONCE from the
+ * cached databases map and memoizing it (keyed by avatar, invalidated on any write/chat-change).
+ * Loads the map via getAllDatabases() (which already serves the per-turn cache or the attachment
+ * fallback), so this works identically with or without IDB.
+ * @returns {Promise<{byCatAspect: Map, bySubject: Map, byToken: Map, aspectCounts: Map, totalFacts: number}>}
+ */
+export async function getMemoryIndex() {
+    const avatar = getCharacterAvatar();
+    if (_idxCache && _idxCacheAvatar === avatar) return _idxCache;
+    const databases = await getAllDatabases();
+    // Re-check: getAllDatabases may have been awaited across a boundary; only commit if still ours.
+    const idx = buildMemoryIndex(databases);
+    if (getCharacterAvatar() === avatar) {
+        _idxCache = idx;
+        _idxCacheAvatar = avatar;
+    }
+    return idx;
+}
+
+/**
+ * Normalize a branch pick / category token: strip wrapping punctuation Agent 1 may add, lowercase.
+ * Shared by the indexed collectBranchFacts so its parsing matches the legacy scan exactly.
+ */
+function normBranchToken(s) {
+    return String(s ?? '')
+        .trim()
+        .replace(/^[\s\-*•"'`(\[\{]+/, '')
+        .replace(/[\s.,;:"'`)\]\}]+$/, '')
+        .trim()
+        .toLowerCase();
+}
+
+/**
+ * INDEXED collectBranchFacts (scaling fix). Same contract/return shape as collectBranchFacts but
+ * resolves Agent 1's branch picks via the prebuilt index instead of scanning every fact:
+ *   - `Category` (no slash)  -> union of all that category's `category||aspect` buckets.
+ *   - `Category/aspect`      -> just that one bucket.
+ *   - Unsorted               -> ALWAYS included (every aspect under it), as before.
+ * Active-only (the index already excludes inactive), deduped by `category:key`. The work is
+ * O(facts in the picked branches + Unsorted), not O(all facts). Logs `retrieval.indexed`.
+ * @param {{byCatAspect: Map, aspectCounts: Map}} index
+ * @param {string[]} branches
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+export function collectBranchFactsIndexed(index, branches) {
+    const out = [];
+    const seen = new Set();
+    const push = (entry) => {
+        const id = `${entry.category}:${entry.fact.key}`;
+        if (seen.has(id)) return;
+        seen.add(id);
+        out.push(entry);
+    };
+
+    // Which category||aspect buckets do we want? Parse picks into wanted whole-cats + cat/aspect.
+    const wantWholeCat = new Set();   // lowercased category names
+    const wantCatAspect = new Set();  // `cat||aspect` lowercased
+    for (const raw of (branches || [])) {
+        const s = String(raw ?? '');
+        const slashIdx = s.indexOf('/');
+        if (slashIdx < 0) {
+            const cat = normBranchToken(s);
+            if (cat) wantWholeCat.add(cat);
+        } else {
+            const cat = normBranchToken(s.slice(0, slashIdx));
+            const asp = normBranchToken(s.slice(slashIdx + 1));
+            if (cat && asp) wantCatAspect.add(`${cat}||${asp}`);
+            else if (cat) wantWholeCat.add(cat);
+        }
+    }
+    // Unsorted is ALWAYS included (catch-all), as in the original scan.
+    wantWholeCat.add('unsorted');
+
+    // Iterate ONLY the index buckets (each key is `category||aspect`); admit a bucket when its
+    // category is wanted whole OR the exact cat/aspect pair was picked. This visits only populated
+    // buckets, and only the wanted ones — never the full fact set.
+    let byIndex = true;
+    for (const [bucketKey, entries] of index.byCatAspect) {
+        const sep = bucketKey.indexOf('||');
+        const cat = bucketKey.slice(0, sep);
+        if (wantWholeCat.has(cat) || wantCatAspect.has(bucketKey)) {
+            for (const e of entries) push(e);
+        }
+    }
+
+    addDebugLog('debug', `Indexed branch collect: ${out.length} candidate(s) from ${wantWholeCat.size} whole-cat + ${wantCatAspect.size} cat/aspect pick(s)`, {
+        subsystem: 'retrieval', event: 'retrieval.indexed',
+        data: { byIndex, candidateCount: out.length, op: 'collectBranchFacts', wholeCats: wantWholeCat.size, catAspects: wantCatAspect.size },
+    });
+    return out;
+}
+
+/**
+ * INDEXED searchFacts (scaling fix). Resolves keyword hits via the prebuilt token index instead
+ * of scanning every fact, then runs the EXACT same per-fact ranking/tiering/expansion the
+ * original searchFacts did — over the SMALL candidate set the index returned. Keeps cold
+ * deprioritization, relationship secondary/tertiary tiers, the primary cap, and relationship
+ * expansion. Returns the same `{fact, category, tier}[]` shape. Logs `retrieval.indexed`.
+ *
+ * CANDIDATE SET = a SUPERSET of what the original full scan could match, so recall is preserved.
+ * The original tested `factText.includes(word)` (a SUBSTRING test), so a keyword word could match
+ * inside a longer fact token ("part" in "apartment") or equal it. We therefore gather every fact
+ * whose token EQUALS, CONTAINS, or is CONTAINED BY a keyword word. We iterate the index's distinct
+ * tokens (far fewer than total facts) once per keyword word to find those — still well below the
+ * old O(all-facts) per call. PLUS facts whose category name matches a keyword word (the original
+ * matched on `categoryLower.includes(word)` too). The exact same per-fact ranking then re-applies
+ * the precise `includes` test over this candidate set, so no false positives leak through.
+ * @param {{byToken: Map}} index
+ * @param {Object<string, DatabaseSchema>} databases - still passed for the bounded relationship
+ *   expansion (which walks linked refs); the keyword match itself no longer scans it.
+ * @param {string[]} keywords
+ * @returns {Array<{fact: Object, category: string, tier: string}>}
+ */
+export function searchFactsIndexed(index, databases, keywords) {
+    const MAX_PRIMARY = 8;
+    const results = [];
+    const nameWords = getCharacterNameWords();
+    const lowerKeywords = keywords.map(k => k.toLowerCase());
+
+    // Same keyword pre-processing as the original: split into words, drop char-name + short words.
+    const keywordWordSets = lowerKeywords.map(kw =>
+        kw.split(/\s+/).filter(w => w.length > 3 && !nameWords.has(w))
+    ).filter(words => words.length > 0);
+
+    // Gather the candidate set from the token index. Match a keyword word against an index token
+    // when either CONTAINS the other (superset of the original's substring `includes` test), so
+    // "part"~"apartment" and "apartments"~"apartment" both qualify. Exact hits use the O(1) Map
+    // get; the contains/contained pass iterates distinct tokens (« total facts).
+    const candidates = new Map(); // `category:key` -> {fact, category}
+    const allKeyWords = new Set();
+    for (const words of keywordWordSets) for (const w of words) allKeyWords.add(w);
+    const pullBucket = (tok) => {
+        const bucket = index.byToken.get(tok);
+        if (bucket) for (const e of bucket) candidates.set(`${e.category}:${e.fact.key}`, e);
+    };
+    for (const word of allKeyWords) pullBucket(word); // exact hits (fast path)
+    // Substring/superstring hits: scan distinct tokens once. Only needed for words that could
+    // match a DIFFERENT-length token (the exact pass already handled equality).
+    for (const token of index.byToken.keys()) {
+        for (const word of allKeyWords) {
+            if (token === word) continue; // exact already pulled
+            if (token.includes(word) || word.includes(token)) { pullBucket(token); break; }
+        }
+    }
+    // Also admit facts whose CATEGORY name contains a keyword word (the original matched on
+    // `categoryLower.includes(word)` too). Categories are few, so this stays cheap.
+    for (const cat of collectCategoriesFromIndex(index)) {
+        const catLower = cat.toLowerCase();
+        const catHit = keywordWordSets.some(words => words.some(w => catLower.includes(w)));
+        if (!catHit) continue;
+        // pull every active fact of that category from the index buckets
+        for (const [bucketKey, entries] of index.byCatAspect) {
+            if (bucketKey.slice(0, bucketKey.indexOf('||')) !== catLower) continue;
+            for (const e of entries) candidates.set(`${e.category}:${e.fact.key}`, e);
+        }
+    }
+
+    const candidateList = [...candidates.values()];
+
+    // Now run the SAME per-fact matching/tiering as the original, but over candidates only.
+    for (const { fact, category } of candidateList) {
+        const categoryLower = category.toLowerCase();
+        // (index already filtered to active facts)
+        const factText = `${fact.key} ${fact.value} ${(fact.tags || []).join(' ')} ${(fact.aliases || []).join(' ')}`.toLowerCase();
+
+        const directMatch = keywordWordSets.some(words => {
+            if (words.length === 0) return false;
+            const matchCount = words.filter(word => factText.includes(word) || categoryLower.includes(word)).length;
+            if (words.length === 1) return matchCount >= 1;
+            return matchCount >= 2;
+        });
+
+        if (directMatch) {
+            results.push({ fact, category, tier: 'primary' });
+            continue;
+        }
+
+        if (fact.relationships) {
+            const secondaryMatch = (fact.relationships.secondary || []).some(ref => {
+                const refLower = ref.toLowerCase();
+                return keywordWordSets.some(words => words.some(word => refLower.includes(word)));
+            });
+            if (secondaryMatch) { results.push({ fact, category, tier: 'secondary' }); continue; }
+            const tertiaryMatch = (fact.relationships.tertiary || []).some(ref => {
+                const refLower = ref.toLowerCase();
+                return keywordWordSets.some(words => words.some(word => refLower.includes(word)));
+            });
+            if (tertiaryMatch) results.push({ fact, category, tier: 'tertiary' });
+        }
+    }
+
+    // Primary cap + COLD-FIRST demotion — identical to the original.
+    const primaryResults = results.filter(r => r.tier === 'primary');
+    if (primaryResults.length > MAX_PRIMARY) {
+        let toDemote = primaryResults.length - MAX_PRIMARY;
+        for (const result of results) {
+            if (toDemote <= 0) break;
+            if (result.tier === 'primary' && isColdFact(result.fact)) { result.tier = 'secondary'; toDemote--; }
+        }
+        for (const result of results) {
+            if (toDemote <= 0) break;
+            if (result.tier === 'primary') { result.tier = 'secondary'; toDemote--; }
+        }
+    }
+
+    // Relationship-based expansion (bounded). The original re-scanned every fact for refs that
+    // point at a primary hit; we instead resolve refs through the token index (a ref token pulls
+    // the small set of facts mentioning it), keeping it O(refs * matches) rather than O(all).
+    const primaryFacts = results.filter(r => r.tier === 'primary');
+    const alreadyFound = new Set(results.map(r => `${r.category}:${r.fact.key}`));
+    for (const primaryResult of primaryFacts) {
+        if (!primaryResult.fact.relationships) continue;
+        const relatedRefs = [
+            ...(primaryResult.fact.relationships.primary || []),
+            ...(primaryResult.fact.relationships.secondary || []),
+        ];
+        for (const ref of relatedRefs) {
+            const refLower = String(ref).toLowerCase();
+            // A ref names a key/tag/category token; pull candidates by each >3-char word of it.
+            for (const w of refLower.split(/[^a-z0-9]+/).filter(t => t.length > 3)) {
+                const bucket = index.byToken.get(w);
+                if (!bucket) continue;
+                for (const { fact, category } of bucket) {
+                    const id = `${category}:${fact.key}`;
+                    if (alreadyFound.has(id)) continue;
+                    const factIdentifiers = `${category} ${fact.key} ${(fact.tags || []).join(' ')}`.toLowerCase();
+                    if (factIdentifiers.includes(refLower)) {
+                        results.push({ fact, category, tier: 'secondary' });
+                        alreadyFound.add(id);
+                    }
+                }
+            }
+        }
+    }
+
+    addDebugLog('debug', `Indexed keyword search: ${candidateList.length} candidate(s) → ${results.length} ranked hit(s)`, {
+        subsystem: 'retrieval', event: 'retrieval.indexed',
+        data: { byIndex: true, candidateCount: candidateList.length, op: 'searchFacts', results: results.length },
+    });
+    return results;
+}
+
+/** Collect the distinct (original-cased) category names present in the index. */
+function collectCategoriesFromIndex(index) {
+    const seen = new Set();
+    const cats = [];
+    for (const entries of index.byCatAspect.values()) {
+        for (const e of entries) {
+            if (!seen.has(e.category)) { seen.add(e.category); cats.push(e.category); }
+        }
+        // one entry per bucket is enough to learn the category
+    }
+    return cats;
+}
+
+/**
+ * INDEXED summarizeMenu counts (scaling fix). Builds the same planner menu as summarizeMenu but
+ * reads per-aspect ACTIVE-HOT counts from the prebuilt index's aspectCounts aggregate instead of
+ * walking every fact. Same output: one populated category per line, populated aspects in fixed
+ * vocab order then out-of-vocab extras by count, empty categories omitted. Logs `retrieval.indexed`.
+ * @param {{aspectCounts: Map}} index
+ * @returns {string}
+ */
+export function summarizeMenuIndexed(index) {
+    // Use the canonical L1 order first, then any custom categories that have counts.
+    const present = new Set(index.aspectCounts.keys());
+    const ordered = [];
+    for (const c of MENU_CATEGORY_ORDER) {
+        const found = [...present].find(p => p.toLowerCase() === c.toLowerCase());
+        if (found) ordered.push(found);
+    }
+    for (const c of present) {
+        if (!MENU_CATEGORY_ORDER.some(m => m.toLowerCase() === c.toLowerCase())) ordered.push(c);
+    }
+
+    const lines = [];
+    let aspectCount = 0;
+    for (const name of ordered) {
+        const counts = index.aspectCounts.get(name);
+        if (!counts || counts.size === 0) continue;
+        const vocab = aspectVocabFor(name);
+        const parts = vocab.filter(a => (counts.get(a) || 0) > 0).map(a => `${a}(${counts.get(a)})`);
+        const extras = [...counts.keys()]
+            .filter(a => !vocab.includes(a) && counts.get(a) > 0)
+            .sort((a, b) => (counts.get(b) - counts.get(a)) || String(a).localeCompare(String(b)));
+        for (const a of extras) parts.push(`${a}(${counts.get(a)})`);
+        aspectCount += parts.length;
+        if (parts.length) lines.push(`${name}: ${parts.join(', ')}`);
+    }
+    addDebugLog('debug', `Indexed menu: ${lines.length} populated categor(ies), ${aspectCount} aspect drawer(s)`, {
+        subsystem: 'retrieval', event: 'retrieval.indexed',
+        data: { byIndex: true, candidateCount: aspectCount, op: 'summarizeMenu', categories: lines.length },
+    });
+    return lines.join('\n');
+}
+
+/**
+ * SCOPED scribe-dedup candidates (the key unbounded fix). For the message being processed, return
+ * ONLY the active facts that could plausibly be duplicates/relevant — those sharing a SUBJECT or a
+ * keyword TOKEN with the message — via the prebuilt index, bounded to `cap`. This replaces dumping
+ * the WHOLE active DB into the Scribe prompt. The write-time reconcile (findParallelStateKey /
+ * findFactMatch / upsertFact) remains the dedup AUTHORITY; this only narrows what the prompt SHOWS.
+ *
+ * Selection: union of (a) facts whose subject matches a subject token in play and (b) facts sharing
+ * a >3-char keyword token with the message, deduped by `category:key`. Capped to the highest-
+ * salience `cap` candidates so the prompt stays bounded on a huge store. Logs `scribe.dedup_scoped`.
+ * @param {{bySubject: Map, byToken: Map}} index
+ * @param {string[]} subjects - subject tokens in play (e.g. {{char}}, {{user}}, named entities)
+ * @param {string[]} keywords - keyword/token hints from the message text
+ * @param {number} [cap=60] - max scoped candidates to include
+ * @returns {Array<{fact: Object, category: string}>}
+ */
+export function scopedScribeCandidates(index, subjects, keywords, cap = 60) {
+    const picked = new Map(); // `category:key` -> {fact, category}
+    const addEntry = (e) => { if (e) picked.set(`${e.category}:${e.fact.key}`, e); };
+
+    for (const subj of (subjects || [])) {
+        const s = String(subj || '').trim().toLowerCase();
+        if (!s) continue;
+        const bucket = index.bySubject.get(s);
+        if (bucket) for (const e of bucket) addEntry(e);
+    }
+    for (const kw of (keywords || [])) {
+        for (const w of String(kw || '').toLowerCase().split(/[^a-z0-9]+/)) {
+            if (w.length <= 3) continue;
+            const bucket = index.byToken.get(w);
+            if (bucket) for (const e of bucket) addEntry(e);
+        }
+    }
+
+    let candidates = [...picked.values()];
+    // Bound the set: rank by salience (importance + recency, cold pushed last) and keep the top cap.
+    if (candidates.length > cap) {
+        const now = Date.now();
+        candidates = candidates
+            .slice()
+            .sort((a, b) => salienceScore(b.fact, now) - salienceScore(a.fact, now))
+            .slice(0, cap);
+    }
+    return candidates;
 }
 
 /**

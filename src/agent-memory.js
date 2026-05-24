@@ -2,7 +2,7 @@
 // Runs AFTER the response is displayed, processes N-1 message
 // Updates fact databases, tracks who knows what, manages cross-references
 
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
+import { getAllDatabases, getMemoryIndex, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES } from './database.js';
 import { addDebugLog } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 
@@ -254,7 +254,35 @@ Only SKIP when something is purely hypothetical, [OOC:], reported/historical spe
  * @returns {Promise<MemoryUpdateResult>}
  */
 export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null) {
-    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages);
+    // SCOPED DEDUP CONTEXT (scaling fix). Instead of dumping EVERY active fact into the Scribe
+    // prompt (impossible on a huge store), fetch only the SCOPED candidates that could be
+    // duplicates/relevant for THIS message — by the subjects + keyword tokens in play — via the
+    // per-turn in-memory index. The write-time reconcile (findParallelStateKey/findFactMatch/
+    // upsertFact) remains the dedup AUTHORITY; this only narrows what the prompt SHOWS.
+    let scopedFacts = null;
+    try {
+        const index = await getMemoryIndex();
+        // Subjects in play: always {{char}}/{{user}} (their resolved names + the literal macros),
+        // plus capitalized proper-noun tokens mentioned across the analyzed text (prior + target).
+        const analyzedText = [
+            ...(Array.isArray(priorMessages) ? priorMessages.map(m => m.text) : []),
+            messageText,
+        ].join(' ');
+        const subjects = scribeSubjects(analyzedText);
+        const keywords = scribeKeywords(analyzedText);
+        scopedFacts = scopedScribeCandidates(index, subjects, keywords, SCRIBE_SCOPED_CAP);
+        addDebugLog('debug', `Scribe scoped-dedup: ${scopedFacts.length} candidate(s) (subjects:${subjects.length} keywords:${keywords.length})`, {
+            subsystem: 'agent3', event: 'scribe.dedup_scoped',
+            data: { scopedCandidates: scopedFacts.length, subjects: subjects.length, keywords: keywords.length, cap: SCRIBE_SCOPED_CAP },
+        });
+    } catch (e) {
+        // Index/scoping failure must never break extraction — fall back to no existing-facts
+        // context (the write-time reconcile is still the authority, so correctness holds).
+        console.error('[BFMemory] Scribe scoped-dedup failed; proceeding without existing-fact context', e);
+        scopedFacts = null;
+    }
+
+    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages, scopedFacts);
     addDebugLog('info', `Agent 3 prompt: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
 
     try {
@@ -285,10 +313,63 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
     }
 }
 
+// Max scoped existing-fact candidates shown to the Scribe (bounds the prompt on a huge store).
+const SCRIBE_SCOPED_CAP = 60;
+
+/**
+ * Subjects in play for the Scribe's scoped-dedup query: the resolved {{char}}/{{user}} names and
+ * the literal macros (so facts filed under either are pulled), plus lowercased proper-noun tokens
+ * (capitalized, not stop-words) mentioned in the analyzed text. Lowercased, deduped.
+ * @param {string} text - the analyzed message text (prior + target)
+ * @returns {string[]}
+ */
+function scribeSubjects(text) {
+    const out = new Set();
+    try {
+        const ctx = SillyTavern.getContext();
+        const charName = String(ctx.characters?.[ctx.characterId]?.name || '').trim().toLowerCase();
+        const userName = String(ctx.name1 || '').trim().toLowerCase();
+        if (charName) out.add(charName);
+        if (userName) out.add(userName);
+    } catch { /* ignore */ }
+    // The literal macro tokens facts may be filed under (subj:{{char}} etc.).
+    out.add('{{char}}');
+    out.add('{{user}}');
+    out.add('char');
+    out.add('user');
+    // Proper-noun candidates from the message (named NPCs/places/things the message references).
+    for (const word of String(text || '').split(/\s+/)) {
+        const clean = word.replace(/[^a-zA-Z0-9]/g, '');
+        if (clean.length < 3) continue;
+        if (clean[0] === clean[0].toUpperCase() && clean[0] !== clean[0].toLowerCase()) {
+            out.add(clean.toLowerCase());
+        }
+    }
+    return [...out];
+}
+
+/**
+ * Keyword tokens for the Scribe's scoped-dedup query: lowercased >3-char word tokens of the
+ * analyzed text. The index intersects these against fact tokens, so this need not be filtered
+ * heavily (scopedScribeCandidates re-tokenizes/length-gates internally). Deduped.
+ * @param {string} text
+ * @returns {string[]}
+ */
+function scribeKeywords(text) {
+    const out = new Set();
+    for (const tok of String(text || '').toLowerCase().split(/[^a-z0-9]+/)) {
+        if (tok.length > 3) out.add(tok);
+    }
+    return [...out];
+}
+
 /**
  * Build the prompt for Agent 3
+ * @param {Array<{fact:Object, category:string}>|null} scopedFacts - SCOPED existing-fact
+ *   candidates for dedup context (scaling fix). When provided, the "Existing facts" block lists
+ *   ONLY these (not the whole DB). When null (scoping failed/unavailable), the block is omitted.
  */
-function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages = []) {
+function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages = [], scopedFacts = null) {
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
     // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
@@ -305,9 +386,13 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
         dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
     }
 
-    const dbSummary = summarizeDatabases(existingDatabases);
+    // SCOPED existing-fact context (scaling fix): show the Scribe ONLY the scoped candidate facts
+    // that could be duplicates/relevant for this message (subjects/aspects/tokens in play), not the
+    // whole active DB. Falls back to nothing when scoping failed (write-time reconcile is still the
+    // dedup authority). Header renamed to "Existing facts (scoped)" so it's clear this is a subset.
+    const dbSummary = summarizeScopedFacts(scopedFacts);
     if (dbSummary) {
-        dataParts.push(`## Existing Databases\n${dbSummary}`);
+        dataParts.push(`## Existing facts (scoped)\n${dbSummary}`);
     }
 
     // Tag the source role so the model can't collapse user disclosures into RP narrative.
@@ -333,26 +418,26 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
 }
 
 /**
- * Summarize databases for the prompt (compact, mirrors output format)
+ * Render the SCOPED existing-fact candidates for the Scribe prompt (compact, mirrors output
+ * format). Replaces the old summarizeDatabases, which dumped EVERY active fact in the store
+ * (unbounded). `scopedFacts` is the small `{fact, category}[]` set returned by
+ * scopedScribeCandidates — already active-only and bounded. Returns '' when there's nothing
+ * scoped (so the block is omitted), keeping the prompt lean on the common no-overlap turn.
+ * @param {Array<{fact:Object, category:string}>|null} scopedFacts
+ * @returns {string}
  */
-function summarizeDatabases(databases) {
-    if (!databases || Object.keys(databases).length === 0) return '(No databases yet)';
-
+function summarizeScopedFacts(scopedFacts) {
+    if (!Array.isArray(scopedFacts) || scopedFacts.length === 0) return '';
     const lines = [];
-    for (const [category, db] of Object.entries(databases)) {
-        for (const fact of db.facts) {
-            // Supersession: don't show Agent 3 the inactive history snapshots — it should
-            // reason against the CURRENT state only (and not try to re-extract stale values).
-            if (fact.active === false) continue;
-            const known = fact.knownBy?.length ? ` | @${fact.knownBy.join(',')}` : '';
-            const tags = fact.tags?.length ? ` | #${fact.tags.join(',')}` : '';
-            // Value-less facts (note carries the fact) render as `key | >note` so the
-            // Scribe sees the full picture and doesn't re-extract it as missing.
-            const hasValue = String(fact.value ?? '').trim() !== '';
-            const note = (typeof fact.context === 'string' && fact.context.trim()) ? ` | >${fact.context.trim()}` : '';
-            const head = hasValue ? `${category}/${fact.key} = ${fact.value}` : `${category}/${fact.key}${note}`;
-            lines.push(`${head}${known}${tags}`);
-        }
+    for (const { fact, category } of scopedFacts) {
+        // scopedScribeCandidates already excludes inactive history; guard anyway for safety.
+        if (fact.active === false) continue;
+        const known = fact.knownBy?.length ? ` | @${fact.knownBy.join(',')}` : '';
+        const tags = fact.tags?.length ? ` | #${fact.tags.join(',')}` : '';
+        const hasValue = String(fact.value ?? '').trim() !== '';
+        const note = (typeof fact.context === 'string' && fact.context.trim()) ? ` | >${fact.context.trim()}` : '';
+        const head = hasValue ? `${category}/${fact.key} = ${fact.value}` : `${category}/${fact.key}${note}`;
+        lines.push(`${head}${known}${tags}`);
     }
     return lines.join('\n');
 }
