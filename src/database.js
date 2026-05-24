@@ -422,12 +422,79 @@ function getCharacterAvatar() {
     return context.characters?.[context.characterId]?.avatar || null;
 }
 
+// =============================================================================
+// PER-TURN getAllDatabases() CACHE (perf). getAllDatabases() fetch()es + JSON.parses
+// every category attachment, and it is called ~4-5×/turn (Drafter menu, speculative
+// retrieval, finder, post-reply extraction, reflection/UI). Re-reading every category
+// file that many times per turn is pure waste — the on-disk facts only change when WE
+// write one. So we memoize the parsed result and serve it on subsequent calls, keyed by
+// the current character avatar (a different character must never see a cached DB map).
+//
+// CORRECTNESS — the cache MUST be invalidated on ANY write so a post-write read is
+// FRESH (extraction runs post-reply and DOES write; a stale read after a write would be
+// a correctness bug — facts would silently disappear/reappear). Every write path funnels
+// through saveDatabase()/deleteDatabase(), which call invalidateDatabaseCache(); the
+// CHAT_CHANGED handler (pipeline.js) also invalidates so switching chats never serves a
+// previous chat's facts. A pending in-flight fetch is shared (promise cache) so concurrent
+// callers within one turn don't each kick off their own round of fetches.
+//
+// NOTE: getAllDatabases() returns a possibly-SHARED object reference (the cached map).
+// Callers that mutate it in place (applyUpdates → upsertFact) then persist via
+// saveDatabase(), which invalidates — so the next reader re-fetches fresh from disk. We
+// never serve a mutated-but-unsaved map across a write boundary.
+let _dbCache = null;          // resolved map (Object<string, DatabaseSchema>)
+let _dbCacheAvatar = null;    // avatar the cached map belongs to
+let _dbCachePromise = null;   // in-flight load promise (deduped concurrent callers)
+
 /**
- * Get all memory databases for the current character
+ * Invalidate the per-turn getAllDatabases() cache. Called automatically on every write
+ * (saveDatabase / deleteDatabase) and must also be called by the chat-change handler.
+ * Safe to call repeatedly. Exported so the orchestrator can drop it on CHAT_CHANGED.
+ */
+export function invalidateDatabaseCache() {
+    _dbCache = null;
+    _dbCacheAvatar = null;
+    _dbCachePromise = null;
+}
+
+/**
+ * Get all memory databases for the current character. Memoized per-turn (see the cache
+ * note above): returns the cached parsed map until a write or chat-change invalidates it.
  * @returns {Promise<Object<string, DatabaseSchema>>} Map of category -> database
  */
 export async function getAllDatabases() {
     const avatar = getCharacterAvatar();
+    if (!avatar) return {};
+
+    // Serve the cache only when it belongs to the CURRENT character (a character switch
+    // without a CHAT_CHANGED must still never leak another character's facts).
+    if (_dbCache && _dbCacheAvatar === avatar) return _dbCache;
+    // Share an in-flight load so concurrent callers in the same turn don't each re-fetch.
+    if (_dbCachePromise && _dbCacheAvatar === avatar) return _dbCachePromise;
+
+    _dbCacheAvatar = avatar;
+    _dbCachePromise = (async () => {
+        try {
+            const result = await loadAllDatabases(avatar);
+            // Only commit to the cache if the avatar hasn't changed under us mid-load and
+            // the cache wasn't invalidated (a write during the fetch nulls _dbCacheAvatar).
+            if (_dbCacheAvatar === avatar) _dbCache = result;
+            return result;
+        } finally {
+            // Clear the in-flight marker only if it's still ours.
+            if (_dbCacheAvatar === avatar) _dbCachePromise = null;
+        }
+    })();
+    return _dbCachePromise;
+}
+
+/**
+ * Uncached loader: fetch + parse + legacy-remap every category attachment for a character.
+ * Split out of getAllDatabases() so the cache wrapper above can memoize it.
+ * @param {string} avatar
+ * @returns {Promise<Object<string, DatabaseSchema>>}
+ */
+async function loadAllDatabases(avatar) {
     if (!avatar) return {};
 
     const context = getContext();
@@ -502,6 +569,12 @@ export async function getDatabase(category) {
 export async function saveDatabase(db) {
     const avatar = getCharacterAvatar();
     if (!avatar) throw new Error('No character selected');
+
+    // Per-turn cache: this is a WRITE — drop the memoized map so the next getAllDatabases()
+    // re-reads fresh from disk (post-reply extraction writes here; a stale read afterward
+    // would silently lose/duplicate facts). Invalidate BEFORE the async upload so even a
+    // concurrent read mid-upload can't latch onto a now-stale snapshot.
+    invalidateDatabaseCache();
 
     // Enforce max facts limit.
     if (db.facts.length > MAX_FACTS_PER_DB) {
@@ -650,6 +723,9 @@ export async function saveDatabase(db) {
 export async function deleteDatabase(category) {
     const avatar = getCharacterAvatar();
     if (!avatar) return;
+
+    // Per-turn cache: deleting a category is a write — invalidate so a later read re-fetches.
+    invalidateDatabaseCache();
 
     const context = getContext();
     const attachments = context.extensionSettings?.character_attachments?.[avatar] || [];

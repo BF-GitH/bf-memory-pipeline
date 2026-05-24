@@ -1829,6 +1829,16 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
     })();
     const userPersona = ctx.persona?.description || ctx.name1 || '';
 
+    // PERF (fix): load the databases ONCE before the loop instead of re-fetching every
+    // iteration. applyUpdates() mutates this map IN PLACE (via upsertFact) and persists
+    // each touched category through saveDatabase(), so the same reference stays current
+    // across iterations — passing it forward is both correct and avoids a fresh round of
+    // fetch()+JSON.parse per message (which on a long chat was a huge serial cost and,
+    // combined with the per-message LLM call below, could hang the UI). saveDatabase()
+    // also invalidates the per-turn getAllDatabases() cache, so any later reader (the
+    // Database tab, the next turn's pipeline) still re-reads fresh from disk.
+    const databases = await getAllDatabases();
+
     let processed = 0, skipped = 0, factsAdded = 0;
     const total = chat.length;
     const backfillStart = Date.now();
@@ -1848,6 +1858,12 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
             });
             break;
         }
+        // PERF (fix): yield to the event loop periodically so a long chat with many
+        // SKIPPED (synchronous) messages doesn't freeze the UI between LLM calls. The
+        // processed path already awaits an LLM call (a natural yield); this covers long
+        // runs of skips (system messages, already-processed, trivially-empty) that would
+        // otherwise spin the main thread with no chance for the cancel button to paint.
+        if (i > 0 && i % 25 === 0) await new Promise(r => setTimeout(r, 0));
         const msg = chat[i];
         const skip = (reason) => addDebugLog('debug', `Full-chat: msg ${i + 1} skipped (${reason})`, {
             subsystem: 'import', event: 'backfill.skipped', reason, data: { msgIndex: i },
@@ -1869,7 +1885,7 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
         }
 
         try {
-            const databases = await getAllDatabases();
+            // Reuse the single pre-loaded map (mutated in place + persisted by applyUpdates).
             const result = await runMemoryUpdater(
                 msg.mes,
                 i,

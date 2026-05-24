@@ -8,7 +8,7 @@ import { buildWriterInjection, injectMemoryContext, buildSceneBlock } from './ag
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope } from './database.js';
+import { getAllDatabases, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenu, collectBranchFacts, deriveSubject, deriveScope, invalidateDatabaseCache } from './database.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun } from './settings.js';
@@ -871,10 +871,27 @@ async function runPipelineInline(data) {
 
     const success = injectMemoryContext(data, injection, { trimToLast: agent2Limit });
 
-    // Token comparison: count main-model input AFTER trim+inject.
-    const actualArr = data.chat || data.messages;
+    // Token comparison: main-model input AFTER trim+inject.
+    // PERF (fix): avoid tokenizing the WHOLE chat a SECOND time. On the common path
+    // (agent2Limit == 0, no trim) the post-injection array differs from baseline by
+    // exactly ONE inserted system message (the injection) — so actualInput is just
+    // baselineInput + the injection's token cost. We tokenize only that single message
+    // instead of the entire (potentially million-message) chat again. This keeps the
+    // Tokens-tab "actualIn" meaning intact (still baseline + injected context), measured
+    // with the same tokenizer; it's a hair approximate only in that it omits any
+    // chat-completion array-framing delta from inserting one message, which is negligible.
+    // When trimming IS active (agent2Limit > 0) the array changes structurally (messages
+    // removed), so we fall back to a full recount to keep the number faithful.
     let actualInput = baselineInput;
-    try { actualInput = await countChatTokens(actualArr); } catch { actualInput = baselineInput; }
+    if (success && agent2Limit === 0) {
+        try {
+            const injTokens = await countChatTokens([{ role: 'system', content: injection }]);
+            actualInput = baselineInput + injTokens;
+        } catch { actualInput = baselineInput; }
+    } else {
+        const actualArr = data.chat || data.messages;
+        try { actualInput = await countChatTokens(actualArr); } catch { actualInput = baselineInput; }
+    }
 
     // Record token metrics for the Tokens tab. Agent 3 no longer runs on this path
     // (memoryResult: null) — its tokens are folded in later via addAgent3Tokens on
@@ -1074,13 +1091,25 @@ async function runMemoryExtraction() {
 
         // Mark the AI target + the user message (Agent 3 saw both) as processed so the
         // per-message icon / "skip already processed" / our own re-extract gate honor it.
-        if (chat[memoryTargetIndex]) {
+        // PERF (fix): only FORCE a chat save when the flag actually CHANGED. The flag was
+        // previously stamped + saveChatDebounced() called every turn, which re-serializes
+        // the ENTIRE chat .jsonl each time — O(chat size) per reply on a long chat for a
+        // boolean that's almost always already correct. We track whether either stamp was
+        // a real transition and only then nudge ST to persist; when nothing changed we let
+        // ST's own existing chat-save cadence handle it (the flag still lives on the
+        // in-memory chat object, so persistence isn't lost — we just stop forcing a
+        // redundant full-chat write for a no-op).
+        let processedFlagChanged = false;
+        if (chat[memoryTargetIndex] && !chat[memoryTargetIndex].extra?.bf_mem_processed) {
             chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: true };
+            processedFlagChanged = true;
         }
-        if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]) {
+        if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]
+            && !chat[lastUserMsgIndex].extra?.bf_mem_processed) {
             chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: true };
+            processedFlagChanged = true;
         }
-        SillyTavern.getContext().saveChatDebounced?.();
+        if (processedFlagChanged) SillyTavern.getContext().saveChatDebounced?.();
 
         // Review popup (deferred), capturing the chat id so it can't pop in the wrong chat.
         if (tickMessageCounter(settings.reviewInterval || 10)) {
@@ -1404,6 +1433,9 @@ export function initPipeline() {
 
     // Reset on chat change
     eventSource.on(eventTypes.CHAT_CHANGED, () => {
+        // Per-turn getAllDatabases() cache: a chat (and possibly character) switch means
+        // the cached fact map no longer applies — drop it so the new chat re-reads fresh.
+        invalidateDatabaseCache();
         isInternalCall = false;
         lastProcessedMessageIndex = -1;
         lastInjection = null;
