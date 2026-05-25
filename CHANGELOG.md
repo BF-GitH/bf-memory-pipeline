@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.30.0] - 2026-05-24
+
+### Added — the "spiderweb": connected, scene-aware recall (MVP)
+Three independent design agents (+ a survey of GraphRAG / Zep / A-MEM) shaped this. The memory was already ~85% a connected web — facts already store who/where/when/source/related and retrieval already follows those links one hop. This finishes the web **without** turning it into an unbounded graph dump, and adds the scene/source strands.
+
+**Retrieval hygiene (part 1).**
+- **Anti-hub:** a "popular" subject's facts no longer monopolize the injected set — pure same-subject auto-links are demoted to the capped tier, and each seed/hub can contribute at most a few facts to the expansion (per-seed + total caps). Crucially, **connectedness only decides what's *eligible* — ranking stays importance/recency/use** (no "most-connected wins," which would bury the decisive sparse fact).
+- **Coherent grouping:** injected facts are grouped by subject so the Writer sees connected clusters instead of a flat list (same facts, better order).
+- **Deterministic expansion:** removed a `Math.random` reach in the event-sequence follow that could make swipes/regens unstable; unified the link / sequence / relationship expansions under one shared, salience-ranked cap. ([src/fact-retrieval.js](src/fact-retrieval.js), [src/database.js](src/database.js))
+
+**Scene + source strands (part 2).**
+- Each fact is now stamped with the **scene** it was established in (a deterministic, debounced scene number + name) and its **source message**. Scene boundaries advance on a *material location change* (with a similarity guard so "the bar"→"the club" or room-flapping doesn't spuriously bump); the scene name is auto-derived from the location and optionally refined by the Drafter (never required). Scene numbering is **branch-safe** (a branch continues its own numbering, like the token tab) and **swipe-safe** (re-rolling doesn't bump). Facts keep their **origin** scene (first-wins); a superseded snapshot keeps the old scene while the live fact advances.
+- Same-scene is wired as a **high-precision, capped** connection (it can't form a noisy hub).
+- **Recap-by-scene:** the Writer's `search_memory` tool (and a `scene` query) can now pull a whole scene — **including cold-tiered and superseded facts** (a recap wants the full scene, not just the current set). Each fact shows its scene + source in the Database tab. ([src/settings.js](src/settings.js), [src/agent-draft.js](src/agent-draft.js), [src/agent-memory.js](src/agent-memory.js), [src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-writer.js](src/agent-writer.js))
+
+*(Deferred follow-up: promoting the summary pyramid to a per-scene "arc" tier the Writer drills into.)*
+
 ## [0.29.0] - 2026-05-24
 
 ### Fixed — follow-ups from 0.28 testing
