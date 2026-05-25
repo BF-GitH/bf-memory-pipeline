@@ -135,6 +135,106 @@ export function buildBigPictureBlock(pyramid, scene, maxTokens = 250) {
 }
 
 /**
+ * Build the narrow, default-OFF "moment echo" block (Resonance Part B) — at most ONE tiny
+ * `[Echo: …]` line surfacing a single resonant PAST moment when the present echoes it. This is
+ * the PROACTIVE half of the relationship-resonance feature: Build 1 made the couple's emotional
+ * thread PULLABLE (getRelationshipMomentThread); this lets one past beat RESURFACE on its own —
+ * but NARROWLY (high-precision cue) and SAFELY (the agents warned auto-injection is the bloat/
+ * attention-dilution risk, so it is default-off, capped at ONE, token-clamped, and emits NOTHING
+ * on most turns). Pure + deterministic (NO LLM call) — the caller gates it on `enableMomentEcho`.
+ *
+ * THE CUE (narrow, in priority — NEVER "same place", which fires on every revisit = noise):
+ *   1. CALLBACK edge (reflection-authored, Part A): a past moment whose `callbacks[]` points to a
+ *      LATER beat that is LIVE in the present context (injected this turn). The earlier beat is the
+ *      causal antecedent the present pays off ("the confession that the current beat echoes") — the
+ *      highest-precision cue, and the one pure surface-matching can't do.
+ *   2. CHARGED pair-moment: the most-recent `kind:'moment'` for the present PAIR with real charge
+ *      (high importance and/or a `tone`) that ISN'T already in this turn's injected facts.
+ * If neither clears, returns '' (most turns → nothing). NO connectedness/degree term in the choice
+ * (the cue is precision: pair + callback + recency/charge — never "most connected").
+ *
+ * @param {object|null} scene - current scene card ({ present[], ... }) — the CUE source
+ * @param {Array<{fact:object, category:string}>} thread - the present pair's moment thread
+ *   (from getRelationshipMomentThread; chronological, incl. cold + superseded). [] when no pair.
+ * @param {Set<string>} injectedKeys - `category::key` of the facts ALREADY injected this turn
+ *   (so an echo never duplicates a fact the Writer already sees).
+ * @param {number} [maxTokens=40] - approximate hard cap (1 token ≈ 4 chars heuristic)
+ * @returns {{block:string, fired:boolean, cue:string, fact:(object|null), pair:string[]}}
+ */
+export function buildMomentEchoBlock(scene, thread, injectedKeys, maxTokens = 40) {
+    const none = { block: '', fired: false, cue: '', fact: null, pair: [] };
+    if (!scene || typeof scene !== 'object') return none;
+    // CUE source: the present characters that form a PAIR (need exactly two distinct names — a
+    // lone character or a crowd is not a "couple" cue). Mirror the thread's name normalization
+    // loosely (trim/lowercase) only for the de-dup; the display keeps the scene's casing.
+    const present = Array.isArray(scene.present)
+        ? scene.present.map(x => String(x ?? '').trim()).filter(Boolean)
+        : [];
+    const seen = new Set();
+    const pair = [];
+    for (const p of present) {
+        const k = p.toLowerCase();
+        if (seen.has(k)) continue;
+        seen.add(k); pair.push(p);
+    }
+    if (pair.length !== 2) return none; // narrow: only a clean two-person pair cues an echo
+    if (!Array.isArray(thread) || thread.length === 0) return none;
+
+    const injected = injectedKeys instanceof Set ? injectedKeys : new Set();
+    const isMoment = (f) => f && String(f.kind || '').toLowerCase() === 'moment';
+    const idOf = (category, fact) => `${category}::${fact.key}`;
+
+    // Candidate moments = thread moments NOT already injected this turn (an echo must add a beat
+    // the Writer doesn't already see). Keep their original chronological order from the thread.
+    const candidates = thread.filter(e => e && e.fact && isMoment(e.fact) && !injected.has(idOf(e.category, e.fact)));
+    if (candidates.length === 0) return none;
+
+    let chosen = null;
+    let cue = '';
+
+    // CUE 1 (highest precision): a CALLBACK edge whose LATER target is live in the present context.
+    // Scan candidates for one whose `callbacks[]` points to a fact injected this turn — that later
+    // beat is happening now, so its earlier antecedent is the resonant echo. Prefer the most-recent
+    // such antecedent (candidates are chronological → take the LAST match).
+    for (const e of candidates) {
+        const cbs = Array.isArray(e.fact.callbacks) ? e.fact.callbacks : [];
+        if (cbs.some(cb => cb && injected.has(`${cb.toCategory}::${cb.toKey}`))) {
+            chosen = e; cue = 'callback';
+        }
+    }
+
+    // CUE 2 (charged pair-moment): the most-recent moment with real emotional charge — a `tone`
+    // OR a high importance (>=4, the moment baseline). Recency = chronological position (the thread
+    // is chronological, so the LAST charged candidate is the most recent). NO connectedness term.
+    if (!chosen) {
+        for (const e of candidates) {
+            const f = e.fact;
+            const charged = (typeof f.tone === 'string' && f.tone.trim()) || (Number(f.importance) || 0) >= 4;
+            if (charged) { chosen = e; cue = 'charged'; }
+        }
+    }
+
+    if (!chosen) return none;
+
+    // Render ONE tiny line: the moment's note (preferred) / value + its scene + tone. Mirrors the
+    // moment-line format the fact formatter uses (`<note> (tone)`), prefixed with the scene handle.
+    const f = chosen.fact;
+    const note = (typeof f.context === 'string' && f.context.trim()) ? f.context.trim() : String(f.value ?? '').trim();
+    if (!note) return none;
+    const sceneTag = Number.isInteger(f.sceneNo) ? ` (scene ${f.sceneNo}${f.sceneName ? `·${f.sceneName}` : ''})` : '';
+    const tone = (typeof f.tone === 'string' && f.tone.trim()) ? ` (${f.tone.trim()})` : '';
+    let block = `[Echo:${sceneTag} ${note}${tone}]`;
+
+    // Hard cap (same heuristic + truncation style as buildSceneBlock): clip mid-string. The clamp
+    // keeps the closing bracket so the line stays well-formed even when truncated.
+    const charBudget = Math.max(24, Math.floor((Number(maxTokens) || 40) * 4));
+    if (block.length > charBudget) {
+        block = block.slice(0, charBudget - 2).trimEnd() + '…]';
+    }
+    return { block, fired: true, cue, fact: f, pair };
+}
+
+/**
  * Build the fact injection block that gets inserted into the prompt
  * This doesn't call an LLM - it prepares context for the main generation
  * @param {string} draft - Draft from Agent 1

@@ -4,11 +4,11 @@
 
 import { runDraftAgent } from './agent-draft.js';
 import { runFinderAgent, formatChosenFacts } from './agent-finder.js';
-import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock } from './agent-writer.js';
+import { buildWriterInjection, injectMemoryContext, buildSceneBlock, buildBigPictureBlock, buildMomentEchoBlock } from './agent-writer.js';
 import { runMemoryUpdater } from './agent-memory.js';
 import { runReflection } from './agent-reflect.js';
 import { retrieveFacts, extractContextKeywords, isFactVisible, expandLinks } from './fact-retrieval.js';
-import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage } from './database.js';
+import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, upsertFact, summarizeKeys, summarizeMenuIndexed, collectBranchFactsIndexed, capFinderCandidates, deriveSubject, deriveAspect, deriveScope, invalidateDatabaseCache, markFactsUsed, applyBufferedFactUsage, getRelationshipMomentThread } from './database.js';
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
@@ -1160,8 +1160,42 @@ async function runPipelineInline(data) {
             addDebugLog('fail', `[${runId}] Big Picture injection failed (non-fatal): ${err.message || err}`, { subsystem: 'writer', event: 'summary.injected', reason: 'ERROR' });
         }
     }
-    // Stack the Big Picture above the scene block (both live in the pre-facts slot).
-    const overviewBlock = [bigPictureBlock, sceneBlock].filter(Boolean).join('\n\n');
+    // MOMENT ECHO (Resonance Part B). Default OFF (enableMomentEcho). When ON, on the rare turn a
+    // couple's present moment echoes an earlier beat, surface ONE tiny `[Echo: …]` line — a single
+    // resonant past moment for the PAIR present, cued by a reflection-authored callback that pays
+    // off in the present context or the most-recent charged moment for that pair (NEVER shared
+    // place). Capped at one, token-clamped; emits nothing on most turns. The full relationship
+    // thread stays PULL-ONLY (Build 1). When OFF, momentEchoBlock is '' → overviewBlock unchanged
+    // (byte-identical to before). Built from the SAME turn-stable scene + facts, so the draft-less
+    // swipe cache below reuses the identical echo (no drift on re-roll).
+    let momentEchoBlock = '';
+    if (settings.enableMomentEcho === true) {
+        try {
+            // CUE = the present PAIR (exactly two distinct characters). Only fetch the thread when a
+            // pair exists — most turns short-circuit here with zero work.
+            const present = (scene && Array.isArray(scene.present))
+                ? scene.present.map(x => String(x ?? '').trim()).filter(Boolean) : [];
+            const distinct = Array.from(new Set(present.map(p => p.toLowerCase())));
+            if (distinct.length === 2) {
+                const thread = getRelationshipMomentThread(databases, present[0], present[1]);
+                // Facts ALREADY injected this turn (category::key) so an echo never duplicates one.
+                const injectedKeys = new Set((retrieval.facts || []).map(({ fact, category }) => `${category}::${fact.key}`));
+                const echo = buildMomentEchoBlock(scene, thread, injectedKeys, settings.momentEchoMaxTokens || 40);
+                momentEchoBlock = echo.block || '';
+                if (echo.fired) {
+                    addDebugLog('debug', `[${runId}] Moment echo fired (${echo.cue} cue): ${echo.block}`, {
+                        subsystem: 'writer', event: 'echo.fired',
+                        data: { cue: echo.cue, pair: echo.pair, key: echo.fact?.key, sceneNo: echo.fact?.sceneNo ?? null, chars: momentEchoBlock.length },
+                    });
+                }
+            }
+        } catch (err) {
+            addDebugLog('fail', `[${runId}] Moment echo injection failed (non-fatal): ${err.message || err}`, { subsystem: 'writer', event: 'echo.fired', reason: 'ERROR' });
+        }
+    }
+
+    // Stack the Big Picture + moment echo above the scene block (all live in the pre-facts slot).
+    const overviewBlock = [bigPictureBlock, momentEchoBlock, sceneBlock].filter(Boolean).join('\n\n');
     stageMs.sceneBuildMs = Date.now() - sceneBuildStart;
 
     // injectMs spans the writer-injection build + the actual injectMemoryContext + the

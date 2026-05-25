@@ -139,6 +139,18 @@ const DEFAULT_SETTINGS = {
     // chat_metadata — this toggle only gates whether they're INJECTED. Absent (older settings)
     // → default false (back-compatible).
     enableSummaryPyramid: false,
+    // Moment echo (Resonance Part B) — narrow, default-OFF proactive recall. When ON, each turn
+    // MAY surface ONE tiny `[Echo: …]` line: a single resonant PAST moment for the PAIR of
+    // characters present, cued either by a reflection-authored callback link that pays off in the
+    // present context, or by the most-recent charged moment for that pair (never by shared place).
+    // Capped at one echo, token-clamped, and emits NOTHING on most turns. Default OFF so the
+    // injection is byte-identical to today until opted in (the agents warned auto-injection is the
+    // bloat/attention-dilution risk; this keeps it high-precision + off by default). Build 1's full
+    // relationship thread stays PULL-ONLY (search_memory) — this is just the one-line echo.
+    enableMomentEcho: false,
+    // Hard cap on the injected moment-echo line, in approx tokens (reuses the buildSceneBlock
+    // char-budget truncation style). Deliberately tiny — ONE short beat, never a recap.
+    momentEchoMaxTokens: 40,
     // Automatic associative linking (A-MEM style, lexical, DETERMINISTIC, zero-API). When ON, a
     // freshly-written fact is auto-connected to related EXISTING facts (same subject / shared
     // location / shared participants / lexical token overlap) by recording links into its
@@ -325,6 +337,9 @@ function validateSettings(s) {
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    // Moment echo (Resonance Part B) — default OFF; absent (older settings) => false (back-compat).
+    if (typeof s.enableMomentEcho !== 'boolean') s.enableMomentEcho = false;
+    s.momentEchoMaxTokens = Math.floor(clamp(s.momentEchoMaxTokens, 12, 120, 40));
     // Auto-linking defaults ON (free + deterministic): absent/invalid => true (back-compat).
     if (typeof s.enableAutoLinking !== 'boolean') s.enableAutoLinking = true;
     s.summaryPyramidMaxTokens = Math.floor(clamp(s.summaryPyramidMaxTokens, 50, 1000, 250));
@@ -3940,6 +3955,17 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.enableSummaryPyramid = next;
         addDebugLog('info', `Summary pyramid Big Picture injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableSummaryPyramid' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Moment echo (Resonance Part B) injection toggle. Default OFF. Gates ONLY whether a single
+    // narrow `[Echo: …]` line (one resonant past moment for the present pair) is injected; emits
+    // nothing on most turns even when on. No registration side-effect.
+    $('#bf_mem_moment_echo_enabled').prop('checked', extensionSettings.enableMomentEcho === true).on('change', function () {
+        const before = extensionSettings.enableMomentEcho === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableMomentEcho = next;
+        addDebugLog('info', `Moment echo injection ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableMomentEcho' }, before, after: !!next });
         saveSettings();
     });
 

@@ -54,6 +54,15 @@ const MAX_SHELF_SUMMARY_CHARS = 220;
 // Bound the example facts shown per shelf in the prompt (newest-first) so the #SHELVES request
 // stays cheap even for a populous bucket.
 const MAX_SHELF_SAMPLE_FACTS = 8;
+// CALLBACK LINKS (Resonance Part A) — bound how many recent `moment` beats are shown to the
+// reflection pass so it can name cross-beat echoes, and how many links it may author per pass.
+// Cheap, non-embedding CAUSAL resonance: the wide-context reflection pass (which can see beats
+// the 2-message Scribe can't) names "this later beat echoes that earlier one" as a typed edge on
+// the EARLIER fact. Bounded like MAX_SHELVES_PER_PASS so the call + apply stay cheap.
+const MAX_MOMENTS_FOR_CALLBACK = 14;
+const MAX_CALLBACKS_PER_PASS = 2;
+// Cap a stored callback reason (chars) defensively, regardless of the model's compliance.
+const MAX_CALLBACK_REASON_CHARS = 120;
 
 export const DEFAULT_REFLECT_PROMPT = `You are a periodic memory-maintenance pass for a long roleplay between {{user}} (the human player) and {{char}} (the AI character). You are given the current scene, recent beats, a few timeline steps, and a compact list of stored facts. Duplicate facts are merged automatically before you run; your job is to surface only DURABLE higher-order memory that the per-fact extractor would miss, and to maintain short zoom-out summaries.
 
@@ -62,6 +71,8 @@ Produce 0-5 higher-order OBSERVATIONS: durable behavioral/relational PATTERNS yo
 Also produce a STORY summary: the whole-story "so far" in 2-4 short sentences (the top of a zoom-out pyramid — the cheapest big-picture recap). Keep it tight and factual.
 
 If a "## Shelves to summarize" list is given, write ONE short summary line per listed shelf (a shelf is a Category/aspect bucket of related facts). Each summary is one or two clauses (<= ~25 words) capturing the gist of that bucket so it can stand in for the raw facts. Only summarize the shelves in that list. If no list is given, put a single "." under #SHELVES.
+
+If a "## Recent moments" list is given (the couple/character emotional beats — confessions, fights, betrayals, reunions — each shown with its exact id), you MAY name 0-2 CALLBACK links: a NEW recent beat that clearly ECHOES an EARLIER one (a confession that pays off an earlier hidden feeling; a betrayal that resurfaces an old wound; a reunion that answers a parting). Emit a link ONLY when the resonance is unmistakable — most passes name none. Each link points the EARLIER beat's id to the LATER beat's id with a one-clause reason. Use ONLY ids from the list (never invent one). If no clear echo exists (or no list was given), put a single "." under #CALLBACK.
 
 You may ALSO be given a "## Re-evaluate" list of uncertain facts (filed to Unsorted/misc or stale current-states) that the per-message extractor couldn't confidently classify — e.g. someone seen doing something once that MIGHT be a lasting habit. For EACH listed fact, decide ONE verdict using the whole picture:
 - PROMOTE — the evidence now supports it as a real, lasting fact: give its proper Layer-1 category (People/Places/Things/Relationships/Events/World) and the most-specific aspect. e.g. a recurring vice → People/vices; a confirmed home → People/home.
@@ -82,13 +93,16 @@ Only PROMOTE or DROP when you are confident; default to KEEP. Reference each fac
 + <subject>_<short_pattern_key> = <atomic pattern clause>
 + <subject>_<short_pattern_key> = <atomic pattern clause>
 .
+#CALLBACK
++ <earlier_id> <- <later_id> | <short reason this later beat echoes the earlier one>
+.
 #REEVAL
 + <id> = promote | <Category> | <aspect>
 + <id> = drop
 + <id> = keep
 .
 
-If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
+If there is no story yet, put a single "." under #STORY. If no shelves were listed, put a single "." under #SHELVES. If there are no observations, put a single "." under #OBS. If no clear echo exists (or no recent-moments list was given), put a single "." under #CALLBACK. If no re-evaluation list was given (or no verdicts), put a single "." under #REEVAL. Keep observation keys snake_case and the values to a short clause (<= ~10 words). Use the EXACT Category/aspect label shown in the shelves list. Do not invent facts not supported by the material.`;
 
 /**
  * Build the compact, bounded input bundle for the reflection pass.
@@ -128,6 +142,38 @@ function collectReevalCandidates(databases) {
     // Oldest-confirmed first, then cap.
     out.sort((a, b) => (Number(a.fact.lastUpdated) || 0) - (Number(b.fact.lastUpdated) || 0));
     return out.slice(0, MAX_REEVAL_CANDIDATES);
+}
+
+/**
+ * CALLBACK LINKS (Resonance Part A) — collect the recent `moment`-kind beats the reflection pass
+ * may draw cross-beat echo links between. These are the emotional anchors (confessions, fights,
+ * betrayals, reunions) — the substrate the owner's "love → confession → first date" thread rides
+ * on. We surface the MOST-RECENT moments (by validAt → sceneNo → lastUpdated) so the model sees a
+ * compact, bounded recent arc, each with a stable id (`category::key`) the model echoes back in a
+ * #CALLBACK link. Skips superseded snapshots + timeline steps. Bounded to MAX_MOMENTS_FOR_CALLBACK.
+ * @param {Object} databases
+ * @returns {Array<{id:string, category:string, key:string, fact:object}>}
+ */
+function collectRecentMoments(databases) {
+    const out = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || fact.active === false || fact.track) continue; // skip superseded snapshots + timeline steps
+            if (String(fact.kind || '').toLowerCase() !== 'moment') continue;
+            out.push({ id: `${category}::${fact.key}`, category, key: fact.key, fact });
+        }
+    }
+    // Newest-first (the recent arc) by birth-order spine: validAt → sceneNo → lastUpdated.
+    out.sort((a, b) => {
+        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : -1;
+        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : -1;
+        if (av !== bv) return bv - av;
+        const as = Number.isInteger(a.fact.sceneNo) ? a.fact.sceneNo : -1;
+        const bs = Number.isInteger(b.fact.sceneNo) ? b.fact.sceneNo : -1;
+        if (as !== bs) return bs - as;
+        return (Number(b.fact.lastUpdated) || 0) - (Number(a.fact.lastUpdated) || 0);
+    });
+    return out.slice(0, MAX_MOMENTS_FOR_CALLBACK);
 }
 
 /**
@@ -173,7 +219,7 @@ function pickChangedShelves(index, priorPyramid) {
     return candidates.slice(0, MAX_SHELVES_PER_PASS);
 }
 
-function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [] }) {
+function buildReflectInput({ scene, databases, reevalCandidates = [], changedShelves = [], recentMoments = [] }) {
     const parts = [];
 
     // FIX #12: the prior "story so far" summary is intentionally NOT prepended anymore — the
@@ -230,6 +276,21 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Shelves to summarize (one short summary per shelf, echo the exact Category/aspect label)\n${shelfLines.join('\n')}`);
     }
 
+    // CALLBACK LINKS (Resonance Part A) — recent emotional beats the model may echo-link.
+    // Each line is `[id] (sceneNo·sceneName) note/value (tone)` so the model has enough to spot a
+    // genuine resonance between a NEW beat and an EARLIER one and reference both by exact id.
+    // Newest-first (collectRecentMoments order) so the "recent arc" reads top-down.
+    if (Array.isArray(recentMoments) && recentMoments.length) {
+        const mLines = recentMoments.map(c => {
+            const f = c.fact;
+            const note = (typeof f.context === 'string' && f.context.trim()) ? f.context.trim() : String(f.value ?? '').trim();
+            const scene = Number.isInteger(f.sceneNo) ? ` (scene ${f.sceneNo}${f.sceneName ? `·${f.sceneName}` : ''})` : '';
+            const tone = (typeof f.tone === 'string' && f.tone.trim()) ? ` (${f.tone.trim()})` : '';
+            return `[${c.id}]${scene} ${note.slice(0, 140)}${tone}`;
+        });
+        parts.push(`## Recent moments (name 0-2 #CALLBACK echo-links between these by exact id; newest first)\n${mLines.join('\n')}`);
+    }
+
     // Re-evaluation candidates (uncertain Unsorted/misc + stale states). Each line is
     // `[id] Category/key = value (note)` so the model can return a verdict per id.
     if (Array.isArray(reevalCandidates) && reevalCandidates.length) {
@@ -243,7 +304,7 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
         parts.push(`## Re-evaluate (give a verdict per id)\n${reLines.join('\n')}`);
     }
 
-    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS and #REEVAL sections.');
+    parts.push('\nNow output ONLY the #STORY, #SHELVES, #OBS, #CALLBACK and #REEVAL sections.');
     return parts.join('\n\n');
 }
 
@@ -254,7 +315,7 @@ function buildReflectInput({ scene, databases, reevalCandidates = [], changedShe
  * @returns {{summary: string, observations: Array<{key:string,value:string}>}}
  */
 export function parseReflectResult(response) {
-    const out = { summary: '', shelves: [], observations: [], reevals: [] };
+    const out = { summary: '', shelves: [], observations: [], callbacks: [], reevals: [] };
     if (!response || !response.trim()) return out;
 
     let text = response.replace(/```[\s\S]*?```/g, m => m.replace(/```\w*/g, '').trim()).replace(/```/g, '');
@@ -298,8 +359,8 @@ export function parseReflectResult(response) {
         }
     }
 
-    // #OBS lines: `+ key = value`. Bounded BEFORE #REEVAL so it can't swallow it.
-    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
+    // #OBS lines: `+ key = value`. Bounded BEFORE #CALLBACK/#REEVAL so it can't swallow them.
+    const obsMatch = text.match(/#OBS\s*([\s\S]*?)(?=\n\s*#CALLBACK|\n\s*#REEVAL|$)/i);
     if (obsMatch) {
         const block = obsMatch[1].trim();
         if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
@@ -318,6 +379,36 @@ export function parseReflectResult(response) {
                 if (!key || !value) continue;
                 out.observations.push({ key, value });
                 if (out.observations.length >= MAX_OBSERVATIONS) break;
+            }
+        }
+    }
+
+    // #CALLBACK lines (Resonance Part A): `+ <earlier_id> <- <later_id> | <reason>`. A typed,
+    // cross-beat ECHO edge — the EARLIER beat pays off in the LATER one. Parsed leniently and
+    // bounded BEFORE #REEVAL. Graceful when absent (a lone "."): out.callbacks stays empty.
+    // We accept `<-` (the documented arrow) and tolerate a few near-forms the model may emit.
+    const cbMatch = text.match(/#CALLBACK\s*([\s\S]*?)(?=\n\s*#REEVAL|$)/i);
+    if (cbMatch) {
+        const block = cbMatch[1].trim();
+        if (block && block !== '.' && !/^\(none\)$/i.test(block)) {
+            for (const rawLine of block.split('\n')) {
+                let line = rawLine.replace(/^[\s\-\*\d.)\]]+/, '').trim();
+                if (!line || line === '.' || !line.startsWith('+')) continue;
+                line = line.slice(1).trim();
+                // Split off an optional `| reason` tail FIRST so an arrow inside a reason can't fool us.
+                let reason = '';
+                const barIdx = line.indexOf('|');
+                if (barIdx >= 0) { reason = line.slice(barIdx + 1).trim(); line = line.slice(0, barIdx).trim(); }
+                // The link grammar is `earlier <- later`. Tolerate `<-`, `<=`, `<--`, or the words
+                // "echoes"/"from" as the separator; the EARLIER id is always on the LEFT.
+                const m = line.split(/\s*(?:<\-{1,2}|<=|⟵|\becho(?:e?s)?\b|\bfrom\b)\s*/i);
+                if (!m || m.length < 2) continue;
+                const earlierId = (m[0] || '').trim().replace(/^\[|\]$/g, '').trim();
+                const laterId = (m[1] || '').trim().replace(/^\[|\]$/g, '').trim();
+                if (!earlierId || !laterId || earlierId === laterId) continue;
+                if (reason.length > MAX_CALLBACK_REASON_CHARS) reason = reason.slice(0, MAX_CALLBACK_REASON_CHARS).trimEnd() + '…';
+                out.callbacks.push({ earlierId, laterId, reason });
+                if (out.callbacks.length >= MAX_CALLBACKS_PER_PASS) break;
             }
         }
     }
@@ -409,6 +500,13 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const reevalCandidates = collectReevalCandidates(databases);
         const reevalById = new Map(reevalCandidates.map(c => [c.id, c]));
 
+        // CALLBACK LINKS (Resonance Part A): gather the recent `moment` beats so the SAME reflection
+        // LLM call can ALSO name cross-beat echo edges. Bounded (MAX_MOMENTS_FOR_CALLBACK). The
+        // id→candidate map lets us validate the model's referenced ids against real facts (drop
+        // dangling/hallucinated refs, mirroring the #REEVAL id check + the anti-drift shelf snap).
+        const recentMoments = collectRecentMoments(databases);
+        const momentById = new Map(recentMoments.map(c => [c.id, c]));
+
         // SUMMARY PYRAMID (middle layer): pick which (category, aspect) shelves changed since
         // their last summary and fold a bounded #SHELVES request into THIS same LLM call (no
         // extra call). Index is built from the post-dedupe databases. Cost-guarded: only
@@ -427,7 +525,7 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
         const dataParts = [];
         if (characterInfo) dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
         if (userPersona) dataParts.push(`## User Persona ({{user}})\n${userPersona}`);
-        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves }));
+        dataParts.push(buildReflectInput({ scene, databases, reevalCandidates, changedShelves, recentMoments }));
         const userPrompt = substitute(dataParts.join('\n\n'));
 
         addDebugLog('info', `[${runId}] Reflection pass: system=${systemPrompt.length}, user=${userPrompt.length} chars`);
@@ -511,6 +609,41 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             }
         }
 
+        // CALLBACK LINKS (Resonance Part A): store the model's cross-beat echo edges as a typed,
+        // additive `callbacks[]` ref on the EARLIER fact — pointing FORWARD to the later beat that
+        // pays it off (matching the autoLinkFact "store on the source, resolve at retrieval" shape).
+        // VALIDATION: both ids MUST resolve to real facts in this pass's moment set (momentById) —
+        // dangling/hallucinated refs are dropped (mirrors the #REEVAL id check + the anti-drift
+        // shelf snap). Idempotent: a re-authored identical edge is de-duped by laterId. Bounded by
+        // the parser's MAX_CALLBACKS_PER_PASS. Backward-compatible: the field is only ever ADDED,
+        // never required; older facts simply have no `callbacks`. NEVER deletes/supersedes facts.
+        let callbacksWritten = 0;
+        const callbackModified = new Set();
+        for (const cb of (parsed.callbacks || [])) {
+            const earlier = momentById.get(cb.earlierId);
+            const later = momentById.get(cb.laterId);
+            if (!earlier || !later) continue; // dangling/hallucinated ref — drop it
+            if (earlier.fact === later.fact) continue; // self-link — skip
+            const fact = earlier.fact;
+            if (!Array.isArray(fact.callbacks)) fact.callbacks = [];
+            // De-dupe by the target (later) fact key — one edge per earlier→later pair.
+            if (fact.callbacks.some(c => c && c.toKey === later.key && c.toCategory === later.category)) continue;
+            fact.callbacks.push({ toCategory: later.category, toKey: later.key, reason: cb.reason || '', at: Date.now() });
+            callbackModified.add(earlier.category);
+            callbacksWritten++;
+            addDebugLog('info', `[${runId}] Reflection callback-link: [${earlier.category}] ${earlier.key} <- [${later.category}] ${later.key}${cb.reason ? ` | ${cb.reason}` : ''}`, {
+                subsystem: 'reflection', event: 'callback.linked', reason: 'ECHO',
+                data: { fromCategory: earlier.category, fromKey: earlier.key, toCategory: later.category, toKey: later.key, reason: cb.reason || '' },
+            });
+        }
+        for (const category of callbackModified) {
+            try { await saveDatabase(databases[category]); }
+            catch (err) { addDebugLog('fail', `[${runId}] Callback-link failed to save "${category}": ${err.message || err}`); }
+        }
+        if (callbacksWritten > 0) {
+            addDebugLog('pass', `[${runId}] Reflection authored ${callbacksWritten} callback-link(s) (cap ${MAX_CALLBACKS_PER_PASS}, from ${recentMoments.length} recent moment(s))`);
+        }
+
         // RE-EVALUATION: apply promote/drop verdicts on the uncertain candidates. PROMOTE
         // moves the fact to its proper Layer-1 category + aspect (and bumps importance so it
         // stops looking transient); DROP DEMOTES a confirmed one-off TO COLD-TIER (never-delete:
@@ -583,8 +716,8 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             addDebugLog('pass', `[${runId}] Re-evaluation: promoted ${promoted}, dropped ${dropped} (from ${reevalCandidates.length} candidate(s))`);
         }
 
-        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, reeval(+${promoted}/-${dropped})`);
-        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, promoted, dropped, tokensIn, tokensOut };
+        addDebugLog('info', `[${runId}] Reflection done: merged=${totalMerged}, summary=${parsed.summary ? parsed.summary.length + ' chars' : 'none'}, observations=${written}, callbacks=${callbacksWritten}, reeval(+${promoted}/-${dropped})`);
+        return { summary: parsed.summary, observations: parsed.observations, written, merged: totalMerged, callbacks: callbacksWritten, promoted, dropped, tokensIn, tokensOut };
     } catch (error) {
         addDebugLog('fail', `Reflection error (non-fatal): ${error.message || error}`);
         return { summary: '', observations: [], tokensIn: 0, tokensOut: 0, error: error.message || String(error) };
