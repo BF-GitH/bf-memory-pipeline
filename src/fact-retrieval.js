@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 import * as host from './host.js';
 
@@ -1159,6 +1159,45 @@ function detectSceneQuery(query) {
 }
 
 /**
+ * RELATIONSHIP-THREAD intent detector (Phase 0): sniff a callback-style "history between two
+ * people" query from free text and return the pair `[A, B]` of names, else null. Routes to
+ * getRelationshipMomentThread. Conservative — it only fires on an EXPLICIT pair frame
+ * ("history of A and B", "what happened between A and B", "A and B's history/relationship"), so
+ * ordinary keyword recall and the scene-recap path are unaffected. A name is a short run of word
+ * characters (with optional spaces/apostrophes for "first date"-style multi-word names is NOT
+ * matched — names only); the two captured names are returned trimmed.
+ *
+ * @param {string} query
+ * @returns {[string, string]|null}
+ */
+function detectRelationshipQuery(query) {
+    const q = String(query || '').trim();
+    if (!q) return null;
+    const lower = q.toLowerCase();
+    // A name token: letters/digits/apostrophe/hyphen, 2+ chars (kept tight so "and"/"the" don't
+    // get captured as names). NO spaces — pair queries name single-token characters.
+    const NAME = "([a-z0-9][a-z0-9'\\-]{1,})";
+    const frames = [
+        // "history of A and B", "the relationship between A and B", "what happened between A and B"
+        new RegExp(`\\b(?:history|relationship|story|past)\\s+(?:of|between|with)\\s+${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}\\b`),
+        new RegExp(`\\bbetween\\s+${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}\\b`),
+        // "A and B's history/relationship/past/story"
+        new RegExp(`\\b${NAME}\\s+(?:and|&|\\+|with)\\s+${NAME}(?:'s)?\\s+(?:history|relationship|romance|story|past)\\b`),
+    ];
+    for (const re of frames) {
+        const m = lower.match(re);
+        if (m && m[1] && m[2]) {
+            const a = m[1].trim();
+            const b = m[2].trim();
+            // Guard against capturing filler words as a "name".
+            const STOP = new Set(['the', 'and', 'a', 'an', 'their', 'his', 'her', 'our', 'of', 'to']);
+            if (a && b && !STOP.has(a) && !STOP.has(b)) return [a, b];
+        }
+    }
+    return null;
+}
+
+/**
  * PULL-DETAIL recall for the Writer's `search_memory` tool (Feature: infinite reach).
  * READ-ONLY, DETERMINISTIC, ZERO-API: reuses the SAME machinery as the normal push path —
  * `getAllDatabases` + `getMemoryIndex` + `searchFactsIndexed` for keyword hits, the exact
@@ -1174,6 +1213,13 @@ function detectSceneQuery(query) {
  * cold-tiered AND superseded facts, because a recap wants the WHOLE scene, not just the hot/current
  * set normal retrieval surfaces.
  *
+ * RELATIONSHIP-THREAD RECALL (Phase 0): when `with` is given (two names, OR "A and B"/"A,B"), OR
+ * the free-text query reads like a couple's history ("history of A and B", "what happened between
+ * A and B"), this routes to getRelationshipMomentThread and returns that couple's emotional
+ * moment-thread across all scenes — likewise INCLUDING cold + superseded facts so the arc reads
+ * whole. A single name returns that character's own moment beats. Takes precedence over keyword
+ * search; the explicit `scene` arg still wins over both.
+ *
  * @param {Object} params
  * @param {string} params.query - free-text keyword query (required); MAY be a `Category/key`
  *   handle, in which case the exact record is resolved by identity in addition to keyword match.
@@ -1182,10 +1228,13 @@ function detectSceneQuery(query) {
  * @param {number} [params.limit] - optional result cap (clamped 1..RECALL_MAX_LIMIT).
  * @param {(number|string)} [params.scene] - optional scene number or name to recap (full scene,
  *   incl. cold + superseded facts). When set, takes precedence over keyword search.
+ * @param {string} [params.with] - optional relationship pair: two character names (e.g. "A and B",
+ *   "A, B", or just one name for that character's own beats). Routes to the couple's moment-thread
+ *   (incl. cold + superseded). Honored over keyword search; the explicit `scene` arg wins over it.
  * @returns {Promise<{text: string, count: number}>} a compact formatted string (or a clear
  *   "no matches" message) plus the admitted fact count.
  */
-export async function searchMemoryForRecall({ query, category, limit, scene } = {}) {
+export async function searchMemoryForRecall({ query, category, limit, scene, with: withPair } = {}) {
     const q = String(query ?? '').trim();
     const catFilter = String(category ?? '').trim().toLowerCase();
     const cap = Math.min(RECALL_MAX_LIMIT, Math.max(1, Math.floor(Number(limit)) || RECALL_DEFAULT_LIMIT));
@@ -1198,13 +1247,56 @@ export async function searchMemoryForRecall({ query, category, limit, scene } = 
         sceneTarget = detectSceneQuery(q);
     }
 
-    if (!q && sceneTarget === null) {
+    // Resolve a relationship pair (only when no explicit scene target): an explicit `with` arg
+    // wins; else sniff a couple-history intent from the free-text query. `with` may be one name
+    // (single-character moment thread) or two names separated by "and"/"&"/"+"/","/"with".
+    let relPair = null; // [nameA, nameB|''] | null
+    if (sceneTarget === null) {
+        if (withPair !== undefined && withPair !== null && String(withPair).trim()) {
+            const parts = String(withPair)
+                .split(/\s*(?:,|&|\+|\band\b|\bwith\b)\s*/i)
+                .map(s => s.trim())
+                .filter(Boolean);
+            if (parts.length >= 2) relPair = [parts[0], parts[1]];
+            else if (parts.length === 1) relPair = [parts[0], ''];
+        } else if (q) {
+            const detected = detectRelationshipQuery(q);
+            if (detected) relPair = detected;
+        }
+    }
+
+    if (!q && sceneTarget === null && relPair === null) {
         return { text: 'No query provided. Pass a keyword query (or a Category/key handle) to search memory.', count: 0 };
     }
 
     const databases = await getAllDatabases();
     if (Object.keys(databases).length === 0) {
         return { text: 'No stored memory yet — nothing to search.', count: 0 };
+    }
+
+    // RELATIONSHIP-THREAD PATH (Phase 0): return the couple's chronological moment-thread (cold +
+    // superseded included), formatted like the push gist. Honors the optional category filter +
+    // the hard cap. Bypasses the keyword/index path. Logged for the Debug tab (standing rule).
+    if (relPair !== null) {
+        const [nameA, nameB] = relPair;
+        let relRows = getRelationshipMomentThread(databases, nameA, nameB, { limit: cap });
+        if (catFilter) relRows = relRows.filter(r => String(r.category).toLowerCase() === catFilter);
+        const ctxR = host.getCtx();
+        const namesR = ctxR ? { charName: ctxR.characters?.[ctxR.characterId]?.name || '', userName: ctxR.name1 || '' } : null;
+        relRows = relRows.filter(r => isFactVisible(r.fact, namesR));
+        const cappedRel = relRows.slice(0, cap);
+        addDebugLog('debug', `Relationship recall: ${nameA}${nameB ? ` ↔ ${nameB}` : ' (solo)'} → ${cappedRel.length} moment-thread fact(s)`, {
+            subsystem: 'retrieval', event: 'recall.relationship',
+            data: {
+                pair: [String(nameA || '').slice(0, 40), String(nameB || '').slice(0, 40)],
+                returned: cappedRel.length, total: relRows.length,
+                includesColdAndSuperseded: true,
+            },
+        });
+        const relText = cappedRel.length
+            ? formatFactsForWriter(cappedRel.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' })))
+            : `No relationship history found between ${nameA}${nameB ? ` and ${nameB}` : ''}.`;
+        return { text: relText, count: cappedRel.length };
     }
 
     // SCENE-RECALL PATH (Spiderweb 2): return the whole scene (cold + superseded included), ranked

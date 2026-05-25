@@ -4285,3 +4285,166 @@ export function getFactsByScene(databases, scene) {
     });
     return out;
 }
+
+// RELATIONSHIP MOMENT-THREAD (Phase 0): hard cap on the returned chain. A relationship arc wants
+// enough beats to read as an arc but must never flood the Writer's context — bounded like the
+// scene-recall / recall-tool caps elsewhere. When the matched set exceeds this, we keep the
+// most-important/newest first (salience), then RE-SORT the kept slice chronologically for output.
+const RELATIONSHIP_THREAD_MAX = 16;
+
+/**
+ * Normalize a character name to the SAME token form `subject`/`involved` are stored in: trimmed,
+ * lowercased, `@`-sigil stripped, and reserved generic placeholders (`char`/`user`/`{{char}}`/
+ * `{{user}}`) resolved to the active character/user name (so a caller can pass `{{char}}` or a
+ * real name interchangeably). Mirrors the `deriveSubject` normalization so a query name matches
+ * the same way the store does. Returns '' for blank input.
+ * @param {string} name
+ * @returns {string}
+ */
+function normalizeRelationshipName(name) {
+    const n = String(name || '').trim().toLowerCase().replace(/^@/, '').trim();
+    if (!n) return '';
+    return resolveGenericSubjectToken(n);
+}
+
+/**
+ * Collect the distinct, normalized set of character tokens a fact touches across BOTH its
+ * `subject` axis (the owner) and its `involved` participants — the two axes the relationship
+ * pair-tag (`subj:@A | with:@B`) rides on. Each token is `@`-stripped/lowercased/placeholder-
+ * resolved the same way `normalizeRelationshipName` does, so membership tests line up with caller
+ * names. `deriveSubject` is used for the subject so a key-derived subject (no explicit `subj:`)
+ * still participates. Returns a Set.
+ * @param {FactSchema} fact
+ * @returns {Set<string>}
+ */
+function relationshipNamesOfFact(fact) {
+    const names = new Set();
+    const subj = String(deriveSubject(fact) || '').trim();
+    if (subj) names.add(subj); // deriveSubject already lowercases / resolves placeholders
+    const involved = Array.isArray(fact && fact.involved) ? fact.involved : [];
+    for (const raw of involved) {
+        const t = normalizeRelationshipName(raw);
+        if (t) names.add(t);
+    }
+    return names;
+}
+
+/**
+ * RELATIONSHIP MOMENT-THREAD (Phase 0): return the chronological chain of facts binding TWO
+ * characters A and B — the "emotional history between this couple" thread the Writer can PULL on
+ * a callback (a confession, a betrayal resurfacing, a reunion). This is the surface-computable
+ * bridge that survives opposite emotional valence: a fight and a confession share the *pair*
+ * `(A,B)` even when they share no place/keyword (see design scene2-C §2).
+ *
+ * WHAT IT INCLUDES — a fact joins the thread when EITHER:
+ *   - both A and B appear across its `subject` + `involved` axes (resolved/normalized,
+ *     `@`-stripped, lowercased, placeholder-resolved), i.e. the fact concerns both characters; OR
+ *   - it is a Relationships-category fact whose pair (`subject` + `involved`) covers BOTH A and B
+ *     (the abstract trust/romance/conflict/history facts that carry the arc).
+ *   `kind:'moment'` facts (the emotional beats) are PRIORITIZED (kept first when over the cap) but
+ *   the key relationship facts are included so the thread tells the whole arc, not just the beats.
+ *
+ * COLD + SUPERSEDED — DELIBERATELY INCLUDED (like getFactsByScene's recap): a relationship arc
+ * wants the full history, including cold-tiered beats and superseded (`active:false`/`__was`)
+ * earlier values, so the callback reads as it actually unfolded.
+ *
+ * ORDER — chronological by `validAt` (source-message index, the stable birth-order stamp), then
+ * `sceneNo`, then `lastUpdated`, then `key` for a stable tie-break. This is the same
+ * roughly-chronological spine `getFactsByScene` uses, extended with the scene/update stamps.
+ *
+ * BOUNDED — capped at RELATIONSHIP_THREAD_MAX. When the matched set is larger, the OVERFLOW is
+ * dropped by keeping the most-important/newest first (moments first, then salience), but the
+ * RETURNED slice is RE-SORTED chronologically so the output still reads as an arc.
+ *
+ * DEGENERATE CASES — handled gracefully:
+ *   - A == B (after normalization) OR only one name given (B blank): returns THAT character's own
+ *     moment thread (their emotional beats — `kind:'moment'` facts they're in), still capped +
+ *     chronological. A useful "this person's significant beats" query.
+ *   - missing both names / no databases: returns [].
+ *   - a one-sided match (only A present, B absent): excluded from the pair thread (it's not a
+ *     thread fact) — the single-name path is the explicit way to get one character's beats.
+ *
+ * Pure, deterministic, zero-API. Sibling of getFactsByScene / getTrackSteps.
+ *
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {string} nameA - first character name (any of `@A`/`A`/`{{char}}` forms)
+ * @param {string} [nameB] - second character name; omit/blank for the single-character moment thread
+ * @param {Object} [opts]
+ * @param {number} [opts.limit] - optional cap override (clamped 1..RELATIONSHIP_THREAD_MAX)
+ * @returns {Array<{fact: FactSchema, category: string}>} chronological, capped thread
+ */
+export function getRelationshipMomentThread(databases, nameA, nameB, opts = {}) {
+    const a = normalizeRelationshipName(nameA);
+    const b = normalizeRelationshipName(nameB);
+    if (!a && !b) return [];
+
+    // SINGLE-CHARACTER path: one name (or A==B) → that character's own moment beats.
+    const single = !b || a === b;
+    const who = a || b; // the one resolved name in the single-character case
+    if (single && !who) return [];
+
+    const cap = Math.min(
+        RELATIONSHIP_THREAD_MAX,
+        Math.max(1, Math.floor(Number(opts && opts.limit)) || RELATIONSHIP_THREAD_MAX),
+    );
+
+    const matches = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || typeof fact !== 'object') continue;
+            const names = relationshipNamesOfFact(fact);
+            const kind = normalizeKind(fact.kind);
+            let hit = false;
+            if (single) {
+                // Single-character thread: the character's emotional beats (moment-kind facts the
+                // character is in). Restrict to moments so this stays "their significant beats",
+                // not their whole dossier.
+                hit = names.has(who) && kind === 'moment';
+            } else {
+                // Pair thread: any fact that genuinely concerns BOTH characters — a moment about
+                // the two of them, a Relationships fact about the pair (trust/romance/conflict/
+                // history), or any other fact whose subject+involved cover both names.
+                hit = names.has(a) && names.has(b);
+            }
+            if (hit) matches.push({ fact, category, kind });
+        }
+    }
+
+    // CHRONOLOGICAL comparator (the documented stable spine): validAt → sceneNo → lastUpdated → key.
+    const chrono = (x, y) => {
+        const xv = Number.isInteger(x.fact.validAt) ? x.fact.validAt : Number.MAX_SAFE_INTEGER;
+        const yv = Number.isInteger(y.fact.validAt) ? y.fact.validAt : Number.MAX_SAFE_INTEGER;
+        if (xv !== yv) return xv - yv;
+        const xs = Number.isInteger(x.fact.sceneNo) ? x.fact.sceneNo : Number.MAX_SAFE_INTEGER;
+        const ys = Number.isInteger(y.fact.sceneNo) ? y.fact.sceneNo : Number.MAX_SAFE_INTEGER;
+        if (xs !== ys) return xs - ys;
+        const xu = Number(x.fact.lastUpdated) || 0;
+        const yu = Number(y.fact.lastUpdated) || 0;
+        if (xu !== yu) return xu - yu;
+        return String(x.fact.key).localeCompare(String(y.fact.key));
+    };
+
+    if (matches.length <= cap) {
+        matches.sort(chrono);
+        return matches.map(m => ({ fact: m.fact, category: m.category }));
+    }
+
+    // OVER CAP: keep the most-important/newest first — moments before non-moments, then by
+    // salience (importance + recency, the same scorer retrieval uses to fill scarce slots), then
+    // newest-chronological. Then RE-SORT the kept slice chronologically for the arc-reading output.
+    const now = Date.now();
+    const kept = matches
+        .slice()
+        .sort((x, y) => {
+            const xm = x.kind === 'moment' ? 1 : 0;
+            const ym = y.kind === 'moment' ? 1 : 0;
+            if (xm !== ym) return ym - xm; // moments first
+            const xsal = salienceScore(x.fact, now);
+            const ysal = salienceScore(y.fact, now);
+            if (xsal !== ysal) return ysal - xsal; // higher salience first
+            return -chrono(x, y); // newest first as the final tiebreak
+        })
+        .slice(0, cap);
+    kept.sort(chrono);
+    return kept.map(m => ({ fact: m.fact, category: m.category }));
+}

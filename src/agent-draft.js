@@ -47,6 +47,7 @@ RULES:
 - Include character facts, location details, relationship info, object properties
 - Think about what the characters KNOW vs don't know
 - Consider the emotional state and setting
+- If the present moment is an emotional callback or turning point between two characters (a confession, a betrayal resurfacing, a reunion), open the \`Relationships\` branch for that pair so their shared history is on hand for the reply.
 - The #Scene block describes the PRESENT MOMENT (current location, who is here, active goals, the latest beat). Keep each line terse. Omit a line only if truly unknown.`;
 
 /**

@@ -392,16 +392,16 @@ function recallToolEnabled() {
  * READ-ONLY, deterministic, zero-API. Returns a STRING (the ST tool contract). Logs each
  * invocation at debug level with query/category/result-count metadata (NOT full fact bodies).
  * Never throws — returns a safe error string on any failure.
- * @param {{query?: string, category?: string, limit?: number}} args
+ * @param {{query?: string, category?: string, limit?: number, scene?: (number|string), with?: string}} args
  * @returns {Promise<string>}
  */
-async function searchMemoryAction({ query, category, limit, scene } = {}) {
+async function searchMemoryAction({ query, category, limit, scene, with: withPair } = {}) {
     try {
         const { searchMemoryForRecall } = await import('./fact-retrieval.js');
-        const { text, count } = await searchMemoryForRecall({ query, category, limit, scene });
+        const { text, count } = await searchMemoryForRecall({ query, category, limit, scene, with: withPair });
         await recallToolLog('debug', `Writer recall: search_memory "${String(query ?? '').slice(0, 80)}" → ${count} fact(s)`, {
             subsystem: 'writer', event: 'tool.search_memory',
-            data: { query: String(query ?? '').slice(0, 120), category: category || null, resultCount: count },
+            data: { query: String(query ?? '').slice(0, 120), category: category || null, with: withPair ? String(withPair).slice(0, 80) : null, resultCount: count },
         });
         return text;
     } catch (e) {
@@ -437,7 +437,11 @@ export function registerWriterRecallTool() {
                 + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
                 + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
                 + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the drugged-bar '
-                + 'scene") — a scene recap returns the full scene including older/superseded details. Read-only.',
+                + 'scene") — a scene recap returns the full scene including older/superseded details. '
+                + 'When THIS moment is an emotional callback or turning point between two characters (a confession, '
+                + 'a betrayal resurfacing, a reunion), recall their shared history by passing both names in "with" '
+                + '(e.g. "<name> and <other>") — this returns the pair\'s significant moments across all scenes, in order. '
+                + 'Read-only.',
             parameters: {
                 $schema: 'http://json-schema.org/draft-04/schema#',
                 type: 'object',
@@ -459,6 +463,14 @@ export function registerWriterRecallTool() {
                         type: 'string',
                         description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the drugged bar"). '
                             + 'Returns that scene\'s full set of facts, including older/superseded details. Takes precedence over the keyword query.',
+                    },
+                    with: {
+                        type: 'string',
+                        description: 'Optional relationship recall: two character names (e.g. "<name> and <other>", or comma-separated) '
+                            + 'to pull the PAIR\'s emotional history — their significant moments (confessions, betrayals, reunions) across '
+                            + 'all scenes, in chronological order, including older/superseded details. Use it when the present beat echoes '
+                            + 'a turning point between two characters. One name returns that character\'s own significant moments. '
+                            + 'Takes precedence over the keyword query (the "scene" arg wins over this).',
                     },
                 },
                 required: ['query'],
