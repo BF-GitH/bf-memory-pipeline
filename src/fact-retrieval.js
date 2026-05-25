@@ -1122,11 +1122,11 @@ const RECALL_MAX_LIMIT = 40;
 
 /**
  * Detect a SCENE-RECAP intent in a free-text recall query (Spiderweb 2). Deterministic, no LLM.
- * Returns a scene NUMBER (e.g. 3 for "recap scene 3"), a scene NAME string (e.g. "the drugged bar"
- * for "recap the drugged-bar scene"), or null when the query is an ordinary keyword search.
+ * Returns a scene NUMBER (e.g. 3 for "recap scene 3"), a scene NAME string (e.g. "the market"
+ * for "recap the market scene"), or null when the query is an ordinary keyword search.
  *   - "scene 3" / "scene #3" / "recap scene 12"            -> the number
- *   - "recap the drugged bar scene" / "the <X> scene"      -> the name "<X>"
- *   - "what happened in the bar scene" / "recap the bar"   -> the name "bar"
+ *   - "recap the market scene" / "the <X> scene"           -> the name "<X>"
+ *   - "what happened in the market scene" / "recap the market"   -> the name "market"
  * Conservative: a query without the word "scene" (or a "recap/recall/summarize ... scene" frame)
  * is NOT treated as a scene query, so normal keyword recall is unaffected.
  * @param {string} query
@@ -1142,14 +1142,14 @@ function detectSceneQuery(query) {
         const n = parseInt(numMatch[1], 10);
         if (n >= 1) return n;
     }
-    // Named scene framed by "scene": "the drugged-bar scene", "recap the bar scene".
+    // Named scene framed by "scene": "the market scene", "recap the market scene".
     // Capture the descriptor that PRECEDES the word "scene".
     const trailing = lower.match(/^(?:recap|recall|summari[sz]e|recount|what happened in|tell me about)?\s*(?:the\s+)?(.+?)\s+scene\b/);
     if (trailing && trailing[1]) {
         const name = trailing[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
         if (name && name !== 'the' && name.length >= 2) return name;
     }
-    // Leading frame: "scene: the drugged bar" / "scene the bar".
+    // Leading frame: "scene: the market" / "scene the market".
     const leading = lower.match(/\bscene\s*:?\s+(?:the\s+)?(.+)$/);
     if (leading && leading[1] && !numMatch) {
         const name = leading[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1208,7 +1208,7 @@ function detectRelationshipQuery(query) {
  * an LLM. Hard-capped so a single tool call can't flood the context.
  *
  * SCENE RECALL (Spiderweb 2): when `scene` is given (a number or name), OR the free-text query
- * reads like a scene recap ("recap the drugged-bar scene", "what happened in scene 3"), this
+ * reads like a scene recap ("recap the market scene", "what happened in scene 3"), this
  * resolves the scene via getFactsByScene and returns that scene's facts — DELIBERATELY INCLUDING
  * cold-tiered AND superseded facts, because a recap wants the WHOLE scene, not just the hot/current
  * set normal retrieval surfaces.

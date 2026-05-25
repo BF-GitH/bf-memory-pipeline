@@ -4235,7 +4235,7 @@ export function getTrackSteps(databases, track) {
 
 /**
  * SCENE RECALL (Spiderweb 2): return all facts stamped with a given scene, for the "recap the
- * drugged-bar scene" consumer. Accepts a scene NUMBER (matched on `sceneNo`) OR a scene NAME
+ * market scene" consumer. Accepts a scene NUMBER (matched on `sceneNo`) OR a scene NAME
  * (case-insensitive, matched on `sceneName`). DELIBERATELY INCLUDES cold-tiered AND superseded
  * (inactive `__was`) facts — a recap wants the WHOLE scene as it was, not just the hot/current set
  * that normal retrieval surfaces. Sorted by validAt/sourceMsg order then key so the recap reads in

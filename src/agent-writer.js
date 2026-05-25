@@ -536,7 +536,7 @@ export function registerWriterRecallTool() {
             description: 'Search long-term memory for stored facts that are NOT already in your context. '
                 + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
                 + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
-                + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the drugged-bar '
+                + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the market '
                 + 'scene") — a scene recap returns the full scene including older/superseded details. '
                 + 'When THIS moment is an emotional callback or turning point between two characters (a confession, '
                 + 'a betrayal resurfacing, a reunion), recall their shared history by passing both names in "with" '
@@ -549,7 +549,7 @@ export function registerWriterRecallTool() {
                     query: {
                         type: 'string',
                         description: 'Keyword(s) to search for, an exact "Category/key" handle to pull one record, '
-                            + 'or a scene-recap phrase like "recap the drugged-bar scene" / "what happened in scene 3".',
+                            + 'or a scene-recap phrase like "recap the market scene" / "what happened in scene 3".',
                     },
                     category: {
                         type: 'string',
@@ -561,7 +561,7 @@ export function registerWriterRecallTool() {
                     },
                     scene: {
                         type: 'string',
-                        description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the drugged bar"). '
+                        description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the market"). '
                             + 'Returns that scene\'s full set of facts, including older/superseded details. Takes precedence over the keyword query.',
                     },
                     with: {

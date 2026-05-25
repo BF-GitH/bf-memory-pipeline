@@ -34,7 +34,7 @@ OUTPUT FORMAT (follow exactly):
 
 #Scene:
 Location: [where the scene is happening right now, a few words]
-Name: [OPTIONAL. A short, evocative label for THIS scene, e.g. "the drugged bar" or "rooftop standoff". Omit if unsure — a name is derived automatically from the location.]
+Name: [OPTIONAL. A short, evocative label for THIS scene, e.g. "the market scene" or "the rooftop". Omit if unsure — a name is derived automatically from the location.]
 Present: [comma-separated characters/entities currently in the scene]
 Goals: [comma-separated active goals or open threads, short]
 Beat: [ONE short line describing the single most recent thing that just happened]
