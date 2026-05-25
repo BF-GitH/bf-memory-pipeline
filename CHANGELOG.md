@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.31.0] - 2026-05-24
+
+### Added — relationship "resonance": a couple's emotional thread, pulled when it matters
+Follow-up to the spiderweb. Three design agents (+ a survey of Generative Agents / EM-LLM / GraphRAG) established that what connects a fight → a confession → the first date is the **couple's emotional thread**, not the place — and that proactively dumping summaries every turn is the bloat trap. So this surfaces the thread on demand, with one narrow opt-in proactive nudge.
+
+- **Couple moment-thread recall (pull).** `getRelationshipMomentThread(A, B)` returns the chronological chain of a pair's significant moments (the `moment` facts tagged to both names) plus their key relationship facts — **including cold-tiered and superseded ones**, because an arc wants its whole history. The Writer's `search_memory` tool gained a `with:` parameter (two names) and recognizes "history of A and B" style queries, and the Drafter is nudged to reach for a couple's history on an emotional callback/turning point. Pure pull — nothing is auto-injected. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-writer.js](src/agent-writer.js), [src/agent-draft.js](src/agent-draft.js))
+- **Reflection-authored callback links.** The periodic reflection pass can now name a causal/thematic **callback** ("this confession pays off that earlier hidden feeling") and store it as a lightweight link on the earlier fact — the cheap, no-extra-LLM-call way to capture *causal* resonance that plain word/place matching can't. ([src/agent-reflect.js](src/agent-reflect.js))
+- **Narrow moment "echo" — default OFF.** Optional (`enableMomentEcho`, Writer tab): when the two characters present in the scene have a recent charged moment (or a reflection-authored callback into the current moment), a single token-clamped `[Echo: …]` line surfaces it above the facts. High-precision (same **pair**, not "same place" — which would fire on every revisit), capped at one, swipe-safe; off by default so it never bloats unless you opt in. ([src/agent-writer.js](src/agent-writer.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+*(Deferred: a tiny moments-only meaning-search index — the one place embeddings would be justified — only if testing shows the surface cues miss real callbacks.)*
+
 ## [0.30.0] - 2026-05-24
 
 ### Added — the "spiderweb": connected, scene-aware recall (MVP)
