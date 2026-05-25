@@ -395,10 +395,10 @@ function recallToolEnabled() {
  * @param {{query?: string, category?: string, limit?: number}} args
  * @returns {Promise<string>}
  */
-async function searchMemoryAction({ query, category, limit } = {}) {
+async function searchMemoryAction({ query, category, limit, scene } = {}) {
     try {
         const { searchMemoryForRecall } = await import('./fact-retrieval.js');
-        const { text, count } = await searchMemoryForRecall({ query, category, limit });
+        const { text, count } = await searchMemoryForRecall({ query, category, limit, scene });
         await recallToolLog('debug', `Writer recall: search_memory "${String(query ?? '').slice(0, 80)}" → ${count} fact(s)`, {
             subsystem: 'writer', event: 'tool.search_memory',
             data: { query: String(query ?? '').slice(0, 120), category: category || null, resultCount: count },
@@ -435,14 +435,17 @@ export function registerWriterRecallTool() {
             displayName: 'Search Memory',
             description: 'Search long-term memory for stored facts that are NOT already in your context. '
                 + 'Pass a keyword query; optionally narrow by category, or pass an exact "Category/key" handle '
-                + '(as shown in the established-facts list) to pull that full record. Read-only.',
+                + '(as shown in the established-facts list) to pull that full record. To RECAP a whole scene, '
+                + 'pass the scene number or name in "scene" (or just ask in the query, e.g. "recap the drugged-bar '
+                + 'scene") — a scene recap returns the full scene including older/superseded details. Read-only.',
             parameters: {
                 $schema: 'http://json-schema.org/draft-04/schema#',
                 type: 'object',
                 properties: {
                     query: {
                         type: 'string',
-                        description: 'Keyword(s) to search for, or an exact "Category/key" handle to pull one record.',
+                        description: 'Keyword(s) to search for, an exact "Category/key" handle to pull one record, '
+                            + 'or a scene-recap phrase like "recap the drugged-bar scene" / "what happened in scene 3".',
                     },
                     category: {
                         type: 'string',
@@ -451,6 +454,11 @@ export function registerWriterRecallTool() {
                     limit: {
                         type: 'integer',
                         description: 'Optional max number of facts to return (default 20).',
+                    },
+                    scene: {
+                        type: 'string',
+                        description: 'Optional scene to RECAP: a scene number (e.g. "3") or scene name (e.g. "the drugged bar"). '
+                            + 'Returns that scene\'s full set of facts, including older/superseded details. Takes precedence over the keyword query.',
                     },
                 },
                 required: ['query'],

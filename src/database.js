@@ -1549,6 +1549,7 @@ export function buildMemoryIndex(databases) {
     const byCatAspect = new Map();
     const bySubject = new Map();
     const byToken = new Map();
+    const bySceneNo = new Map(); // Spiderweb 2: sceneNo -> [{fact, category}] (the in-scene strand)
     const aspectCounts = new Map();
     let totalFacts = 0;
 
@@ -1570,6 +1571,11 @@ export function buildMemoryIndex(databases) {
             add(byCatAspect, `${catLower}||${aspect}`, entry);
             add(bySubject, deriveSubject(fact), entry);
             for (const tok of factTokens(fact)) add(byToken, tok, entry);
+            // In-scene strand (Spiderweb 2): bucket the fact under its origin scene number so the
+            // unified expansion can pull same-scene facts (capped, candidacy-only) and getFactsByScene
+            // can recall a whole scene. Keyed by the numeric sceneNo (back-compat: facts without one
+            // are simply absent from this bucket).
+            if (Number.isInteger(fact.sceneNo) && fact.sceneNo >= 1) add(bySceneNo, fact.sceneNo, entry);
             // Menu counts: active HOT facts only (cold-tiered overflow is hidden from the planner).
             if (isHotFact(fact)) {
                 let m = aspectCounts.get(category);
@@ -1578,7 +1584,7 @@ export function buildMemoryIndex(databases) {
             }
         }
     }
-    return { byCatAspect, bySubject, byToken, aspectCounts, totalFacts };
+    return { byCatAspect, bySubject, byToken, bySceneNo, aspectCounts, totalFacts };
 }
 
 /**
@@ -1586,7 +1592,7 @@ export function buildMemoryIndex(databases) {
  * cached databases map and memoizing it (keyed by avatar, invalidated on any write/chat-change).
  * Loads the map via getAllDatabases() (which already serves the per-turn cache or the attachment
  * fallback), so this works identically with or without IDB.
- * @returns {Promise<{byCatAspect: Map, bySubject: Map, byToken: Map, aspectCounts: Map, totalFacts: number}>}
+ * @returns {Promise<{byCatAspect: Map, bySubject: Map, byToken: Map, bySceneNo: Map, aspectCounts: Map, totalFacts: number}>}
  */
 export async function getMemoryIndex() {
     const avatar = getCharacterAvatar();
@@ -2607,9 +2613,21 @@ export function upsertFact(db, fact) {
             db.facts.push(snapshot);
             // Advance the canonical fact to the new active value, clearing any stale
             // supersession markers (it's the current truth again).
+            // SCENE STRAND EXCEPTION (Spiderweb 2): first-wins normally pins a fact to its origin
+            // scene, but a SUPERSESSION is a genuinely-new establishment of the live value — so the
+            // live fact carries the NEW (incoming) scene while the `__was` snapshot above keeps the
+            // OLD origin scene. mergeSalience returned the old scene (first-wins); override it here
+            // with the incoming when present so the live fact advances. Source provenance likewise
+            // points at the message that established the new value.
+            const liveSceneOverride = {};
+            if (Number.isInteger(fact?.sceneNo)) {
+                liveSceneOverride.sceneNo = fact.sceneNo;
+                if (fact.sceneName) liveSceneOverride.sceneName = fact.sceneName;
+            }
+            if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg) liveSceneOverride.sourceMsg = fact.sourceMsg;
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
-                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, active: true,
+                context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
             };
             db.updatedAt = now;
@@ -2929,6 +2947,13 @@ function normalizeSalienceFields(fact) {
     // fact without one stays lean — mirrors how `location` is only attached when present).
     const tone = normalizeTone(fact?.tone);
     if (tone) out.tone = tone;
+    // SCENE + SOURCE STRANDS (Spiderweb 2): stamp the origin scene + source-message handle on a
+    // fresh fact when provided (only-when-present, mirrors `tone`). Coerced defensively.
+    if (Number.isInteger(fact?.sceneNo) && fact.sceneNo >= 1) {
+        out.sceneNo = fact.sceneNo;
+        if (typeof fact?.sceneName === 'string' && fact.sceneName.trim()) out.sceneName = fact.sceneName.trim();
+    }
+    if (typeof fact?.sourceMsg === 'string' && fact.sourceMsg.trim()) out.sourceMsg = fact.sourceMsg.trim();
     return out;
 }
 
@@ -2968,6 +2993,30 @@ function mergeSalience(existing, incoming) {
     const exTone = normalizeTone(existing?.tone);
     if (incTone) out.tone = incTone;
     else if (exTone) out.tone = exTone;
+    // SCENE + SOURCE STRANDS (Spiderweb 2): FIRST-WINS (origin). A fact records the scene it was
+    // ESTABLISHED in — a later re-mention must NOT move it (mirrors validAt). Because the upsert
+    // merge spreads `...existing, ...fact, ...sal`, the incoming `fact.sceneNo/Name/sourceMsg`
+    // would otherwise clobber the origin; we re-assert the EXISTING values here (this fn's return
+    // is spread LAST). When `existing` has none (e.g. an old back-compat fact being re-mentioned),
+    // adopt the incoming so the strand is filled once. The SUPERSESSION path deliberately does NOT
+    // route through here for the live fact's new value (it spreads `...existing, ...fact, ...sal`
+    // too, but the design wants the live fact to carry the NEW scene while the `__was` snapshot —
+    // built from `existing` before merge — keeps the old scene); see upsertFact's supersession
+    // branch, which passes the SUPERSEDED existing as `existing` so its origin is preserved on the
+    // snapshot, and lets the incoming scene advance the live fact.
+    const exNo = Number.isInteger(existing?.sceneNo) ? existing.sceneNo : null;
+    const incNo = Number.isInteger(incoming?.sceneNo) ? incoming.sceneNo : null;
+    if (exNo !== null) {
+        out.sceneNo = exNo;
+        if (existing?.sceneName) out.sceneName = existing.sceneName;
+    } else if (incNo !== null) {
+        out.sceneNo = incNo;
+        if (incoming?.sceneName) out.sceneName = incoming.sceneName;
+    }
+    const exSrc = typeof existing?.sourceMsg === 'string' && existing.sourceMsg ? existing.sourceMsg : '';
+    const incSrc = typeof incoming?.sourceMsg === 'string' && incoming.sourceMsg ? incoming.sourceMsg : '';
+    if (exSrc) out.sourceMsg = exSrc;
+    else if (incSrc) out.sourceMsg = incSrc;
     return out;
 }
 
@@ -4116,6 +4165,18 @@ export async function deleteDebugLogFile(chatId) {
  * @property {number} [validAt] - OPTIONAL provenance: the source message index (or ms time)
  *   at which the fact became true. Defaults to the source message index at write time.
  *   Absent on older facts (backward-compatible).
+ * @property {number} [sceneNo] - OPTIONAL scene strand (Spiderweb 2): the monotonic scene NUMBER
+ *   the fact was ESTABLISHED in (origin). Stamped at write from the current scene card; FIRST-WINS
+ *   (a re-mention never moves it — mirrors validAt). The supersession path is the one exception:
+ *   the live fact may advance to the new scene while the retained `__was` snapshot keeps the old.
+ *   Indexed under `bySceneNo`; drives same-scene expansion + getFactsByScene recall. Absent on
+ *   older facts (backward-compatible).
+ * @property {string} [sceneName] - OPTIONAL scene strand (Spiderweb 2): the scene's name at the
+ *   time the fact was established (location-derived by default, optionally Drafter-refined). Paired
+ *   with `sceneNo`. Absent on older facts (backward-compatible).
+ * @property {string} [sourceMsg] - OPTIONAL source strand (Spiderweb 2): provenance handle for the
+ *   message the fact came from (`msg_<idx>`). REUSES the existing `source` index — no new id is
+ *   minted. FIRST-WINS like the scene. Absent on older facts (backward-compatible).
  * @property {('character'|'place'|'event')} [scope] - OPTIONAL recall axis (scope feature).
  *   `character` = sticks to a person (traits/state/behavior); `place` = a location/world thing
  *   recalled when the PLACE matters even if its owner is absent; `event` = something that
@@ -4170,4 +4231,57 @@ export function getTrackSteps(databases, track) {
     }
     steps.sort((a, b) => (Number(a.fact.ord) || 0) - (Number(b.fact.ord) || 0));
     return steps;
+}
+
+/**
+ * SCENE RECALL (Spiderweb 2): return all facts stamped with a given scene, for the "recap the
+ * drugged-bar scene" consumer. Accepts a scene NUMBER (matched on `sceneNo`) OR a scene NAME
+ * (case-insensitive, matched on `sceneName`). DELIBERATELY INCLUDES cold-tiered AND superseded
+ * (inactive `__was`) facts — a recap wants the WHOLE scene as it was, not just the hot/current set
+ * that normal retrieval surfaces. Sorted by validAt/sourceMsg order then key so the recap reads in
+ * a stable, roughly-chronological order. Pure, deterministic, zero-API.
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {number|string} scene - a scene number (int >= 1) or a scene name (string)
+ * @returns {Array<{fact: FactSchema, category: string}>}
+ */
+export function getFactsByScene(databases, scene) {
+    // A number (or a purely-numeric string like "3") => scene-number match; any other non-empty
+    // string => scene-name match (case-insensitive).
+    let wantNo = null;
+    let wantName = '';
+    if (typeof scene === 'number') {
+        const n = Math.floor(scene);
+        if (Number.isInteger(n) && n >= 1) wantNo = n;
+    } else if (typeof scene === 'string') {
+        const s = scene.trim();
+        if (/^\d+$/.test(s)) {
+            const n = parseInt(s, 10);
+            if (n >= 1) wantNo = n;
+        } else if (s) {
+            wantName = s.toLowerCase();
+        }
+    }
+    if (wantNo === null && !wantName) return [];
+
+    const out = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!fact || typeof fact !== 'object') continue;
+            let hit = false;
+            if (wantNo !== null) {
+                hit = Number.isInteger(fact.sceneNo) && fact.sceneNo === wantNo;
+            } else if (wantName) {
+                hit = typeof fact.sceneName === 'string' && fact.sceneName.trim().toLowerCase() === wantName;
+            }
+            if (hit) out.push({ fact, category });
+        }
+    }
+    // Roughly chronological: by validAt (source message index) then key for a stable tie-break.
+    out.sort((a, b) => {
+        const av = Number.isInteger(a.fact.validAt) ? a.fact.validAt : Number.MAX_SAFE_INTEGER;
+        const bv = Number.isInteger(b.fact.validAt) ? b.fact.validAt : Number.MAX_SAFE_INTEGER;
+        if (av !== bv) return av - bv;
+        return String(a.fact.key).localeCompare(String(b.fact.key));
+    });
+    return out;
 }

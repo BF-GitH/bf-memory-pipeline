@@ -84,7 +84,7 @@ let sessionTokens = { baselineInput: 0, actualInput: 0, agentInput: 0, agentOutp
 // Scene card — the always-injected "what is true right now" core working-memory block.
 // Persisted per-chat in chat_metadata.bf_mem_scene, reloaded on CHAT_CHANGED.
 // null = no scene yet (back-compatible: absent scene behaves as no scene card).
-let sceneCard = null; // { location, present[], goals[], beats[], updatedAt, runId }
+let sceneCard = null; // { location, present[], goals[], beats[], sceneNo, sceneName, ownerChatId, updatedAt, runId }
 // Reflection / consolidation summary — the rolling "story so far" + last synthesized
 // observations. Persisted per-chat in chat_metadata.bf_mem_reflection, reloaded on
 // CHAT_CHANGED. null = none yet (back-compatible: absent reflection = no injection).
@@ -1167,6 +1167,56 @@ export function reloadTokensFromChat() {
 const SCENE_META_KEY = 'bf_mem_scene';
 const SCENE_BEATS_MAX = 3; // rolling window: keep the last N one-line beats
 
+// Scene-boundary detector (deterministic, NOT LLM-named). A new scene number is minted only when
+// the location MATERIALLY changes. We compare the normalized (lowercased/trim/token-set) locations
+// by Jaccard token overlap: when overlap is HIGH the locations are "the same place" (synonym drift
+// like "the bar" -> "the dim bar", or room-flapping A->B->A back to a recently-seen place) and the
+// scene number is held. Sticky on omission (a turn with no location keeps the current scene).
+const SCENE_SIM_THRESHOLD = 0.5; // Jaccard token-overlap >= this => "same place" (hold the counter)
+const SCENE_NAME_MAX = 60;       // hard clamp on a derived/refined scene name (lean storage)
+
+/** Normalize a location string into a lowercased token set for similarity comparison. */
+function sceneLocTokens(loc) {
+    return new Set(
+        String(loc || '')
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, ' ')
+            .split(/\s+/)
+            // Drop tiny stop-ish tokens so "the bar" vs "bar" reads as identical.
+            .filter(t => t.length >= 3 && !/^(the|and|for|with|near|into|onto)$/.test(t)),
+    );
+}
+
+/**
+ * Decide whether `nextLoc` is MATERIALLY different from `prevLoc` (a scene boundary). Returns false
+ * (NOT a boundary) when either is empty (sticky on omission), when they normalize identically, or
+ * when their token sets overlap at/above SCENE_SIM_THRESHOLD (synonym drift / minor rewording).
+ * Pure + deterministic — no LLM, no randomness.
+ * @param {string} prevLoc
+ * @param {string} nextLoc
+ * @returns {boolean}
+ */
+function isMaterialLocationChange(prevLoc, nextLoc) {
+    const a = String(prevLoc || '').trim();
+    const b = String(nextLoc || '').trim();
+    if (!a || !b) return false;                 // sticky on omission (no location => keep scene)
+    if (a.toLowerCase() === b.toLowerCase()) return false;
+    const sa = sceneLocTokens(a);
+    const sb = sceneLocTokens(b);
+    if (sa.size === 0 || sb.size === 0) return false;
+    let inter = 0;
+    for (const t of sa) if (sb.has(t)) inter++;
+    const union = sa.size + sb.size - inter;
+    const jaccard = union > 0 ? inter / union : 0;
+    return jaccard < SCENE_SIM_THRESHOLD;       // low overlap => a genuinely different place
+}
+
+/** Derive a default scene name from a location string (trimmed + clamped). */
+function deriveSceneName(loc) {
+    const s = String(loc || '').trim().replace(/\s+/g, ' ');
+    return s.length > SCENE_NAME_MAX ? s.slice(0, SCENE_NAME_MAX).trim() : s;
+}
+
 /** Coerce a stored value into the scene shape, or return null if unusable. */
 function normalizeScene(raw) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -1177,11 +1227,22 @@ function normalizeScene(raw) {
     const beats = arr(raw.beats).slice(-SCENE_BEATS_MAX);
     // A scene is meaningful only if it carries at least one field.
     if (!loc && present.length === 0 && goals.length === 0 && beats.length === 0) return null;
+    // Scene counter (Spiderweb 2): monotonic int starting at 1; name auto-derived from the
+    // location by default (the Drafter MAY refine it but it is never required).
+    const rawNo = Math.floor(Number(raw.sceneNo));
+    const sceneNo = Number.isInteger(rawNo) && rawNo >= 1 ? rawNo : 1;
+    let sceneName = typeof raw.sceneName === 'string' ? raw.sceneName.trim() : '';
+    if (sceneName.length > SCENE_NAME_MAX) sceneName = sceneName.slice(0, SCENE_NAME_MAX).trim();
+    if (!sceneName) sceneName = deriveSceneName(loc);
     return {
         location: loc,
         present,
         goals,
         beats,
+        sceneNo,
+        sceneName,
+        // Branch-safe ownership stamp (mirrors the token-tab fix): the chatId that owns this record.
+        ownerChatId: typeof raw.ownerChatId === 'string' ? raw.ownerChatId : '',
         updatedAt: Number(raw.updatedAt) || Date.now(),
         runId: typeof raw.runId === 'string' ? raw.runId : '',
     };
@@ -1191,7 +1252,29 @@ function loadSceneFromMeta() {
     try {
         const md = getContext().chatMetadata || getContext().chat_metadata;
         if (!md) return null;
-        return normalizeScene(md[SCENE_META_KEY]);
+        const scene = normalizeScene(md[SCENE_META_KEY]);
+        if (!scene) return null;
+        // BRANCH-SAFE SCENE OWNERSHIP (Spiderweb 2; mirrors the token-tab ownerChatId fix). ST
+        // creates a branch by COPYING the parent chat's chat_metadata, so a freshly-branched chat
+        // inherits the parent's bf_mem_scene record. We must not let the branch and parent
+        // double-write the SAME record (corrupting the parent's scene state). When the stored
+        // record's owner ≠ the current chat, it was inherited: we CONTINUE numbering from the
+        // inherited sceneNo (the safer option per web-C — monotonic per chat, no jump back to a
+        // beat the branch never produced) and RE-STAMP ownership to this chat so subsequent writes
+        // target the branch's own record, leaving the parent's untouched.
+        const currentChatId = getCurrentChatId();
+        const owner = scene.ownerChatId || '';
+        if (currentChatId && owner && owner !== currentChatId) {
+            scene.ownerChatId = currentChatId;
+            sceneCard = scene;
+            saveSceneToMeta(); // re-stamp so it stops re-detecting as inherited
+            addDebugLog('info', `Scene inherited by branch chat ${currentChatId} (was owned by ${owner}); continuing at scene ${scene.sceneNo}`, {
+                subsystem: 'settings', event: 'scene.inherited', actor: 'SYSTEM', reason: 'BRANCH_INHERITED',
+                data: { chatId: currentChatId, ownerChatId: owner, sceneNo: scene.sceneNo, isBranch: isBranchChat(currentChatId) },
+            });
+            return scene;
+        }
+        return scene;
     } catch { return null; }
 }
 
@@ -1215,12 +1298,12 @@ export function getScene() {
  *   - location / present / goals: replaced when the new value is non-empty,
  *     otherwise the prior value is kept (Agent 1 may omit a field on a given turn).
  *   - beats: rolling window — append the newest beat(s), drop the oldest, cap at 3.
- * @param {{location?:string, present?:string[], goals?:string[], newBeats?:string[]}} patch
+ * @param {{location?:string, present?:string[], goals?:string[], newBeats?:string[], name?:string}} patch
  * @param {string} runId
  */
 export function setScene(patch, runId = '') {
     if (!patch || typeof patch !== 'object') return;
-    const prev = sceneCard || { location: '', present: [], goals: [], beats: [] };
+    const prev = sceneCard || { location: '', present: [], goals: [], beats: [], sceneNo: 1, sceneName: '' };
     const cleanArr = (v) => Array.isArray(v) ? v.map(x => String(x ?? '').trim()).filter(Boolean) : [];
 
     const location = (typeof patch.location === 'string' && patch.location.trim())
@@ -1239,8 +1322,45 @@ export function setScene(patch, runId = '') {
     }
     beats = beats.slice(-SCENE_BEATS_MAX);
 
-    const next = normalizeScene({ location, present, goals, beats, updatedAt: Date.now(), runId });
+    // SCENE COUNTER (Spiderweb 2). The number is a DETERMINISTIC, debounced boundary detector —
+    // it advances only when the location MATERIALLY changes (isMaterialLocationChange: low token
+    // overlap with the prior location). Synonym drift / room-flapping back to a recently-seen place
+    // and turns with no location are sticky (the number holds). The advance is driven by the
+    // (deterministic) location, NOT a per-run counter, so re-rolling/swiping the same message —
+    // which yields the same location — does NOT bump the scene.
+    const prevNo = Number.isInteger(prev.sceneNo) && prev.sceneNo >= 1 ? prev.sceneNo : 1;
+    const boundary = isMaterialLocationChange(prev.location, location);
+    const sceneNo = boundary ? prevNo + 1 : prevNo;
+
+    // Scene NAME: the Drafter MAY refine it (patch.name, parsed leniently); otherwise the
+    // location-derived name stands. On a boundary we always re-derive from the new location so the
+    // name tracks the new scene unless the Drafter overrides; within a scene we keep the prior name
+    // (or adopt a Drafter refinement / fill from the location if it was empty).
+    const refined = (typeof patch.name === 'string' && patch.name.trim()) ? patch.name.trim() : '';
+    let sceneName;
+    if (refined) sceneName = refined;
+    else if (boundary) sceneName = deriveSceneName(location);
+    else sceneName = prev.sceneName || deriveSceneName(location);
+
+    const next = normalizeScene({
+        location, present, goals, beats, sceneNo, sceneName,
+        ownerChatId: getCurrentChatId() || '',
+        updatedAt: Date.now(), runId,
+    });
     if (!next) return; // nothing meaningful to store
+
+    if (boundary) {
+        addDebugLog('info', `Scene advanced: ${prevNo} "${prev.sceneName || ''}" → ${next.sceneNo} "${next.sceneName}"`, {
+            subsystem: 'settings', event: 'scene.advanced', actor: 'SYSTEM', reason: 'LOCATION_CHANGE',
+            data: { fromNo: prevNo, toNo: next.sceneNo, fromName: prev.sceneName || '', toName: next.sceneName, fromLoc: prev.location || '', toLoc: location },
+        });
+    } else {
+        addDebugLog('debug', `Scene continued: ${next.sceneNo} "${next.sceneName}"`, {
+            subsystem: 'settings', event: 'scene.continued',
+            data: { sceneNo: next.sceneNo, sceneName: next.sceneName, location },
+        });
+    }
+
     sceneCard = next;
     saveSceneToMeta();
     renderScene();
@@ -1262,7 +1382,11 @@ function renderScene() {
     }
     const s = sceneCard;
     const row = (label, val) => val ? `<div class="bf-mem-fact-line"><span class="bf-mem-fact-cat">${escapeHtml(label)}</span> ${escapeHtml(val)}</div>` : '';
+    // Scene No + name (Spiderweb 2): the monotonic scene number + its (location-derived or
+    // Drafter-refined) name, so the boundary detector is visible in the Agent 1 tab.
+    const sceneLabel = Number.isInteger(s.sceneNo) ? `#${s.sceneNo}${s.sceneName ? ` · ${s.sceneName}` : ''}` : '';
     el.innerHTML =
+        row('Scene', sceneLabel) +
         row('Location', s.location) +
         row('Present', (s.present || []).join(', ')) +
         row('Goals', (s.goals || []).join('; ')) +
@@ -2082,6 +2206,10 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
         const note = fact.context || '';
         const coldBadge = cold ? ' <span class="bf-mem-custom-chip" title="Cold-tiered: kept but deprioritized by retrieval">cold</span>' : '';
         const superseded = fact.active === false ? ' <span class="bf-mem-custom-chip" title="Superseded (historical)">old</span>' : '';
+        // Spiderweb 2: the fact's origin scene (No + name) + source-message provenance.
+        const sceneLine = Number.isInteger(fact.sceneNo)
+            ? `<div class="bf-mem-fact-source">scene: #${fact.sceneNo}${fact.sceneName ? ` · ${escapeHtml(fact.sceneName)}` : ''}${fact.sourceMsg ? ` · from ${escapeHtml(fact.sourceMsg)}` : ''}</div>`
+            : (fact.sourceMsg ? `<div class="bf-mem-fact-source">from ${escapeHtml(fact.sourceMsg)}</div>` : '');
         return `
             <div class="bf-mem-fact-row" data-key="${escapeHtml(fact.key)}" style="border-bottom:1px solid var(--SmartThemeBorderColor,#444);padding:6px 0;">
                 <div style="display:flex;gap:8px;align-items:flex-start;">
@@ -2091,6 +2219,7 @@ function renderFactRows(facts, limit, isColdFact, deriveAspect) {
                             <span class="bf-mem-fact-source"> [${escapeHtml(aspect)} · imp ${importance}]</span></div>
                         <div class="bf-mem-fact-value">${escapeHtml(fact.value)}</div>
                         ${note ? `<div class="bf-mem-fact-source">note: ${escapeHtml(note)}</div>` : ''}
+                        ${sceneLine}
                         ${(fact.knownBy || []).length ? `<div class="bf-mem-fact-source">known by: ${escapeHtml((fact.knownBy || []).join(', '))}</div>` : ''}
                         ${(fact.tags || []).length ? `<div class="bf-mem-fact-source">tags: ${escapeHtml((fact.tags || []).join(', '))}</div>` : ''}
                     </div>

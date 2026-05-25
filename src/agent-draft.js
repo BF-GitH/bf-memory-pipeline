@@ -34,6 +34,7 @@ OUTPUT FORMAT (follow exactly):
 
 #Scene:
 Location: [where the scene is happening right now, a few words]
+Name: [OPTIONAL. A short, evocative label for THIS scene, e.g. "the drugged bar" or "rooftop standoff". Omit if unsure — a name is derived automatically from the location.]
 Present: [comma-separated characters/entities currently in the scene]
 Goals: [comma-separated active goals or open threads, short]
 Beat: [ONE short line describing the single most recent thing that just happened]
@@ -211,7 +212,7 @@ function parseDraftResult(response) {
  * Parse the optional #Scene block from Agent 1's output into a scene patch.
  * Tolerant: any field may be absent. Returns null if no usable scene fields found.
  * @param {string} response
- * @returns {{location:string, present:string[], goals:string[], newBeats:string[]}|null}
+ * @returns {{location:string, present:string[], goals:string[], newBeats:string[], name:string}|null}
  */
 function parseSceneBlock(response) {
     // Grab everything from #Scene to the next #Section or end-of-text.
@@ -236,10 +237,16 @@ function parseSceneBlock(response) {
     const beatLine = line('Beat') || line('Beats') || line('Recently');
     const newBeats = beatLine ? list(beatLine).filter(Boolean) : [];
 
+    // OPTIONAL scene name (Spiderweb 2): a short evocative label the Drafter MAY emit. Lenient —
+    // drop a bracketed placeholder / "none" echo so a model that doesn't fill it changes nothing
+    // (the location-derived name then stands; setScene falls back). Never required.
+    const nameLine = line('Name');
+    const name = (/^\[.*\]$/.test(nameLine) || /^(none|n\/a|unknown|tbd)$/i.test(nameLine)) ? '' : nameLine;
+
     const cleanLoc = (/^\[.*\]$/.test(location) || /^(none|n\/a|unknown|tbd)$/i.test(location)) ? '' : location;
 
-    if (!cleanLoc && present.length === 0 && goals.length === 0 && newBeats.length === 0) return null;
-    return { location: cleanLoc, present, goals, newBeats };
+    if (!cleanLoc && present.length === 0 && goals.length === 0 && newBeats.length === 0 && !name) return null;
+    return { location: cleanLoc, present, goals, newBeats, name };
 }
 
 /**
@@ -249,7 +256,7 @@ function parseSceneBlock(response) {
  * @property {string[]} focus - OPTIONAL focus character name(s) for the finder's character-tag filter (3-layer model). Empty for a general/world moment. Never a branch.
  * @property {string[]} neededFacts - List of fact categories/keywords to look up
  * @property {string[]} nextHint - Backstage breadcrumb: topics likely relevant next scene (refinement #11). Stored in message.extra, never injected/shown.
- * @property {{location:string, present:string[], goals:string[], newBeats:string[]}|null} scene - Optional parsed #Scene block (null if absent)
+ * @property {{location:string, present:string[], goals:string[], newBeats:string[], name:string}|null} scene - Optional parsed #Scene block (null if absent)
  * @property {string} raw - Raw LLM response
  * @property {string|null} error - Error message if failed
  */

@@ -2,7 +2,7 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 import * as host from './host.js';
 
@@ -762,6 +762,51 @@ function collectLinkCandidates(databases, seeds, alreadyFound) {
  * @param {Set<string>} alreadyFound - `category:key` ids already in results (read-only here)
  * @returns {Array<{fact: Object, category: string, tier: string, via: string, seedId: string}>}
  */
+/**
+ * SAME-SCENE candidate collector (Spiderweb 2, the in-scene strand). For each seed that carries an
+ * origin `sceneNo`, pull the OTHER facts stamped in that same scene from the per-turn `bySceneNo`
+ * bucket and RETURN them as candidate rows (does NOT push). A scene can hold many facts, so it is a
+ * potential HUB — every candidate is attributed to its scene seedId (`scene:<no>`) so the unified
+ * admitter's per-seed cap applies and same-scene facts CANNOT flood the tier. This is a
+ * high-precision, candidacy-only edge: scene membership decides ELIGIBILITY; salience (in the
+ * admitter) decides ORDER — there is NO connectedness/degree term. One hop, deterministic, zero-API.
+ * Active + visible only (a recap of cold/superseded facts is the job of getFactsByScene, not the
+ * always-on push path). Same-scene auto-links are NOT marked primary (they enter as `secondary`).
+ * @param {{bySceneNo: Map}} index - per-turn fact index (carries the in-scene bucket)
+ * @param {Array<{fact: Object, category: string, tier: string}>} seeds - snapshot of seed rows
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results (read-only here)
+ * @returns {Array<{fact: Object, category: string, tier: string, via: string, seedId: string}>}
+ */
+function collectSceneCandidates(index, seeds, alreadyFound) {
+    const bySceneNo = index && index.bySceneNo;
+    if (!bySceneNo || bySceneNo.size === 0) return [];
+    // Distinct seed scenes (a seed contributes its scene once, no matter how many seeds share it).
+    const seedScenes = new Set();
+    for (const r of seeds) {
+        const no = r && r.fact && Number.isInteger(r.fact.sceneNo) ? r.fact.sceneNo : null;
+        if (no !== null) seedScenes.add(no);
+    }
+    if (seedScenes.size === 0) return [];
+
+    const candidates = [];
+    const emitted = new Set();
+    for (const no of seedScenes) {
+        const bucket = bySceneNo.get(no);
+        if (!bucket) continue;
+        const seedId = `scene:${no}`;
+        for (const { fact, category } of bucket) {
+            if (!fact) continue;
+            if (!isActiveFact(fact)) continue;        // never surface superseded history on the push path
+            if (!isFactVisible(fact)) continue;        // respect knownBy
+            const id = `${category}:${fact.key}`;
+            if (alreadyFound.has(id) || emitted.has(id)) continue;
+            emitted.add(id);
+            candidates.push({ fact, category, tier: 'secondary', via: 'scene', seedId });
+        }
+    }
+    return candidates;
+}
+
 function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound) {
     const candidates = [];
     const emitted = new Set();
@@ -785,9 +830,10 @@ function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound)
 }
 
 /**
- * UNIFIED EXPANSION (Spiderweb Phase 1). Gathers candidates from ALL expansions — scope-graph
- * links, relationship-ref chasing, and deterministic sequence-track continuity — then admits them
- * through ONE shared budget. Mutates `results` in place; mutates `alreadyFound`.
+ * UNIFIED EXPANSION (Spiderweb Phase 1 + 2). Gathers candidates from ALL expansions — scope-graph
+ * links, same-scene facts (Spiderweb 2's in-scene strand), relationship-ref chasing, and
+ * deterministic sequence-track continuity — then admits them through ONE shared budget. Mutates
+ * `results` in place; mutates `alreadyFound`.
  *
  * THE ANTI-HUB CAP. Each candidate is attributed to the seed/hub that produced it (`seedId`). A
  * single seed may contribute at most MAX_EXPANSION_PER_SEED facts, so a popular subject / busy
@@ -810,10 +856,13 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound) {
     const seeds = results.slice();
     const now = Date.now();
 
-    // Gather from all three expansions (each returns attributed candidates; none pushes).
+    // Gather from all expansions (each returns attributed candidates; none pushes).
     const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
     const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
     const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
+    // In-scene strand (Spiderweb 2): same-scene facts, attributed to their scene seedId so the
+    // per-seed cap below prevents a big scene from flooding the tier.
+    const sceneCands = collectSceneCandidates(index, seeds, alreadyFound);
 
     // Sequence-track continuity is admitted FIRST and EXEMPT from the per-seed cap (continuity is
     // mandatory) — but still counts against the shared total. Dedupe across sources by id.
@@ -843,10 +892,11 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound) {
     // 1) Track continuity (exempt from per-seed cap, counts toward total).
     for (const c of trackCands) admit(c, { perSeedCapped: false });
 
-    // 2) Link + relationship-ref candidates, ranked by salience, under the per-seed cap. Salience
-    //    DESCENDING (importance + recency + use) — no connectedness term. Stable sort keeps source
-    //    order on ties, so the pass is fully deterministic.
-    const ranked = [...linkCands, ...refCands].sort(
+    // 2) Link + scene + relationship-ref candidates, ranked by salience, under the per-seed cap.
+    //    Salience DESCENDING (importance + recency + use) — no connectedness term. Stable sort keeps
+    //    source order on ties, so the pass is fully deterministic. Same-scene facts ride the SAME
+    //    per-seed cap (scene seedId), so a big scene can't flood the tier.
+    const ranked = [...linkCands, ...sceneCands, ...refCands].sort(
         (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
     for (const c of ranked) {
         if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
@@ -863,7 +913,7 @@ function gatherExpansionCandidates(databases, index, results, alreadyFound) {
                 admitted: admittedTotal, total_cap: MAX_EXPANSION_TOTAL,
                 per_seed_cap: MAX_EXPANSION_PER_SEED, capped_by_seed: cappedBySeed,
                 top_seed: topSeed, top_seed_contrib: topN,
-                from: { link: linkCands.length, ref: refCands.length, track: trackCands.length },
+                from: { link: linkCands.length, scene: sceneCands.length, ref: refCands.length, track: trackCands.length },
             },
         });
     }
@@ -1071,6 +1121,44 @@ const RECALL_DEFAULT_LIMIT = 20;
 const RECALL_MAX_LIMIT = 40;
 
 /**
+ * Detect a SCENE-RECAP intent in a free-text recall query (Spiderweb 2). Deterministic, no LLM.
+ * Returns a scene NUMBER (e.g. 3 for "recap scene 3"), a scene NAME string (e.g. "the drugged bar"
+ * for "recap the drugged-bar scene"), or null when the query is an ordinary keyword search.
+ *   - "scene 3" / "scene #3" / "recap scene 12"            -> the number
+ *   - "recap the drugged bar scene" / "the <X> scene"      -> the name "<X>"
+ *   - "what happened in the bar scene" / "recap the bar"   -> the name "bar"
+ * Conservative: a query without the word "scene" (or a "recap/recall/summarize ... scene" frame)
+ * is NOT treated as a scene query, so normal keyword recall is unaffected.
+ * @param {string} query
+ * @returns {number|string|null}
+ */
+function detectSceneQuery(query) {
+    const q = String(query || '').trim();
+    if (!q) return null;
+    const lower = q.toLowerCase();
+    // Numeric scene reference: "scene 3", "scene #3", "scene no. 3".
+    const numMatch = lower.match(/\bscene\s*#?\s*(?:no\.?\s*)?(\d+)\b/);
+    if (numMatch) {
+        const n = parseInt(numMatch[1], 10);
+        if (n >= 1) return n;
+    }
+    // Named scene framed by "scene": "the drugged-bar scene", "recap the bar scene".
+    // Capture the descriptor that PRECEDES the word "scene".
+    const trailing = lower.match(/^(?:recap|recall|summari[sz]e|recount|what happened in|tell me about)?\s*(?:the\s+)?(.+?)\s+scene\b/);
+    if (trailing && trailing[1]) {
+        const name = trailing[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if (name && name !== 'the' && name.length >= 2) return name;
+    }
+    // Leading frame: "scene: the drugged bar" / "scene the bar".
+    const leading = lower.match(/\bscene\s*:?\s+(?:the\s+)?(.+)$/);
+    if (leading && leading[1] && !numMatch) {
+        const name = leading[1].replace(/[-_]+/g, ' ').replace(/\s+/g, ' ').trim();
+        if (name && name.length >= 2) return name;
+    }
+    return null;
+}
+
+/**
  * PULL-DETAIL recall for the Writer's `search_memory` tool (Feature: infinite reach).
  * READ-ONLY, DETERMINISTIC, ZERO-API: reuses the SAME machinery as the normal push path —
  * `getAllDatabases` + `getMemoryIndex` + `searchFactsIndexed` for keyword hits, the exact
@@ -1080,21 +1168,37 @@ const RECALL_MAX_LIMIT = 40;
  * (`Category/key: note` or `Category/key = value`). Never writes, never deletes, never calls
  * an LLM. Hard-capped so a single tool call can't flood the context.
  *
+ * SCENE RECALL (Spiderweb 2): when `scene` is given (a number or name), OR the free-text query
+ * reads like a scene recap ("recap the drugged-bar scene", "what happened in scene 3"), this
+ * resolves the scene via getFactsByScene and returns that scene's facts — DELIBERATELY INCLUDING
+ * cold-tiered AND superseded facts, because a recap wants the WHOLE scene, not just the hot/current
+ * set normal retrieval surfaces.
+ *
  * @param {Object} params
  * @param {string} params.query - free-text keyword query (required); MAY be a `Category/key`
  *   handle, in which case the exact record is resolved by identity in addition to keyword match.
  * @param {string} [params.category] - optional category filter (case-insensitive); only facts
  *   in this Layer-1 category are returned.
  * @param {number} [params.limit] - optional result cap (clamped 1..RECALL_MAX_LIMIT).
+ * @param {(number|string)} [params.scene] - optional scene number or name to recap (full scene,
+ *   incl. cold + superseded facts). When set, takes precedence over keyword search.
  * @returns {Promise<{text: string, count: number}>} a compact formatted string (or a clear
  *   "no matches" message) plus the admitted fact count.
  */
-export async function searchMemoryForRecall({ query, category, limit } = {}) {
+export async function searchMemoryForRecall({ query, category, limit, scene } = {}) {
     const q = String(query ?? '').trim();
     const catFilter = String(category ?? '').trim().toLowerCase();
     const cap = Math.min(RECALL_MAX_LIMIT, Math.max(1, Math.floor(Number(limit)) || RECALL_DEFAULT_LIMIT));
 
-    if (!q) {
+    // Resolve a scene target: an explicit `scene` arg wins; else sniff a recap intent from the query.
+    let sceneTarget = null;
+    if (scene !== undefined && scene !== null && String(scene).trim()) {
+        sceneTarget = (typeof scene === 'number') ? scene : String(scene).trim();
+    } else if (q) {
+        sceneTarget = detectSceneQuery(q);
+    }
+
+    if (!q && sceneTarget === null) {
         return { text: 'No query provided. Pass a keyword query (or a Category/key handle) to search memory.', count: 0 };
     }
 
@@ -1102,6 +1206,27 @@ export async function searchMemoryForRecall({ query, category, limit } = {}) {
     if (Object.keys(databases).length === 0) {
         return { text: 'No stored memory yet — nothing to search.', count: 0 };
     }
+
+    // SCENE-RECALL PATH (Spiderweb 2): return the whole scene (cold + superseded included), ranked
+    // chronologically by getFactsByScene, then formatted like the push gist. Honors the optional
+    // category filter + the hard cap. Bypasses the keyword/index path entirely.
+    if (sceneTarget !== null) {
+        let sceneRows = getFactsByScene(databases, sceneTarget);
+        if (catFilter) sceneRows = sceneRows.filter(r => String(r.category).toLowerCase() === catFilter);
+        const ctxS = host.getCtx();
+        const namesS = ctxS ? { charName: ctxS.characters?.[ctxS.characterId]?.name || '', userName: ctxS.name1 || '' } : null;
+        sceneRows = sceneRows.filter(r => isFactVisible(r.fact, namesS));
+        const cappedScene = sceneRows.slice(0, cap);
+        addDebugLog('debug', `Scene recall: "${String(sceneTarget).slice(0, 60)}" → ${cappedScene.length}/${sceneRows.length} fact(s)`, {
+            subsystem: 'retrieval', event: 'retrieval.scene_recall',
+            data: { scene: String(sceneTarget).slice(0, 60), returned: cappedScene.length, total: sceneRows.length, includesColdAndSuperseded: true },
+        });
+        const sceneText = cappedScene.length
+            ? formatFactsForWriter(cappedScene.map(r => ({ fact: r.fact, category: r.category, tier: 'primary' })))
+            : `No facts found for scene "${String(sceneTarget)}".`;
+        return { text: sceneText, count: cappedScene.length };
+    }
+
     const index = await getMemoryIndex();
 
     // Collect candidates by identity (exact Category/key handle) AND by keyword, deduped.

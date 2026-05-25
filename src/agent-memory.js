@@ -3,7 +3,7 @@
 // Updates fact databases, tracks who knows what, manages cross-references
 
 import { getAllDatabases, getMemoryIndex, buildMemoryIndex, autoLinkFact, scopedScribeCandidates, saveDatabase, createEmptyDatabase, upsertFact, findFactMatch, normalizeScope, normalizeTone, NPC_SUBJECT, mapLegacyCategory, normalizeAspect, L1_CATEGORIES, groupedTaxonomySubAreas } from './database.js';
-import { addDebugLog } from './settings.js';
+import { addDebugLog, getScene } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 import * as host from './host.js';
 
@@ -500,6 +500,16 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         error: null,
     };
 
+    // SCENE STAMP (Spiderweb 2): read the CURRENT scene once so every NEW fact extracted from this
+    // turn records the scene it was ESTABLISHED in (origin). Best-effort — a fact written before any
+    // scene exists simply carries no scene stamp (additive / back-compat). First-wins is enforced at
+    // the merge (database.js mergeSalience), so this stamp only takes effect on a genuinely-new fact.
+    let curScene = null;
+    try {
+        const s = getScene();
+        if (s && Number.isInteger(s.sceneNo)) curScene = { no: s.sceneNo, name: typeof s.sceneName === 'string' ? s.sceneName : '' };
+    } catch { /* no scene available — leave facts unstamped */ }
+
     if (!response || !response.trim()) {
         result.error = 'Empty response from memory updater';
         return result;
@@ -945,6 +955,17 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         // message index (when the fact became true). Both kept optional/back-compat.
         if (confidence !== null && confidence !== '') update.confidence = confidence;
         if (Number.isInteger(sourceIndex)) update.validAt = sourceIndex;
+        // SCENE + SOURCE STRANDS (Spiderweb 2): stamp the scene the fact was established in, plus a
+        // `sourceMsg` provenance handle (REUSES the existing source message index — no new id). Both
+        // optional / only-when-present (lean / back-compat). First-wins is enforced at merge: a
+        // re-mention does NOT move a fact's birth scene (mirrors validAt). The supersession path
+        // (database.js) clones `...existing` then advances the live fact, so a state change MAY carry
+        // the new scene on the live fact while the `__was` snapshot keeps the old scene (correct).
+        if (curScene && Number.isInteger(curScene.no)) {
+            update.sceneNo = curScene.no;
+            if (curScene.name) update.sceneName = curScene.name;
+        }
+        if (update.source) update.sourceMsg = update.source;
         // Supersession feature: only attach the explicit signal when present (lean / back-compat).
         if (supersedes) update.supersedes = true;
         // Layer A: only attach aliases when the writer provided some (keep object lean / back-compat).
@@ -1325,6 +1346,12 @@ async function applyUpdates(updates, existingDatabases) {
             factToWrite.confidence = update.confidence;
         }
         if (Number.isInteger(update.validAt)) factToWrite.validAt = update.validAt;
+        // SCENE + SOURCE STRANDS (Spiderweb 2): forward the origin scene + source-message handle so
+        // upsertFact stores them. First-wins is enforced in mergeSalience (the origin scene is kept
+        // across re-mentions, mirroring validAt). Only attached when present (lean / back-compat).
+        if (Number.isInteger(update.sceneNo)) factToWrite.sceneNo = update.sceneNo;
+        if (update.sceneName) factToWrite.sceneName = update.sceneName;
+        if (update.sourceMsg) factToWrite.sourceMsg = update.sourceMsg;
         // Supersession feature: forward the explicit signal so upsertFact marks the prior
         // value of a changeable-state fact as superseded history (transient flag, not persisted).
         if (update.supersedes) factToWrite.supersedes = true;
@@ -1343,7 +1370,9 @@ async function applyUpdates(updates, existingDatabases) {
         }
 
         const relCount = update.relationships?.length || 0;
-        addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}`);
+        // Spiderweb 2: surface the fact's origin scene stamp on the NEW/UPDATED line (debug aid).
+        const sceneTag = Number.isInteger(update.sceneNo) ? ` (scene ${update.sceneNo}${update.sceneName ? ` "${update.sceneName}"` : ''})` : '';
+        addDebugLog('info', `${status} fact: [${category}] ${update.key} = "${newValue.substring(0, 80)}"${relCount > 0 ? ` (rel: ${relCount})` : ''}${sceneTag}`);
 
         if (update.changed) applied.push(update);
         // Only re-save a category whose stored state actually changed — a run of
