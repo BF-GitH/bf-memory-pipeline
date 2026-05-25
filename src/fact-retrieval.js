@@ -79,6 +79,23 @@ export function isFactVisible(fact, names = null) {
 }
 
 /**
+ * UNIFIED EXPANSION BUDGET (anti-hub). The three expansions (scope-graph links, sequence-track
+ * continuity, relationship-ref chasing) used to each push independently with their own implicit
+ * bounds, so a single hub (a busy place / a much-involved person / a hub subject) could fill the
+ * whole secondary tier by itself. They now flow through ONE admitter under these two caps:
+ *   - MAX_EXPANSION_PER_SEED — a single seed/hub may contribute at most this many EXPANSION facts,
+ *     so the budget is spread across query-relevant seeds rather than monopolized by the most-
+ *     connected one (the SOTA "fan-out cap"). Sequence-track continuity is exempt (continuity is
+ *     mandatory once a track is in scope) — the per-seed cap targets the graph/ref hubs.
+ *   - MAX_EXPANSION_TOTAL — the total facts ALL expansions may add this turn, ranked by
+ *     `retrievalSalience` (importance + recency + use — NEVER connectedness/degree). The existing
+ *     MAX_SECONDARY/MAX_TERTIARY injection caps remain the final backstop; the smaller wins.
+ * Connectedness gates CANDIDACY here (which facts are eligible to be pulled), never RANKING.
+ */
+const MAX_EXPANSION_PER_SEED = 3;
+const MAX_EXPANSION_TOTAL = 16;
+
+/**
  * Retrieve relevant facts based on Agent 1's needed info list
  * @param {string[]} neededInfo - Array of fact categories/keywords from Agent 1
  * @param {string[]} [contextKeywords=[]] - Additional keywords extracted from recent messages
@@ -143,16 +160,9 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         }
     }
 
-    // Also follow relationship links from primary hits
-    for (const result of directResults) {
-        if (result.tier === 'primary' && result.fact.relationships) {
-            for (const ref of (result.fact.relationships.primary || [])) {
-                fallbackKeywords.add(ref);
-            }
-        }
-    }
-
-    // Search for fallback matches (these become secondary if not already found)
+    // Search for FALLBACK-MAPPING category matches (these become secondary if not already found).
+    // NOTE: relationship-ref following is NO LONGER folded in here — it now flows through the
+    // UNIFIED expansion below so all graph/ref/track expansions share ONE cap.
     const fallbackResults = searchFactsIndexed(index, databases, [...fallbackKeywords]);
     const alreadyFound = new Set(directResults.map(r => `${r.category}:${r.fact.key}`));
 
@@ -167,19 +177,16 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
         }
     }
 
-    // DEPTH-DICE SEQUENCE EXPANSION WITH CONTINUITY (Feature #4).
-    // Any track touched by the matched facts so far is "relevant". For each such track
-    // we ALWAYS include the current (highest-ord) step, then probabilistically reach
-    // further back: roll each depth tier (1..4 steps back) at its configured chance;
-    // the REACH is the FURTHEST depth whose roll succeeds; then include EVERY step from
-    // current back to that reach CONTIGUOUSLY (continuity is mandatory — no gaps).
-    expandSequenceTracks(databases, directResults, alreadyFound);
-
-    // LINK-FOLLOWING + SCOPE-AWARE EXPANSION (Phase 4b). Traverse the scope graph one hop:
-    // place->events, person->events, event->place+people. Runs AFTER all candidate
-    // generation and BEFORE the salience cap, so the existing MAX_SECONDARY/TERTIARY caps
-    // bound the total. Deterministic (no Math.random, no LLM); one hop only; deduped by id.
-    expandLinks(databases, directResults, alreadyFound);
+    // UNIFIED, BOUNDED, DETERMINISTIC EXPANSION (Spiderweb Phase 1). The three former expansions —
+    // scope-graph link-following (place⇄event⇄people), relationship-ref chasing, and depth-dice
+    // sequence-track continuity — used to push independently with three separate implicit bounds,
+    // letting one hub monopolize the secondary tier. They now run as ONE pass: each gathers
+    // CANDIDATES (attributed to the seed/hub that produced them), then a single admitter applies a
+    // per-seed cap (so no hub takes more than its share) and a shared total cap, ranked by
+    // `retrievalSalience` (importance + recency + use — NEVER connectedness). No Math.random (the
+    // sequence reach is now deterministic), one hop, deduped by id. The existing MAX_SECONDARY/
+    // MAX_TERTIARY injection caps below remain the final backstop.
+    gatherExpansionCandidates(databases, index, directResults, alreadyFound);
 
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
@@ -459,10 +466,23 @@ function retrievalSalience(fact, now) {
 }
 
 /**
- * Default depth-dice probabilities (Feature #4). Each is the chance of reaching that
+ * Default depth-dice "reach weights" (Feature #4). Each is how strongly we want to reach that
  * many steps back from the current step. Overridden by settings.depthDice* when present.
+ * Historically these were rolled against Math.random per turn; the reach is now DETERMINISTIC
+ * (see deterministicTrackReach) so a swipe/regen — which re-injects from the cached snapshot and
+ * MUST yield the same fact set (pipeline.js ~26-27) — can never silently pull a different slice
+ * of history. The weights are reinterpreted as a fixed include-threshold, not a dice roll.
  */
 const DEFAULT_DEPTH_PROBS = [0.70, 0.50, 0.25, 0.10]; // depth 1,2,3,4
+
+/**
+ * DETERMINISTIC-INCLUDE threshold for the depth-dice weights. A depth tier is INCLUDED when its
+ * configured weight is at/above this threshold (≥ 0.5 = "more likely than not"), and the reach is
+ * the FURTHEST CONTIGUOUS depth that clears it (a gap stops the reach so continuity holds). With
+ * the defaults [0.70, 0.50, 0.25, 0.10] this yields reach 2 — the same expected behavior the dice
+ * used to average to, but now stable across swipes. No Math.random anywhere in the path.
+ */
+const DEPTH_INCLUDE_THRESHOLD = 0.5;
 
 /** Read configured depth probabilities (clamped 0..1), falling back to defaults. */
 function getDepthProbs() {
@@ -480,34 +500,53 @@ function getDepthProbs() {
 }
 
 /**
- * Depth-dice sequence expansion with mandatory continuity (Feature #4).
- * Identifies every track already touched by the retrieved facts, then for each track
- * includes the current (highest-ord) step plus a CONTIGUOUS run of older steps back to
- * a probabilistically-chosen reach. Newly included steps are pushed as primary so the
- * writer reliably sees the relevant slice of history. Mutates `results` in place.
- * @param {Object<string, DatabaseSchema>} databases
- * @param {Array<{fact: Object, category: string, tier: string}>} results
- * @param {Set<string>} alreadyFound - `category:key` ids already in results
+ * DETERMINISTIC reach from the depth-dice weights (replaces the old per-turn Math.random roll).
+ * The reach is the FURTHEST CONTIGUOUS depth whose configured weight clears
+ * DEPTH_INCLUDE_THRESHOLD — a gap (a tier below threshold) stops the reach so continuity is
+ * preserved. Same inputs (settings) → same reach, every time, so swipes/regens that re-derive
+ * retrieval get an identical history slice (no silent drift; pipeline.js ~26-27 invariant).
+ * @param {number[]} probs - configured depth weights for depths 1..N
+ * @returns {number} reach in [0, probs.length] (0 = current step only)
  */
-function expandSequenceTracks(databases, results, alreadyFound) {
-    // Collect relevant tracks from already-matched facts.
+function deterministicTrackReach(probs) {
+    let reach = 0;
+    for (let depth = 1; depth <= probs.length; depth++) {
+        if (probs[depth - 1] >= DEPTH_INCLUDE_THRESHOLD) reach = depth;
+        else break; // contiguity: a below-threshold tier stops the reach (no gaps)
+    }
+    return reach;
+}
+
+/**
+ * Depth-dice sequence expansion with mandatory continuity (Feature #4) — DETERMINISTIC.
+ * Identifies every track touched by the seed facts, then for each track collects the current
+ * (highest-ord) step plus a CONTIGUOUS run of older steps back to a deterministically-derived
+ * reach (no Math.random). Returns CANDIDATE rows (it does NOT push) so the unified expansion
+ * (gatherExpansionCandidates) can apply the shared per-seed + total caps; the track itself is
+ * the "seed" each step is attributed to. Sequence steps stay tier `primary` (continuity is
+ * mandatory once a track is in scope).
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier: string}>} seeds - the seed result rows
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results
+ * @returns {Array<{fact: Object, category: string, tier: string, via: string, seedId: string}>}
+ */
+function expandSequenceTracks(databases, seeds, alreadyFound) {
+    // Collect relevant tracks from the seed facts.
     const tracks = new Set();
-    for (const r of results) {
+    for (const r of seeds) {
         if (isSequenceFact(r.fact)) tracks.add(r.fact.track);
     }
-    if (tracks.size === 0) return;
+    if (tracks.size === 0) return [];
 
     const probs = getDepthProbs();
+    const candidates = [];
 
     for (const track of tracks) {
         const steps = getTrackSteps(databases, track); // ascending by ord
         if (steps.length === 0) continue;
 
-        // Roll each depth tier; REACH = furthest depth whose roll succeeds (0 = current only).
-        let reach = 0;
-        for (let depth = 1; depth <= probs.length; depth++) {
-            if (Math.random() < probs[depth - 1]) reach = depth;
-        }
+        // DETERMINISTIC reach (was a Math.random dice roll) — stable across swipes.
+        const reach = deterministicTrackReach(probs);
         // Number of steps to include from the tail: current + `reach` older = reach+1,
         // bounded by how many steps actually exist.
         const includeCount = Math.min(reach + 1, steps.length);
@@ -516,11 +555,11 @@ function expandSequenceTracks(databases, results, alreadyFound) {
         for (const { fact, category } of slice) {
             const id = `${category}:${fact.key}`;
             if (alreadyFound.has(id)) continue;
-            results.push({ fact, category, tier: 'primary', via: 'link' });
-            alreadyFound.add(id);
+            candidates.push({ fact, category, tier: 'primary', via: 'link', seedId: `track:${track}` });
         }
-        addDebugLog('info', `Depth-dice track "${track}": reach ${reach} → included ${includeCount}/${steps.length} step(s)`);
+        addDebugLog('info', `Depth-dice track "${track}": deterministic reach ${reach} → ${includeCount}/${steps.length} step(s) eligible`);
     }
+    return candidates;
 }
 
 /**
@@ -557,11 +596,44 @@ function linkToken(s) {
  * @param {Set<string>} alreadyFound - `category:key` ids already in results (mutated)
  */
 export function expandLinks(databases, results, alreadyFound) {
-    // SNAPSHOT the seed set up front so we expand exactly one hop: facts we add below are
-    // appended to `results` but are NOT themselves traversed (the loops read `seeds`).
-    const seeds = results.slice();
+    // Thin wrapper: collect scope-graph candidates from the current seeds, then push them in
+    // place (the finder candidate build at pipeline.js relies on this mutate-in-place form).
+    // The deterministic retrieval path instead routes the collector through the UNIFIED cap
+    // (gatherExpansionCandidates) so all expansions share one budget.
+    const candidates = collectLinkCandidates(databases, results.slice(), alreadyFound);
+    let pulled = 0;
+    for (const c of candidates) {
+        const id = `${c.category}:${c.fact.key}`;
+        if (alreadyFound.has(id)) continue;
+        results.push({ fact: c.fact, category: c.category, tier: c.tier, via: c.via });
+        alreadyFound.add(id);
+        pulled++;
+    }
+    if (pulled > 0) {
+        addDebugLog('info', `Link expansion (Phase 4b): pulled ${pulled} linked fact(s) as secondary`);
+    }
+}
 
-    // Build the relevance sets from the SEED candidates (deterministic, scope-aware).
+/**
+ * SCOPE-GRAPH candidate collector (Phase 4b core, extracted). Traverses the scope graph ONE
+ * hop from `seeds` and RETURNS candidate rows (does NOT push) so the unified expansion can apply
+ * the shared per-seed + total caps. Each candidate carries a `seedId` = the place/person/event
+ * node that pulled it, so a single hub seed (a busy place or a much-involved person) can be
+ * capped to its share by the unified admitter (per-seed cap) and can't monopolize the tier.
+ * Deterministic — no Math.random, no LLM. One hop (newly pulled facts are NOT re-expanded).
+ *
+ * Four link directions (each keyed off scope/subject, NOT the owning character, so a place
+ * fact is recalled when the PLACE is the topic even if its owner is absent):
+ *   1. PLACE -> EVENTS / 2. PERSON -> EVENTS / 3. EVENT -> PLACE / 4. EVENT -> PEOPLE.
+ *
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier: string}>} seeds - snapshot of seed rows
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results (read-only here)
+ * @returns {Array<{fact: Object, category: string, tier: string, via: string, seedId: string}>}
+ */
+function collectLinkCandidates(databases, seeds, alreadyFound) {
+    // Build the relevance sets from the SEED candidates (deterministic, scope-aware). We remember
+    // the seed token so each pulled fact can be attributed to the hub/node that pulled it.
     const relevantPlaces = new Set();   // place subjects/keys we should surface events for
     const relevantPeople = new Set();   // character subjects we should surface events for
     const seedEvents = [];              // event facts whose context (place+people) we pull
@@ -572,79 +644,68 @@ export function expandLinks(databases, results, alreadyFound) {
         const subject = linkToken(deriveSubject(fact));
         const key = linkToken(fact.key);
         if (scope === 'place') {
-            // A place is in scope: remember its subject AND its key so events can match
-            // either the place subject (`<PLACE>`) or a sub-place key prefix.
             if (subject) relevantPlaces.add(subject);
             if (key) relevantPlaces.add(key);
         } else if (scope === 'event') {
             seedEvents.push(fact);
         } else {
-            // character (or default) scope: the subject is a person of interest.
             if (subject) relevantPeople.add(subject);
         }
     }
 
-    // Track which event facts are already pulled in as event-seeds for direction 3/4, so a
-    // freshly pulled event (from direction 1/2) ALSO gets its context expanded — but only
-    // within this single pass over a fixed candidate list (no recursion).
+    // Track which event facts are pulled as event-seeds for direction 3/4, so a freshly pulled
+    // event (from direction 1/2) ALSO gets its context expanded — one hop, no recursion.
     const eventQueue = seedEvents.slice();
 
-    const admit = (category, fact) => {
+    // Dedupe within THIS collection so the same fact isn't emitted twice (the unified admitter
+    // also dedupes against alreadyFound). We only emit ids not already in results.
+    const emitted = new Set();
+    const candidates = [];
+    const emit = (category, fact, seedId) => {
         if (!fact) return false;
         if (!isActiveFact(fact)) return false;          // never surface superseded history
         if (!isFactVisible(fact)) return false;          // respect knownBy
         const id = `${category}:${fact.key}`;
-        if (alreadyFound.has(id)) return false;
-        results.push({ fact, category, tier: 'secondary', via: 'link' });
-        alreadyFound.add(id);
+        if (alreadyFound.has(id) || emitted.has(id)) return false;
+        emitted.add(id);
+        candidates.push({ fact, category, tier: 'secondary', via: 'link', seedId });
         return true;
     };
 
-    let pulled = 0;
-
-    // DIRECTIONS 1 & 2 — PLACE/PERSON -> EVENTS. Scan every event fact once; admit it when
-    // its `location` link names a relevant place (exact subject/key OR sub-place key prefix)
-    // or its `involved` list includes a relevant person. Newly admitted events are queued so
-    // their own place+people context expands below (still one hop from the seed set).
+    // DIRECTIONS 1 & 2 — PLACE/PERSON -> EVENTS.
     if (relevantPlaces.size > 0 || relevantPeople.size > 0) {
         for (const [category, db] of Object.entries(databases)) {
             for (const fact of (db.facts || [])) {
                 if (deriveScope(fact) !== 'event') continue;
                 if (!isActiveFact(fact)) continue;
                 const id = `${category}:${fact.key}`;
-                if (alreadyFound.has(id)) continue;
-                let hit = false;
+                if (alreadyFound.has(id) || emitted.has(id)) continue;
+                let hitSeed = null;
                 // Direction 1: event located at a relevant place (or a sub-place of it).
                 const loc = linkToken(fact.location);
                 if (loc && relevantPlaces.size > 0) {
                     for (const place of relevantPlaces) {
-                        // Match the place subject/key exactly, or treat the event location as
-                        // a sub-place when one key/subject is a prefix of the other.
                         if (loc === place || loc.startsWith(place + '_') || place.startsWith(loc + '_')) {
-                            hit = true;
+                            hitSeed = `place:${place}`;
                             break;
                         }
                     }
                 }
                 // Direction 2: event whose participants include a relevant person.
-                if (!hit && relevantPeople.size > 0 && Array.isArray(fact.involved)) {
+                if (!hitSeed && relevantPeople.size > 0 && Array.isArray(fact.involved)) {
                     for (const p of fact.involved) {
-                        if (relevantPeople.has(linkToken(p))) { hit = true; break; }
+                        const pt = linkToken(p);
+                        if (relevantPeople.has(pt)) { hitSeed = `person:${pt}`; break; }
                     }
                 }
-                if (hit && admit(category, fact)) {
-                    pulled++;
+                if (hitSeed && emit(category, fact, hitSeed)) {
                     eventQueue.push(fact); // expand this event's own context below
                 }
             }
         }
     }
 
-    // DIRECTIONS 3 & 4 — EVENT -> PLACE + PEOPLE. For every event in scope (seed events plus
-    // events freshly pulled above), pull the place fact named by its `location` and the key
-    // facts of each `involved` participant. Resolve targets by SUBJECT (scope-aware), so a
-    // place fact filed under the place subject is found even if its owning character isn't
-    // in scene.
+    // DIRECTIONS 3 & 4 — EVENT -> PLACE + PEOPLE.
     if (eventQueue.length > 0) {
         // Index active facts by scope+subject ONCE so the per-event lookups stay cheap.
         const placesBySubject = new Map();  // subject -> [{category, fact}]
@@ -661,35 +722,150 @@ export function expandLinks(databases, results, alreadyFound) {
                 map.get(subj).push({ category, fact });
             }
         }
-        // Dedupe the queue of events to traverse (an event may appear as both seed and pull).
         const seenEventIds = new Set();
         for (const ev of eventQueue) {
-            const evId = `${ev.key}`;
-            if (seenEventIds.has(evId)) continue;
-            seenEventIds.add(evId);
+            const evKey = linkToken(ev.key);
+            if (seenEventIds.has(evKey)) continue;
+            seenEventIds.add(evKey);
+            const evSeed = `event:${evKey}`;
             // Direction 3: the event's linked place.
             const loc = linkToken(ev.location);
             if (loc && placesBySubject.has(loc)) {
-                for (const { category, fact } of placesBySubject.get(loc)) {
-                    if (admit(category, fact)) pulled++;
-                }
+                for (const { category, fact } of placesBySubject.get(loc)) emit(category, fact, evSeed);
             }
             // Direction 4: the event's participants' character facts.
             if (Array.isArray(ev.involved)) {
                 for (const p of ev.involved) {
                     const subj = linkToken(p);
                     if (subj && peopleBySubject.has(subj)) {
-                        for (const { category, fact } of peopleBySubject.get(subj)) {
-                            if (admit(category, fact)) pulled++;
-                        }
+                        for (const { category, fact } of peopleBySubject.get(subj)) emit(category, fact, evSeed);
                     }
                 }
             }
         }
     }
 
-    if (pulled > 0) {
-        addDebugLog('info', `Link expansion (Phase 4b): pulled ${pulled} linked fact(s) as secondary (places:${relevantPlaces.size} people:${relevantPeople.size} events:${eventQueue.length})`);
+    return candidates;
+}
+
+/**
+ * RELATIONSHIP-REF candidate collector. For each PRIMARY seed result, follow its
+ * `relationships.primary` refs and RETURN the resolved facts as candidate rows (does NOT push),
+ * attributed to the seed fact that owns the ref (its `seedId`). This replaces the old path that
+ * folded relationship refs into the FALLBACK_MAPPINGS keyword search; routing them through the
+ * unified admitter means a hub seed's many refs are capped to its per-seed share like every other
+ * expansion. Deterministic, zero-API: refs are resolved via the same token index the push path
+ * uses (searchFactsIndexed), then filtered to active + visible + not-already-found.
+ * @param {{byCatAspect: Map, bySubject: Map, byToken: Map}} index - per-turn fact index
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {Array<{fact: Object, category: string, tier: string}>} seeds - snapshot of seed rows
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results (read-only here)
+ * @returns {Array<{fact: Object, category: string, tier: string, via: string, seedId: string}>}
+ */
+function collectRelationshipRefCandidates(index, databases, seeds, alreadyFound) {
+    const candidates = [];
+    const emitted = new Set();
+    for (const seed of seeds) {
+        if (seed.tier !== 'primary' || !seed.fact?.relationships) continue;
+        const refs = seed.fact.relationships.primary || [];
+        if (refs.length === 0) continue;
+        const seedId = `ref:${seed.category}:${seed.fact.key}`;
+        // Resolve this seed's refs through the same index matcher the push path uses.
+        for (const r of searchFactsIndexed(index, databases, refs)) {
+            const id = `${r.category}:${r.fact.key}`;
+            if (alreadyFound.has(id) || emitted.has(id)) continue;
+            if (!isActiveFact(r.fact)) continue;       // never surface superseded history
+            if (!isFactVisible(r.fact)) continue;       // respect knownBy
+            emitted.add(id);
+            // Relationship refs were historically demoted to tertiary; keep that tier.
+            candidates.push({ fact: r.fact, category: r.category, tier: 'tertiary', via: 'link', seedId });
+        }
+    }
+    return candidates;
+}
+
+/**
+ * UNIFIED EXPANSION (Spiderweb Phase 1). Gathers candidates from ALL expansions — scope-graph
+ * links, relationship-ref chasing, and deterministic sequence-track continuity — then admits them
+ * through ONE shared budget. Mutates `results` in place; mutates `alreadyFound`.
+ *
+ * THE ANTI-HUB CAP. Each candidate is attributed to the seed/hub that produced it (`seedId`). A
+ * single seed may contribute at most MAX_EXPANSION_PER_SEED facts, so a popular subject / busy
+ * place / much-involved person can't fill the whole tier with its own siblings — the budget is
+ * spread across query-relevant seeds. Sequence-track continuity steps are EXEMPT from the per-seed
+ * cap (continuity is mandatory once a track is in scope) but still count toward the total.
+ *
+ * RANKING IS UNCHANGED. Within the shared budget, candidates are admitted in DESCENDING
+ * `retrievalSalience` (importance + recency + use). There is NO connectedness/degree term — links
+ * decide what is ELIGIBLE (candidacy), salience decides the ORDER. The most-connected fact does
+ * not get a ranking boost.
+ *
+ * @param {Object<string, DatabaseSchema>} databases
+ * @param {{byCatAspect: Map, bySubject: Map, byToken: Map}} index - per-turn fact index
+ * @param {Array<{fact: Object, category: string, tier: string}>} results - mutated in place
+ * @param {Set<string>} alreadyFound - `category:key` ids already in results (mutated)
+ */
+function gatherExpansionCandidates(databases, index, results, alreadyFound) {
+    // SNAPSHOT seeds up front so this is exactly one hop (added facts aren't re-expanded).
+    const seeds = results.slice();
+    const now = Date.now();
+
+    // Gather from all three expansions (each returns attributed candidates; none pushes).
+    const linkCands = collectLinkCandidates(databases, seeds, alreadyFound);
+    const refCands = collectRelationshipRefCandidates(index, databases, seeds, alreadyFound);
+    const trackCands = expandSequenceTracks(databases, seeds, alreadyFound);
+
+    // Sequence-track continuity is admitted FIRST and EXEMPT from the per-seed cap (continuity is
+    // mandatory) — but still counts against the shared total. Dedupe across sources by id.
+    const claimed = new Set();      // ids already admitted this pass
+    const perSeed = new Map();      // seedId -> count admitted under the per-seed cap
+    let admittedTotal = 0;
+    let cappedBySeed = 0;           // how many candidates a per-seed cap blocked (debug)
+    const seedContrib = new Map();  // seedId -> count (debug: how much each hub contributed)
+
+    const admit = (c, { perSeedCapped }) => {
+        if (admittedTotal >= MAX_EXPANSION_TOTAL) return false;
+        const id = `${c.category}:${c.fact.key}`;
+        if (alreadyFound.has(id) || claimed.has(id)) return false;
+        if (perSeedCapped) {
+            const used = perSeed.get(c.seedId) || 0;
+            if (used >= MAX_EXPANSION_PER_SEED) { cappedBySeed++; return false; }
+            perSeed.set(c.seedId, used + 1);
+        }
+        claimed.add(id);
+        alreadyFound.add(id);
+        results.push({ fact: c.fact, category: c.category, tier: c.tier, via: c.via });
+        admittedTotal++;
+        seedContrib.set(c.seedId, (seedContrib.get(c.seedId) || 0) + 1);
+        return true;
+    };
+
+    // 1) Track continuity (exempt from per-seed cap, counts toward total).
+    for (const c of trackCands) admit(c, { perSeedCapped: false });
+
+    // 2) Link + relationship-ref candidates, ranked by salience, under the per-seed cap. Salience
+    //    DESCENDING (importance + recency + use) — no connectedness term. Stable sort keeps source
+    //    order on ties, so the pass is fully deterministic.
+    const ranked = [...linkCands, ...refCands].sort(
+        (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now));
+    for (const c of ranked) {
+        if (admittedTotal >= MAX_EXPANSION_TOTAL) break;
+        admit(c, { perSeedCapped: true });
+    }
+
+    if (admittedTotal > 0 || cappedBySeed > 0) {
+        // Find the biggest single-seed contribution to surface the anti-hub cap working.
+        let topSeed = null, topN = 0;
+        for (const [sid, n] of seedContrib) if (n > topN) { topN = n; topSeed = sid; }
+        addDebugLog('info', `Unified expansion: admitted ${admittedTotal}/${MAX_EXPANSION_TOTAL} (per-seed cap ${MAX_EXPANSION_PER_SEED} blocked ${cappedBySeed}; top seed "${topSeed}" contributed ${topN})`, {
+            subsystem: 'retrieval', event: 'retrieval.indexed',
+            data: {
+                admitted: admittedTotal, total_cap: MAX_EXPANSION_TOTAL,
+                per_seed_cap: MAX_EXPANSION_PER_SEED, capped_by_seed: cappedBySeed,
+                top_seed: topSeed, top_seed_contrib: topN,
+                from: { link: linkCands.length, ref: refCands.length, track: trackCands.length },
+            },
+        });
     }
 }
 
@@ -702,9 +878,14 @@ export function expandLinks(databases, results, alreadyFound) {
 export function formatFactsForWriter(results) {
     if (results.length === 0) return '(No stored facts available)';
 
-    const lines = [];
-
-    for (const { fact, category, tier } of results) {
+    // Build the per-fact line EXACTLY as before (format/tone/knownBy/dedup unchanged), then GROUP
+    // the lines by SUBJECT so the Writer sees connected clusters (all of one character's/place's
+    // facts together) instead of scattered rows. This is PRESENTATION-ONLY: same facts, same count,
+    // same per-line text — only the ORDER changes (a stable group-by-subject re-sort), plus a
+    // one-word `[Subject]` header per group. Subjects appear in FIRST-APPEARANCE order (so a primary
+    // hit's subject still leads); facts with no/unknown subject collapse into a trailing "Misc"
+    // group, so it degrades cleanly when subject is missing or mixed.
+    const formatLine = (fact, category) => {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
         const hasValue = String(fact.value ?? '').trim() !== '';
@@ -717,20 +898,37 @@ export function formatFactsForWriter(results) {
         // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
         // showing both would be redundant. With no note, inject `Category/key = value`.
         // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-        let line;
-        if (note) {
-            // Note replaces the value (it carries the fact). All tiers.
-            line = `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
-        } else if (hasValue) {
-            line = `${prefix} ${category}/${fact.key} = ${fact.value}`;
-        } else {
-            // Degenerate: neither value nor note — keep the key so it's still visible.
-            line = `${prefix} ${category}/${fact.key}`;
+        if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
+        if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}`;
+        // Degenerate: neither value nor note — keep the key so it's still visible.
+        return `${prefix} ${category}/${fact.key}`;
+    };
+
+    // Bucket lines by subject, preserving first-appearance order of both groups and lines.
+    const MISC_KEY = ' misc'; // sentinel that can't collide with a real subject
+    const order = [];                  // subject keys in first-appearance order
+    const groups = new Map();          // subjectKey -> { label, lines: string[] }
+    for (const { fact, category } of results) {
+        const subjRaw = String(deriveSubject(fact) ?? '').trim();
+        const key = subjRaw ? subjRaw.toLowerCase() : MISC_KEY;
+        if (!groups.has(key)) {
+            // One-word header: the subject as stored (or "Misc" for the no-subject bucket).
+            groups.set(key, { label: subjRaw || 'Misc', lines: [] });
+            order.push(key);
         }
-        lines.push(line);
+        groups.get(key).lines.push(formatLine(fact, category));
     }
 
-    return lines.join('\n');
+    // Emit "Misc" last (a trailing catch-all reads better than leading with un-grouped rows).
+    order.sort((a, b) => (a === MISC_KEY ? 1 : 0) - (b === MISC_KEY ? 1 : 0));
+
+    const out = [];
+    for (const key of order) {
+        const g = groups.get(key);
+        out.push(`[${g.label}]`);
+        for (const line of g.lines) out.push(line);
+    }
+    return out.join('\n');
 }
 
 /**

@@ -3204,8 +3204,15 @@ function mergeRelationships(existing, incoming) {
 // real stored fact, never an invented token). Refs are deduped + lowercased to match resolution.
 //
 // RELATEDNESS SIGNALS (priority order, mirroring the scope-graph the rest of the code uses):
-//   1. SAME SUBJECT (index.bySubject) — facts about the same person/place/thing → PRIMARY.
-//   2. SHARED LOCATION or SHARED `involved` member → PRIMARY (the place/people graph).
+//   1. SHARED LOCATION or SHARED `involved` member → PRIMARY (the place/people graph — the
+//      HIGH-PRECISION structural ties: a shared place-at-a-time or a shared participant is
+//      discriminating, low-degree, and scene-relevant).
+//   2. SAME SUBJECT (index.bySubject) → SECONDARY (ANTI-HUB demotion). Sharing the owning
+//      subject is the LEAST discriminating signal: a hub subject (a character that appears in
+//      dozens of facts) makes every one of its facts a same-subject sibling, so leaving these
+//      PRIMARY let one hub flood the primary tier at retrieval and crowd out the decisive sparse
+//      facts. Demoting pure same-subject ties to the capped secondary tier keeps them findable
+//      while reserving primary for the higher-precision shared-location/involved links above.
 //   3. LEXICAL TOKEN OVERLAP (index.byToken) ≥ AUTOLINK_MIN_TOKEN_OVERLAP shared meaningful
 //      tokens → SECONDARY (weaker, topical co-occurrence).
 // HARD BOUNDS: cap primary + secondary refs (AUTOLINK_MAX_PRIMARY/SECONDARY); skip self, skip
@@ -3277,7 +3284,9 @@ export function autoLinkFact(index, fact, category, runId) {
         return true;
     };
 
-    // ---- PRIMARY candidates: same subject, OR shared location, OR shared involved member. ----
+    // ---- PRIMARY candidates: shared location OR shared involved member (HIGH-PRECISION only).
+    // Pure same-subject ties are NO LONGER primary (anti-hub demotion); they fall to secondary
+    // below so a hub subject can't monopolize the primary tier. ----
     const primaryRefs = new Set();
     const addPrimary = (entry) => {
         if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) return;
@@ -3286,16 +3295,7 @@ export function autoLinkFact(index, fact, category, runId) {
         if (ref && ref !== selfRef) primaryRefs.add(ref);
     };
 
-    // Signal 1 — SAME SUBJECT.
-    const subject = deriveSubject(fact);
-    if (subject) {
-        for (const entry of (index.bySubject.get(subject) || [])) {
-            if (primaryRefs.size >= AUTOLINK_MAX_PRIMARY) break;
-            addPrimary(entry);
-        }
-    }
-
-    // Signal 2 — SHARED LOCATION + SHARED `involved` member. The `location`/`involved` tokens are
+    // Signal 1 — SHARED LOCATION + SHARED `involved` member. The `location`/`involved` tokens are
     // indexed under byToken (they are part of a fact's key/value/tags for most facts) but the most
     // reliable structural match is: a candidate whose OWN location/involved overlaps ours. We pull
     // candidate sets cheaply by tokenizing our location/involved and unioning their byToken buckets,
@@ -3329,11 +3329,33 @@ export function autoLinkFact(index, fact, category, runId) {
         }
     }
 
-    // ---- SECONDARY candidates: lexical token overlap ≥ AUTOLINK_MIN_TOKEN_OVERLAP. ----
+    // ---- SECONDARY candidates: same-subject ties (anti-hub demotion), then lexical overlap. ----
+    const secondaryRefs = new Set();
+    const addSecondary = (entry) => {
+        if (secondaryRefs.size >= AUTOLINK_MAX_SECONDARY) return;
+        if (!admissible(entry)) return;
+        const ref = autoLinkRef(entry.fact);
+        if (!ref || ref === selfRef) return;
+        if (primaryRefs.has(ref)) return; // already a stronger (primary) location/involved link
+        secondaryRefs.add(ref);
+    };
+
+    // Signal 2 — SAME SUBJECT → SECONDARY (was primary; demoted as the anti-hub fix). Filled
+    // FIRST among the secondary candidates because a shared subject is a real structural tie
+    // (stronger than stray lexical co-occurrence) — but capped by AUTOLINK_MAX_SECONDARY so a
+    // hub subject's dozens of siblings can't all land even here.
+    const subject = deriveSubject(fact);
+    if (subject) {
+        for (const entry of (index.bySubject.get(subject) || [])) {
+            if (secondaryRefs.size >= AUTOLINK_MAX_SECONDARY) break;
+            addSecondary(entry);
+        }
+    }
+
+    // Signal 3 — LEXICAL TOKEN OVERLAP ≥ AUTOLINK_MIN_TOKEN_OVERLAP → SECONDARY.
     // Tally how many of OUR meaningful tokens each candidate fact shares (via the token index),
     // then admit the highest-overlap facts as secondary links until the cap. Skips anything already
     // linked as primary (a stronger tie supersedes the weaker lexical one) and self/inactive.
-    const secondaryRefs = new Set();
     const myTokens = factTokens(fact); // >3-char tokens of key+value+tags+aliases (index-consistent)
     if (myTokens.length > 0) {
         const overlap = new Map(); // `category:key` -> { entry, count }
@@ -3351,10 +3373,7 @@ export function autoLinkFact(index, fact, category, runId) {
             .sort((a, b) => b.count - a.count);
         for (const { entry } of ranked) {
             if (secondaryRefs.size >= AUTOLINK_MAX_SECONDARY) break;
-            const ref = autoLinkRef(entry.fact);
-            if (!ref || ref === selfRef) continue;
-            if (primaryRefs.has(ref)) continue; // already a stronger (primary) link
-            secondaryRefs.add(ref);
+            addSecondary(entry); // dedupes against same-subject secondaries + primary already added
         }
     }
 
