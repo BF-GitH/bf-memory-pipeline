@@ -2455,6 +2455,58 @@ export function createEmptyDatabase(category) {
     };
 }
 
+// PROVENANCE (atomic #8). The generic `{ ...existing, ...fact }` spread on every update would
+// clobber the GENESIS `source`/`validAt` with the most-recent message. These helpers preserve
+// genesis attribution (source/validAt/learnedAt) and keep a compact capped trail of prior
+// sources, so "where did it learn this?" stays answerable. Spread AFTER `...fact`.
+const MAX_SOURCE_HISTORY = 10;
+
+function initProvenance(fact, now) {
+    return { learnedAt: now };
+}
+
+function mergeProvenance(existing, incoming, now) {
+    const genesisSource = existing.source || incoming.source || '';
+    const genesisValidAt = (existing.validAt !== undefined) ? existing.validAt : incoming.validAt;
+    const learnedAt = existing.learnedAt || existing.lastUpdated || now;
+    let history = Array.isArray(existing.sourceHistory) ? [...existing.sourceHistory] : [];
+    const prevSource = existing.source;
+    if (prevSource && incoming.source && prevSource !== incoming.source) {
+        history.push({ src: prevSource, at: existing.lastUpdated || now });
+        if (history.length > MAX_SOURCE_HISTORY) history.splice(0, history.length - MAX_SOURCE_HISTORY);
+    }
+    return {
+        source: genesisSource,
+        validAt: genesisValidAt,
+        learnedAt,
+        ...(history.length ? { sourceHistory: history } : {}),
+    };
+}
+
+/**
+ * ISO 8601 UTC cutoff string for "N days ago" (atomic #14). ISO strings of equal length sort
+ * lexicographically, so `fact.createdAt < sinceIso(days)` is a valid recency filter with no
+ * date parsing. days<=0 yields "now".
+ * @param {number} days
+ * @returns {string}
+ */
+export function sinceIso(days) {
+    return new Date(Date.now() - Math.max(0, days) * 86400000).toISOString();
+}
+
+/**
+ * Compact human-readable provenance summary, e.g. "learned msg_12, updated msg_31 msg_45".
+ * @param {FactSchema} fact
+ * @returns {string}
+ */
+export function getProvenanceSummary(fact) {
+    if (!fact) return '(no provenance)';
+    const genesis = fact.source || '(unknown)';
+    const updates = (fact.sourceHistory || []).map(e => e && e.src).filter(Boolean);
+    if (!updates.length) return `learned ${genesis}`;
+    return `learned ${genesis}, updated ${updates.join(' ')}`;
+}
+
 /**
  * Add or update a fact in a database
  * @param {DatabaseSchema} db
@@ -2496,7 +2548,7 @@ export function upsertFact(db, fact) {
             const mergedInvolved = mergeInvolved(existing.involved, seqFact.involved);
             const sal = mergeSalience(existing, seqFact);
             const oldSeqVal = existing.value;
-            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
+            db.facts[exactKeyIdx] = { ...existing, ...seqFact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, seqFact, Date.now()), createdAt: existing.createdAt || new Date().toISOString(), lastUpdated: Date.now() };
             if (!factValuesEqual(oldSeqVal, seqFact.value)) {
                 addDebugLog('debug', `Sequence step updated: [${db.category}] ${existing.key} (track ${seqFact.track}, ord ${ord})`, {
                     subsystem: 'db', event: 'fact.updated', reason: 'VALUE_CHANGED',
@@ -2505,7 +2557,7 @@ export function upsertFact(db, fact) {
                 });
             }
         } else {
-            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), lastUpdated: Date.now() });
+            db.facts.push({ ...seqFact, ...normalizeSalienceFields(seqFact), ...initProvenance(seqFact, Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
             addDebugLog('debug', `Sequence step added: [${db.category}] ${seqFact.key} (track ${seqFact.track}, ord ${ord})`, {
                 subsystem: 'db', event: 'fact.created',
                 data: { category: db.category, key: seqFact.key, value: seqFact.value, subject: deriveSubject(seqFact), aspect: deriveAspect(seqFact), track: seqFact.track, ord, isSequence: true },
@@ -2628,6 +2680,8 @@ export function upsertFact(db, fact) {
             db.facts[canonIdx] = {
                 ...existing, ...fact, key: existing.key, relationships: mergedRels,
                 context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...liveSceneOverride, active: true,
+                ...mergeProvenance(existing, fact, now),
+                createdAt: existing.createdAt || new Date(now).toISOString(),
                 supersededAt: undefined, supersededBy: undefined, lastUpdated: now,
             };
             db.updatedAt = now;
@@ -2643,7 +2697,8 @@ export function upsertFact(db, fact) {
         // Keep the existing canonical key so we update in place instead of renaming
         // (renaming would orphan any relationship refs pointing at the old key).
         const oldValue = existing.value;
-        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, lastUpdated: Date.now() };
+        const updNow = Date.now();
+        db.facts[existingIdx] = { ...existing, ...fact, key: existing.key, relationships: mergedRels, context: mergedContext, aliases: mergedAliases, involved: mergedInvolved, ...sal, ...mergeProvenance(existing, fact, updNow), createdAt: existing.createdAt || new Date(updNow).toISOString(), lastUpdated: updNow };
         if (factValuesEqual(oldValue, fact.value)) {
             addDebugLog('debug', `Fact unchanged: [${db.category}] ${existing.key}`, {
                 subsystem: 'db', event: 'fact.unchanged',
@@ -2657,7 +2712,7 @@ export function upsertFact(db, fact) {
             });
         }
     } else {
-        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), lastUpdated: Date.now() });
+        db.facts.push({ ...fact, ...normalizeSalienceFields(fact), ...initProvenance(fact, Date.now()), createdAt: new Date().toISOString(), lastUpdated: Date.now() });
         addDebugLog('info', `Fact created: [${db.category}] ${fact.key}`, {
             subsystem: 'db', event: 'fact.created',
             data: { category: db.category, key: fact.key, value: fact.value, subject: deriveSubject(fact), aspect: deriveAspect(fact) },

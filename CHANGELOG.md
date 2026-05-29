@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.34.0] - 2026-05-29
+
+### Added — atomic-derived Tier C: semantic retrieval (#1) + batch embedding (#16). Opt-in, default off.
+Match facts by **meaning**, not just keyword/trigram/graph — the one recall mode the current pipeline (spiderweb + relationship resonance) still lacks. Entirely opt-in behind `semanticRetrieval` (default **off**) and built defensively so it's safe to enable on any backend.
+
+- **Defensive embedding endpoint (#1).** New `callEmbeddingAPI` probes `CMRS.sendEmbeddingRequest`, then proxy routes `/api/backends/chat-completions/embeddings` and `/api/backends/embeddings/compute`; returns `null` (semantic features no-op, retrieval stays keyword/graph-only) if none respond. Never throws. Handles OpenAI / raw-array / `{embeddings}` / single-`{embedding}` shapes. New `getEmbeddingProfileId` (reuses Agent 1's profile if no dedicated one). ([src/llm-call.js](src/llm-call.js), [src/profiler.js](src/profiler.js))
+- **Embed-on-write + semantic layer (#1).** When enabled, new facts are vectorized after each Scribe write (fire-and-forget, stored as `fact.embedding` number[]); at retrieval `semanticLayer` embeds the query and admits the top cosine-closest facts (≥ `semanticThreshold`, default 0.75) as secondary (`via: 'semantic'`), feeding the existing token-budget/cap pipeline. ([src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-memory.js](src/agent-memory.js))
+- **Batch embedding + bulk backfill (#16).** New `src/fact-embedding.js`: `embedFacts` (batches of 30 with backoff + adaptive halving) and `bulkEmbedAllFacts`. A **"Semantic retrieval"** toggle + **"Embed all facts"** button (with live progress) in the settings Database section. ([src/fact-embedding.js](src/fact-embedding.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+New settings: `semanticRetrieval` (default false), `embeddingProfile`, `embeddingModel` (default `text-embedding-3-small`), `semanticThreshold` (0.1–0.99, default 0.75).
+
+**Note:** the embedding endpoint paths are best-effort — the exact ST embedding API isn't guaranteed across versions. Enable the toggle, click "Embed all facts", and check the debug log: "No embedding endpoint responded" means the feature no-ops and a different route must be wired for your ST build.
+
+## [0.33.0] - 2026-05-29
+
+### Added — atomic-derived Tier B (re-implemented against current code). Backward-compatible.
+
+- **#14 Recency cutoff.** Facts now carry an ISO `createdAt` stamp (preserved across updates, back-filled if absent); new `recencyCutoffDays` setting (0 = off) drops secondary/tertiary facts older than N days via lexicographic string compare. Primary picks and legacy un-stamped facts are never cut. Drops are logged in the retrieval exclusion ledger (`RECENCY_CUTOFF`). New exported `sinceIso(days)`. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/settings.js](src/settings.js))
+- **#10 Token budget.** The fixed `MAX_SECONDARY=12`/`MAX_TERTIARY=6` count caps are now backstops behind a `retrievalTokenBudget` (default 800, clamp 50–8000): primary tokens are charged first, then secondary/tertiary admitted by salience until the budget OR the count cap is hit (smaller wins), with an always-keep-one guard. Budget drops logged as `CAP_TOKENS`. ([src/fact-retrieval.js](src/fact-retrieval.js), [src/settings.js](src/settings.js))
+- **#17 Concurrent full-chat rebuild.** `runAgent3OnFullChat` (already loading the DB map once) now fans out extraction with a new `createSemaphore` capping parallel Scribe calls at `rebuildConcurrency` (default 3, clamp 1–6) instead of a strict sequential loop; progress fires per completion. Write-safe because the shared DB object is mutated by synchronous upserts between awaits. ([src/llm-call.js](src/llm-call.js), [src/settings.js](src/settings.js))
+
+## [0.32.0] - 2026-05-29
+
+### Added — atomic-derived Tier A (re-implemented against current code). Backward-compatible.
+First batch of improvements inferred from the *atomic* engine, ported onto the current pipeline (the originals were built on a stale v0.18.0 fork). These four had no equivalent on master.
+
+- **#13 Empty-scope pre-LLM skip.** `runMemoryExtraction` now skips the Scribe (Agent 3) LLM call when every message in the extraction window is trivially empty (pure asterisk actions / OOC / very short). `isTriviallyEmptyForExtraction` is now exported and wired into the LIVE path (previously only the backfill used it). New `agent3EmptyScopeSkip` setting (default on). Saves a wasted call + tokens on no-content turns. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+- **#12 Watermark at scope-time.** `bf_mem_processed` is now stamped `'in-flight'` BEFORE the Scribe call and promoted to `true` on commit, reset to `false` on explicit discard (cancel / character-change / returned LLM error), and left `'in-flight'` on an unexpected throw — closing the crash/swipe window that previously caused re-extraction. Preserves the existing no-redundant-save optimization. ([src/pipeline.js](src/pipeline.js))
+- **#8 Fact provenance.** `upsertFact` now preserves the GENESIS `source`/`validAt` across updates (previously clobbered by each re-mention), stamps a `learnedAt` timestamp, and keeps a capped (≤10) `sourceHistory` trail. New `getProvenanceSummary(fact)` export. Applied across all write paths (new / in-place / supersession / sequence). ([src/database.js](src/database.js))
+- **#7 Contradiction scan.** A heuristic pass (no LLM) inside reflection, every `contradictionInterval` passes (default 3, after the dedupe-janitor): flags same-key and near-key (token-Jaccard ≥ 0.72) facts with differing values into the review popup as read-only `CONFLICT` items. Excluded from the upsert path in both the popup and pipeline handlers, so it can never corrupt data. New `contradictionScanEnabled`/`contradictionInterval` settings. ([src/agent-reflect.js](src/agent-reflect.js), [src/review-popup.js](src/review-popup.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [style.css](style.css))
+
 ## [0.31.0] - 2026-05-24
 
 ### Added — relationship "resonance": a couple's emotional thread, pulled when it matters

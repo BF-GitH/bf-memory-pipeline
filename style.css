@@ -541,6 +541,8 @@
 .bf-mem-review-item.bf-mem-add { border-left: 3px solid #4caf50; }
 .bf-mem-review-item.bf-mem-update { border-left: 3px solid #ff9800; }
 .bf-mem-review-item.bf-mem-delete { border-left: 3px solid #f44336; }
+.bf-mem-review-item.bf-mem-conflict { border-left: 3px solid #9c27b0; }
+.bf-mem-conflict-values { font-size: 12px; opacity: 0.9; word-break: break-word; }
 
 .bf-mem-action-badge {
     font-size: 10px;
@@ -553,6 +555,7 @@
 .bf-mem-add .bf-mem-action-badge { background: #4caf50; color: #fff; }
 .bf-mem-update .bf-mem-action-badge { background: #ff9800; color: #fff; }
 .bf-mem-delete .bf-mem-action-badge { background: #f44336; color: #fff; }
+.bf-mem-badge-conflict { background: #9c27b0; color: #fff; }
 
 .bf-mem-category {
     font-weight: bold;

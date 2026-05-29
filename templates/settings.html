@@ -495,6 +495,16 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             </button>
                         </div>
                         <div id="bf_mem_full_chat_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
+                        <label class="checkbox_label" style="margin-top:10px;" title="Match facts by MEANING (embeddings), not just keywords/graph. Requires a working embedding endpoint; no-ops safely if none is found.">
+                            <input type="checkbox" id="bf_mem_semantic_enabled" />
+                            <span>Semantic retrieval (embeddings) — experimental, off by default</span>
+                        </label>
+                        <div class="bf-mem-db-actions" style="margin-top:6px;">
+                            <button id="bf_mem_embed_all" class="menu_button" title="Vectorize all stored facts for semantic retrieval (requires Semantic retrieval enabled + a working embedding endpoint)">
+                                <i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)
+                            </button>
+                        </div>
+                        <div id="bf_mem_embed_all_progress" class="bf-mem-hint" style="display:none;margin-top:6px;font-style:italic;"></div>
                     </div>
                 </div>
 

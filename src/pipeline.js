@@ -12,7 +12,7 @@ import { getAllDatabases, getMemoryIndex, saveDatabase, createEmptyDatabase, ups
 import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
-import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid } from './settings.js';
+import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
 import { detectAndRecord, showEntityPopup } from './agent-entities.js';
 
 // Pipeline state
@@ -1371,6 +1371,29 @@ async function runMemoryExtraction() {
     // debug line at the end so the post-reply cost shows up alongside the blocking-path one.
     const postStageMs = { agent3Ms: null, snapshotMs: null };
 
+    // WATERMARK AT SCOPE-TIME (atomic #12). Stamp the AI target + latest user message with an
+    // 'in-flight' marker BEFORE the Scribe LLM call, not only after commit. A mid-run error or
+    // character switch then never leaves the exchange un-watermarked and re-extracted next turn.
+    // States: 'in-flight' while running → true on commit; reset to false on explicit discard
+    // (cancel / character change / returned LLM error — none of which wrote to the DB) so the
+    // next genuine turn reprocesses; left 'in-flight' on an unexpected throw (crashed run is
+    // terminal — don't blindly re-extract a possibly half-written exchange).
+    const BF_MEM_IN_FLIGHT = 'in-flight';
+    const setWatermark = (val) => {
+        let changed = false;
+        if (chat[memoryTargetIndex] && chat[memoryTargetIndex].extra?.bf_mem_processed !== val) {
+            chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: val };
+            changed = true;
+        }
+        if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]
+            && chat[lastUserMsgIndex].extra?.bf_mem_processed !== val) {
+            chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: val };
+            changed = true;
+        }
+        if (changed) SillyTavern.getContext().saveChatDebounced?.();
+    };
+    setWatermark(BF_MEM_IN_FLIGHT);
+
     memoryExtractionInFlight = true;
     isInternalCall = true; // our extraction LLM call must not re-trigger the pipeline
     let memoryResult = null;
@@ -1406,6 +1429,19 @@ async function runMemoryExtraction() {
         }
         addDebugLog('info', `[${runId}] Agent 3 (post-reply) target [${role}] msg ${memoryTargetIndex}${agent3PriorMessages.length ? ` + ${agent3PriorMessages.length} prior msg(s)` : ''}: ${targetMessage.mes?.substring(0, 100)}`);
 
+        // EMPTY-SCOPE PRE-LLM SKIP (atomic #13). If EVERY message Agent 3 would see is trivially
+        // empty (pure asterisk actions, OOC, very short), skip the Scribe call entirely — commit
+        // the watermark so we don't retry, and return without spending a token. A single
+        // non-trivial message in the window keeps the run alive.
+        if (settings.agent3EmptyScopeSkip !== false) {
+            const windowTexts = [targetMessage.mes, ...agent3PriorMessages.map(m => m.text)];
+            if (windowTexts.every(t => isTriviallyEmptyForExtraction(t))) {
+                addDebugLog('info', `[${runId}] Agent 3 (post-reply): scope trivially empty — skipping LLM call`);
+                setWatermark(true);
+                return;
+            }
+        }
+
         const agent3ProfileId = getAgent3ProfileId(settings);
         const agent3Start = Date.now();
         // HUB FIX (per-character namespacing): pass the target message's AUTHOR name so the Scribe's
@@ -1427,6 +1463,7 @@ async function runMemoryExtraction() {
                 subsystem: 'agent3', event: 'agent3.run', reason: 'ERROR',
                 data: { agent: 'agent3', profileId: getAgent3ProfileId(settings) || null, success: false, error: memoryResult.error, durationMs: Date.now() - startTime },
             });
+            setWatermark(false); // LLM error wrote nothing — clear so a later turn can retry
             return;
         }
 
@@ -1436,6 +1473,7 @@ async function runMemoryExtraction() {
         // pipelineCancelled may have flipped (user clicked Stop) while we awaited the LLM.
         if (pipelineCancelled) {
             addDebugLog('info', `[${runId}] Cancelled mid-extraction — discarding ${memoryResult.updates.length} updates`);
+            setWatermark(false); // user stopped — let the next genuine turn reprocess
             setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
             return;
         }
@@ -1448,6 +1486,7 @@ async function runMemoryExtraction() {
             if (typeof toastr !== 'undefined') {
                 toastr.warning('BF Memory: extraction discarded — you switched characters');
             }
+            setWatermark(false); // wrong character now active — let this char's next turn reprocess
             setLastInserted((memoryResult.updates || []).map(u => ({ ...u, status: 'SKIPPED' })));
             return;
         }
@@ -1487,17 +1526,9 @@ async function runMemoryExtraction() {
         // ST's own existing chat-save cadence handle it (the flag still lives on the
         // in-memory chat object, so persistence isn't lost — we just stop forcing a
         // redundant full-chat write for a no-op).
-        let processedFlagChanged = false;
-        if (chat[memoryTargetIndex] && !chat[memoryTargetIndex].extra?.bf_mem_processed) {
-            chat[memoryTargetIndex].extra = { ...(chat[memoryTargetIndex].extra || {}), bf_mem_processed: true };
-            processedFlagChanged = true;
-        }
-        if (lastUserMsgIndex >= 0 && lastUserMsgIndex !== memoryTargetIndex && chat[lastUserMsgIndex]
-            && !chat[lastUserMsgIndex].extra?.bf_mem_processed) {
-            chat[lastUserMsgIndex].extra = { ...(chat[lastUserMsgIndex].extra || {}), bf_mem_processed: true };
-            processedFlagChanged = true;
-        }
-        if (processedFlagChanged) SillyTavern.getContext().saveChatDebounced?.();
+        // Promote the in-flight watermark to committed (true). setWatermark only saves when a
+        // value actually changes, preserving the prior perf fix (no redundant full-chat write).
+        setWatermark(true);
 
         // Review popup (deferred), capturing the chat id so it can't pop in the wrong chat.
         if (tickMessageCounter(settings.reviewInterval || 10)) {
@@ -1511,10 +1542,12 @@ async function runMemoryExtraction() {
                 await showReviewPopup(
                     () => addDebugLog('info', 'User accepted all memory updates'),
                     async (editedItems) => {
-                        addDebugLog('info', `User edited ${editedItems.length} items`);
-                        appendLastInserted(editedItems.map(i => ({ ...i, status: 'UPDATED' })));
+                        // Defensive: never upsert informational contradiction items (atomic #7).
+                        const writable = editedItems.filter(i => i.action !== 'conflict');
+                        addDebugLog('info', `User edited ${writable.length} items`);
+                        appendLastInserted(writable.map(i => ({ ...i, status: 'UPDATED' })));
                         const dbs = await getAllDatabases();
-                        for (const item of editedItems) {
+                        for (const item of writable) {
                             if (!dbs[item.category]) dbs[item.category] = createEmptyDatabase(item.category);
                             upsertFact(dbs[item.category], item);
                             await saveDatabase(dbs[item.category]);

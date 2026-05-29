@@ -16,6 +16,83 @@ import * as host from './host.js';
 const LLM_TIMEOUT_MS = 28000;          // 28s per transport leg (was 60s, per-leg, unbounded)
 const LLM_WALLCLOCK_BUDGET_MS = 45000; // 45s total across all legs + the one retry (hard cap)
 
+/**
+ * Embed an array of texts (atomic #1). DEFENSIVE + GRACEFUL: tries CMRS `sendEmbeddingRequest`
+ * (if this ST build exposes it), then the proxy routes `/api/backends/chat-completions/embeddings`
+ * and `/api/backends/embeddings/compute`. Returns number[][] vectors, or null if NONE work —
+ * callers treat null as "semantic disabled" and fall back to keyword retrieval. NEVER throws.
+ * @param {string[]} texts
+ * @param {string|null} profileId
+ * @param {string} [model]
+ * @returns {Promise<number[][]|null>}
+ */
+export async function callEmbeddingAPI(texts, profileId = null, model = 'text-embedding-3-small') {
+    if (!Array.isArray(texts) || texts.length === 0) return null;
+    const raceTimeout = (p) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('embedding timeout')), LLM_TIMEOUT_MS))]);
+
+    // Path 1: CMRS embedding request (only if this ST build exposes it).
+    if (profileId) {
+        const CMRS = getCMRS();
+        if (CMRS && typeof CMRS.sendEmbeddingRequest === 'function') {
+            try {
+                const r = await raceTimeout(CMRS.sendEmbeddingRequest(profileId, texts));
+                const vecs = normalizeEmbeddingResponse(r);
+                if (vecs) return vecs;
+            } catch (e) {
+                addDebugLog('info', `Embedding via CMRS failed (${e.message || e}); trying proxy routes`);
+            }
+        }
+    }
+
+    // Paths 2 & 3: direct ST proxy routes (OpenAI-compatible shape).
+    let headers = null;
+    try { headers = host.getRequestHeaders(); } catch { headers = null; }
+    if (!headers) return null;
+    for (const route of ['/api/backends/chat-completions/embeddings', '/api/backends/embeddings/compute']) {
+        try {
+            const resp = await raceTimeout(fetch(route, {
+                method: 'POST', headers, body: JSON.stringify({ model, input: texts }),
+            }));
+            if (!resp.ok) continue;
+            const json = await resp.json();
+            const vecs = normalizeEmbeddingResponse(json);
+            if (vecs) return vecs;
+        } catch { /* try next route */ }
+    }
+    addDebugLog('info', 'No embedding endpoint responded — semantic features will no-op');
+    return null;
+}
+
+/** Normalize the various embedding response shapes to number[][] (or null). */
+function normalizeEmbeddingResponse(r) {
+    if (!r) return null;
+    if (Array.isArray(r) && r.every(v => Array.isArray(v))) return r;
+    if (Array.isArray(r?.data)) return r.data.map(d => d.embedding || d).filter(Array.isArray);
+    if (Array.isArray(r?.embeddings)) return r.embeddings;
+    if (Array.isArray(r?.embedding)) return [r.embedding];
+    return null;
+}
+
+/**
+ * Minimal Promise-based counting semaphore (atomic #17). `acquire()` resolves to a release
+ * function once a slot is free (FIFO). Pure JS, no deps. Used to cap concurrent LLM calls
+ * during a full-chat rebuild so the provider isn't hammered. Applied locally by the rebuild.
+ * @param {number} n - max concurrent holders
+ */
+export function createSemaphore(n) {
+    let running = 0;
+    const queue = [];
+    const release = () => { running--; if (queue.length) { running++; queue.shift()(); } };
+    return {
+        acquire() {
+            return new Promise((resolve) => {
+                if (running < n) { running++; resolve(release); }
+                else queue.push(() => resolve(release));
+            });
+        },
+    };
+}
+
 // CACHE-ELIGIBILITY tracking (HONEST — server-side cache HITS are NOT observable from an
 // extension; see the long note in callAgentLLMOnce). We can only observe what makes the
 // cacheable PREFIX stable: the agent's system-prompt bytes (hash vs the last call for that

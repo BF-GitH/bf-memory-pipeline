@@ -114,6 +114,20 @@ export async function showReviewPopup(onAccept, onEdit) {
     if (items.length === 0) return;
 
     const listHtml = items.map((item, idx) => {
+        // Contradiction items (atomic #7) are INFORMATIONAL: read-only, both values shown, only
+        // a dismiss button — no editable inputs, so they never flow into the upsert path.
+        if (item.action === 'conflict') {
+            return `
+            <div class="bf-mem-review-item bf-mem-conflict" data-idx="${idx}">
+                <span class="bf-mem-action-badge bf-mem-badge-conflict">CONFLICT</span>
+                <span class="bf-mem-category">${escapeHtml(item.category)}</span>
+                <strong>${escapeHtml(item.key)}</strong>
+                <div class="bf-mem-conflict-values">${escapeHtml(item.value || '')}</div>
+                <span class="bf-mem-known">Resolve in the Database tab; dismiss here when handled.</span>
+                <button class="bf-mem-remove-btn" data-idx="${idx}" title="Dismiss this conflict">X</button>
+            </div>`;
+        }
+
         const actionClass = item.action === 'delete' ? 'bf-mem-delete' : item.action === 'update' ? 'bf-mem-update' : 'bf-mem-add';
         const actionLabel = item.action === 'delete' ? 'DEL' : item.action === 'update' ? 'UPD' : 'NEW';
         const knownBy = (item.knownBy || []).join(', ') || 'everyone';
@@ -222,6 +236,7 @@ export async function showReviewPopup(onAccept, onEdit) {
                 const idx = parseInt(el.dataset.idx);
                 const original = items[idx];
                 if (!original) return;
+                if (original.action === 'conflict') return; // informational — never upsert
 
                 const keyInput = el.querySelector('.bf-mem-key');
                 const valueInput = el.querySelector('.bf-mem-value');

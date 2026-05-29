@@ -2,13 +2,27 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
+import { callEmbeddingAPI } from './llm-call.js';
+import { getEmbeddingProfileId } from './profiler.js';
 import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
-// but these are hardcoded fallbacks for common patterns
+// but these are hardcoded fallbacks for common patterns.
+//
+// RETAINED, not superseded by the item #4 sim-links (`expandSimLinks`). Evaluated for
+// removal and kept: the two mechanisms are ORTHOGONAL, not old-vs-new.
+//   - This table is a CONCEPT -> CATEGORY bridge (chat word "apartment" -> search the
+//     Furniture/Rooms/Decor categories). It needs no stored facts and works at cold-start.
+//   - sim-links are a FACT -> textually-similar-FACT edge that only fires from an existing
+//     PRIMARY hit and only after an Agent 3 write cycle has populated `fact.simLinks`.
+// So sim-links cannot reproduce this recall: a chat word matching NO stored fact yields no
+// primary seed (sim-links contribute nothing), and conceptually-related-but-textually-
+// dissimilar categories share too few trigrams to ever link. The semantic layer (item #1)
+// is the only true conceptual analogue, and it is opt-in/default-off. Gating removal behind
+// an accumulated-fact count does not help — the gap is structural, not a warm-up phase.
 const FALLBACK_MAPPINGS = {
     // Location triggers
     'apartment': ['Furniture', 'Rooms', 'Decor'],
@@ -94,6 +108,77 @@ export function isFactVisible(fact, names = null) {
  */
 const MAX_EXPANSION_PER_SEED = 3;
 const MAX_EXPANSION_TOTAL = 16;
+
+/**
+ * Approximate injection token cost of a candidate (atomic #10), mirroring the writer line
+ * `[knownBy] Category/key = value [— context]`, ~4 chars/token.
+ * @param {{fact: Object, category: string, tier: string}} r
+ * @returns {number}
+ */
+function estimateInjectionTokens(r) {
+    const f = r.fact;
+    const kb = (f.knownBy || []).join(', ');
+    const prefix = kb ? `[${kb}]` : '[everyone]';
+    let line = `${prefix} ${r.category}/${f.key} = ${f.value || ''}`;
+    if (r.tier === 'primary' && typeof f.context === 'string' && f.context.trim()) line += ` — ${f.context.trim()}`;
+    return Math.ceil(line.length / 4);
+}
+
+// Max semantic (embedding) hits admitted as secondary per retrieval (atomic #1).
+const SEMANTIC_MAX_SECONDARY = 8;
+
+/** Cosine similarity of two equal-length numeric vectors. 0 on mismatch/empty. */
+function cosineSimilarity(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+/**
+ * Semantic expansion (atomic #1, opt-in). Embeds the query keywords and admits the top
+ * cosine-closest active+visible facts (carrying a cached `embedding`) above the configured
+ * threshold as SECONDARY. Fully guarded: no-ops when semantic retrieval is off, no endpoint
+ * responds, or no facts are embedded yet — so it never breaks keyword/graph retrieval.
+ * @param {Object} databases
+ * @param {string[]} allKeywords
+ * @param {Array} results - mutated in place
+ * @param {Set<string>} alreadyFound - `category:key` ids already present (mutated)
+ */
+async function semanticLayer(databases, allKeywords, results, alreadyFound) {
+    const s = (() => { try { return getSettings(); } catch { return null; } })();
+    if (!s?.semanticRetrieval) return;
+    const queryText = (allKeywords || []).join(' ').trim();
+    if (!queryText) return;
+
+    let qvec = null;
+    try {
+        const vecs = await callEmbeddingAPI([queryText], getEmbeddingProfileId(s));
+        qvec = vecs && vecs[0];
+    } catch { /* graceful */ }
+    if (!Array.isArray(qvec) || qvec.length === 0) return;
+
+    const threshold = Number(s.semanticThreshold) || 0.75;
+    const hits = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact) || !Array.isArray(fact.embedding)) continue;
+            const id = `${category}:${fact.key}`;
+            if (alreadyFound.has(id) || !isFactVisible(fact)) continue;
+            const sim = cosineSimilarity(qvec, fact.embedding);
+            if (sim >= threshold) hits.push({ fact, category, sim });
+        }
+    }
+    if (hits.length === 0) return;
+    hits.sort((a, b) => b.sim - a.sim);
+    let admitted = 0;
+    for (const h of hits.slice(0, SEMANTIC_MAX_SECONDARY)) {
+        results.push({ fact: h.fact, category: h.category, tier: 'secondary', via: 'semantic' });
+        alreadyFound.add(`${h.category}:${h.fact.key}`);
+        admitted++;
+    }
+    addDebugLog('info', `Semantic expansion: admitted ${admitted} fact(s) (cos ≥ ${threshold})`);
+}
 
 /**
  * Retrieve relevant facts based on Agent 1's needed info list
@@ -188,6 +273,12 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // MAX_TERTIARY injection caps below remain the final backstop.
     gatherExpansionCandidates(databases, index, directResults, alreadyFound);
 
+    // SEMANTIC EXPANSION (atomic #1, opt-in). Embed the query and admit facts whose cached
+    // vector is cosine-close to it — catching meaning the keyword/trigram/graph lanes miss
+    // ("safe snack?" → peanut-allergy fact). No-ops gracefully when semantic retrieval is off,
+    // no facts are embedded yet, or no embedding endpoint responds.
+    await semanticLayer(databases, allKeywords, directResults, alreadyFound);
+
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
     // facts — the real cause of "the writer skips facts." We now include facts by tier
@@ -199,26 +290,22 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // secondary/tertiary candidates exceed their caps we must drop some — rank them by a
     // DETERMINISTIC salience score (importance + recency, no Math.random) so higher-
     // importance and more-recent facts win the slots instead of arbitrary match order.
+    // COUNT caps remain the hard backstop; a TOKEN budget (#10) is the finer limit (smaller wins).
     const MAX_SECONDARY = 12;
     const MAX_TERTIARY = 6;
     const now = Date.now();
-    const primary = directResults.filter(r => r.tier === 'primary');
-    const secondary = directResults.filter(r => r.tier === 'secondary');
-    const tertiary = directResults.filter(r => r.tier === 'tertiary');
-    // Stable-ish descending sort by salience (ties keep original relative order in V8's
-    // stable sort, so still deterministic).
-    const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
-    secondary.sort(byScore);
-    tertiary.sort(byScore);
-    const filteredResults = [
-        ...primary,
-        ...secondary.slice(0, MAX_SECONDARY),
-        ...tertiary.slice(0, MAX_TERTIARY),
-    ];
+    const cfg = (() => { try { return getSettings(); } catch { return null; } })() || {};
+    const budget = Number(cfg.retrievalTokenBudget) || 800;
+    const cutoffDays = Number(cfg.recencyCutoffDays) || 0;
+    const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
+    const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
 
-    // EXCLUSION LEDGER — record candidates that fell off the cap cliff so "why it forgot X"
-    // is answerable. Only candidates that ACTUALLY entered a tier are logged (never the whole
-    // DB). Each carries rank + salience score so the user sees it was e.g. rank-14-of-18.
+    const primary = directResults.filter(r => r.tier === 'primary');
+    let secondary = directResults.filter(r => r.tier === 'secondary');
+    let tertiary = directResults.filter(r => r.tier === 'tertiary');
+
+    // EXCLUSION LEDGER — record candidates dropped at the cap/recency/budget cliffs so
+    // "why it forgot X" is answerable. Only candidates that ACTUALLY entered a tier are logged.
     const excludedByReason = {};
     const recordExclude = (r, reason, extra = {}) => {
         excludedByReason[reason] = (excludedByReason[reason] || 0) + 1;
@@ -227,10 +314,41 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
             data: { key: r.fact.key, category: r.category, tier: r.tier, ...extra },
         });
     };
-    secondary.slice(MAX_SECONDARY).forEach((r, i) =>
-        recordExclude(r, 'CAP_SECONDARY', { rank: MAX_SECONDARY + i + 1, of: secondary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
-    tertiary.slice(MAX_TERTIARY).forEach((r, i) =>
-        recordExclude(r, 'CAP_TERTIARY', { rank: MAX_TERTIARY + i + 1, of: tertiary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
+
+    // RECENCY CUTOFF (#14): drop secondary/tertiary older than the cutoff. Primary is never cut;
+    // legacy facts with no createdAt are always kept (back-compat — never silently drop undated).
+    if (cutoffIso) {
+        for (const r of [...secondary, ...tertiary]) {
+            if (!passesRecency(r)) recordExclude(r, 'RECENCY_CUTOFF', { createdAt: r.fact.createdAt || null, cutoff: cutoffIso });
+        }
+        secondary = secondary.filter(passesRecency);
+        tertiary = tertiary.filter(passesRecency);
+    }
+
+    const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
+    secondary.sort(byScore);
+    tertiary.sort(byScore);
+
+    // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
+    // admitted by salience until the token budget OR the count cap is reached (smaller wins).
+    // The first overflow candidate is always admitted (never an empty overflow on a tiny budget).
+    let usedTokens = primary.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+    const admitted = [];
+    const admitTier = (list, maxCount, capReason) => {
+        let n = 0;
+        for (const r of list) {
+            if (n >= maxCount) { recordExclude(r, capReason, { rank: n + 1, of: list.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }); continue; }
+            const cost = estimateInjectionTokens(r);
+            if (admitted.length > 0 && usedTokens + cost > budget) {
+                recordExclude(r, 'CAP_TOKENS', { usedTokens, budget, score: Number(retrievalSalience(r.fact, now).toFixed(3)) });
+                continue;
+            }
+            admitted.push(r); usedTokens += cost; n++;
+        }
+    };
+    admitTier(secondary, MAX_SECONDARY, 'CAP_SECONDARY');
+    admitTier(tertiary, MAX_TERTIARY, 'CAP_TERTIARY');
+    const filteredResults = [...primary, ...admitted];
 
     // Filter by knownBy: only include facts the current character knows.
     // Empty knownBy means "everyone knows" (no filter).

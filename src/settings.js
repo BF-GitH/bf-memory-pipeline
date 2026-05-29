@@ -117,6 +117,10 @@ const DEFAULT_SETTINGS = {
     // pipeline.js — only the debug-log preview is substring'd, never the prompt).
     agent1ContextMessages: 5,
     agent3ContextMessages: 5,
+    // Empty-scope pre-LLM skip (atomic #13): skip the Agent 3 (Scribe) LLM call when EVERY
+    // message in the extraction window is trivially empty (pure asterisk actions, OOC, or very
+    // short) per isTriviallyEmptyForExtraction. Saves a wasted call + tokens on no-content turns.
+    agent3EmptyScopeSkip: true,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -161,6 +165,30 @@ const DEFAULT_SETTINGS = {
     // char-budget truncation style). Bounds prompt growth even with a huge store.
     summaryPyramidMaxTokens: 250,
     reviewInterval: 10,
+    // Contradiction scan (atomic #7): every N reflection passes, flag facts that appear to
+    // contradict (same/near key, different value) into the review popup. Heuristic, no LLM call.
+    contradictionScanEnabled: true,
+    contradictionInterval: 3,
+    // Retrieval token budget (atomic #10): approx-token budget for injected secondary+tertiary
+    // facts. Primary picks always kept + charged first; then secondary/tertiary admitted by
+    // salience until the budget OR the MAX_SECONDARY/MAX_TERTIARY count caps are hit (smaller
+    // wins). Replaces relying on count caps alone. Clamp 50..8000.
+    retrievalTokenBudget: 800,
+    // Recency cutoff (atomic #14): 0 = off. When > 0, secondary/tertiary facts created more
+    // than N days ago are dropped from retrieval. Primary picks + legacy un-stamped facts are
+    // never cut. Clamp 0..3650.
+    recencyCutoffDays: 0,
+    // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
+    // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
+    rebuildConcurrency: 3,
+    // Semantic retrieval (atomic #1/#16). Default OFF. When on, facts are embedded (vector) on
+    // write and the query is embedded at retrieval so facts match by MEANING, not just keyword/
+    // trigram/graph. callEmbeddingAPI probes CMRS + known ST routes and GRACEFULLY NO-OPS if
+    // none respond — safe to enable on any backend (retrieval just stays keyword-only).
+    semanticRetrieval: false,
+    embeddingProfile: '',                       // CMRS profile for embeddings (blank = reuse Agent 1's)
+    embeddingModel: 'text-embedding-3-small',   // embedding model name sent to the endpoint
+    semanticThreshold: 0.75,                    // min cosine similarity for a semantic hit
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
     // existing sliders, but no longer gate which facts get injected. Safe to remove the
@@ -291,6 +319,11 @@ function validateSettings(s) {
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
+    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
+    s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
+    s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));
+    s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
+    s.semanticThreshold = clamp(s.semanticThreshold, 0.1, 0.99, 0.75);
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
     // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
@@ -3275,7 +3308,7 @@ function detachCurrentChatIfNeeded(unlinkedChatId, profileName) {
  *     "ok", "*nods*", emoji, etc.
  *   - pure OOC lines: every non-empty line wrapped in (( )) or prefixed OOC:
  */
-function isTriviallyEmptyForExtraction(mes) {
+export function isTriviallyEmptyForExtraction(mes) {
     const raw = String(mes ?? '');
     // Strip simple action-asterisks and collapse whitespace for the length test.
     const visible = raw.replace(/\*/g, '').replace(/\s+/g, ' ').trim();
@@ -3334,6 +3367,7 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
     const { runMemoryUpdater } = await import('./agent-memory.js');
     const { getAgent3ProfileId } = await import('./profiler.js');
     const { getAllDatabases } = await import('./database.js');
+    const { createSemaphore } = await import('./llm-call.js');
 
     const profileId = getAgent3ProfileId(extensionSettings);
     const charInfo = (function() {
@@ -3370,19 +3404,10 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
     const allUpdates = [];
     const allApplied = [];
 
+    // Build the work list up front (apply skip rules) so trivial/processed messages never
+    // spend an LLM call and the progress total is accurate.
+    const workItems = [];
     for (let i = 0; i < chat.length; i++) {
-        if (shouldCancel?.()) {
-            addDebugLog('info', `Full-chat extraction cancelled at message ${i}/${total}`, {
-                subsystem: 'import', event: 'backfill.cancelled', data: { msgIndex: i, total },
-            });
-            break;
-        }
-        // PERF (fix): yield to the event loop periodically so a long chat with many
-        // SKIPPED (synchronous) messages doesn't freeze the UI between LLM calls. The
-        // processed path already awaits an LLM call (a natural yield); this covers long
-        // runs of skips (system messages, already-processed, trivially-empty) that would
-        // otherwise spin the main thread with no chance for the cancel button to paint.
-        if (i > 0 && i % 25 === 0) await new Promise(r => setTimeout(r, 0));
         const msg = chat[i];
         const skip = (reason) => addDebugLog('debug', `Full-chat: msg ${i + 1} skipped (${reason})`, {
             subsystem: 'import', event: 'backfill.skipped', reason, data: { msgIndex: i },
@@ -3390,50 +3415,54 @@ export async function runAgent3OnFullChat({ skipAlreadyProcessed = true, onProgr
         if (!msg || !msg.mes) { skipped++; skip('EMPTY'); continue; }
         if (msg.is_system) { skipped++; skip('SYSTEM'); continue; }
         if (msg.extra?.type) { skipped++; skip('EXTRA_TYPE'); continue; }
-        // FIX #9: skip already-processed BEFORE spending an LLM call (short-circuit,
-        // not just tally). On by default via skipAlreadyProcessed.
         if (skipAlreadyProcessed && msg.extra?.bf_mem_processed) { skipped++; skip('ALREADY_PROCESSED'); continue; }
-        // FIX #9: client-side pre-filter of trivially-empty messages so we don't burn
-        // a ~1200-token call on content the prompt would return zero facts for anyway.
         if (isTriviallyEmptyForExtraction(msg.mes)) {
             skipped++;
             skip('TRIVIALLY_EMPTY');
-            // Still mark processed so a re-run doesn't re-evaluate the same dead message.
             msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
             continue;
         }
+        workItems.push({ msg, idx: i });
+    }
 
+    // CONCURRENT FAN-OUT (atomic #17). The `databases` map is loaded ONCE above and shared by
+    // all workers; upsertFact is synchronous between awaits, so concurrent workers can't lose
+    // each other's writes. A semaphore caps parallel Scribe calls at rebuildConcurrency.
+    const concurrency = Math.max(1, Math.min(6, extensionSettings.rebuildConcurrency || 3));
+    const sem = createSemaphore(concurrency);
+    const workTotal = workItems.length;
+    const counter = { done: 0 };
+    await Promise.all(workItems.map(async ({ msg, idx }) => {
+        if (shouldCancel?.()) return;
+        const release = await sem.acquire();
+        if (shouldCancel?.()) { release(); return; }
         try {
-            // Reuse the single pre-loaded map (mutated in place + persisted by applyUpdates).
             const result = await runMemoryUpdater(
-                msg.mes,
-                i,
-                charInfo,
-                databases,
-                profileId,
-                !!msg.is_user,
-                userPersona,
-                [],  // no prior context — process each message in isolation for retro extraction
+                msg.mes, idx, charInfo, databases, profileId,
+                !!msg.is_user, userPersona,
+                [],   // no prior context — process each message in isolation for retro extraction
                 null,
                 String(msg.name || '').trim(), // source speaker (HUB FIX per-character namespacing)
             );
             const n = result?.updates?.length || 0;
             factsAdded += n;
             if (Array.isArray(result?.updates)) allUpdates.push(...result.updates);
-            // .applied = committed/changed subset (NEW/UPDATED/SKIPPED), like pipeline.js
             if (Array.isArray(result?.applied)) allApplied.push(...result.applied);
             msg.extra = { ...(msg.extra || {}), bf_mem_processed: true };
             processed++;
-            onProgress?.({ current: i + 1, total, factsAdded });
-            addDebugLog('info', `Full-chat: msg ${i + 1}/${total} → +${n} facts`, {
-                subsystem: 'import', event: 'backfill.perMsg', data: { msgIndex: i, total, factsAdded: n },
+            addDebugLog('info', `Full-chat: msg ${idx + 1} → +${n} facts`, {
+                subsystem: 'import', event: 'backfill.perMsg', data: { msgIndex: idx, total: workTotal, factsAdded: n },
             });
         } catch (err) {
-            addDebugLog('fail', `Full-chat: msg ${i + 1} failed: ${err.message || err}`, {
-                subsystem: 'import', event: 'backfill.msgFailed', reason: 'ERROR', data: { msgIndex: i, error: err.message || String(err) },
+            addDebugLog('fail', `Full-chat: msg ${idx + 1} failed: ${err.message || err}`, {
+                subsystem: 'import', event: 'backfill.msgFailed', reason: 'ERROR', data: { msgIndex: idx, error: err.message || String(err) },
             });
+        } finally {
+            counter.done++;
+            onProgress?.({ current: counter.done, total: workTotal, factsAdded });
+            release();
         }
-    }
+    }));
 
     // FIX #7: surface this backfill's results in the Generated / Inserted panels.
     // Replace (not append) so the tabs show what this backfill produced.
@@ -4333,6 +4362,45 @@ export async function initSettings() {
     $('#bf_mem_run_full_chat_cancel').on('click', () => {
         fullChatCancel = true;
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
+    });
+
+    // Semantic retrieval toggle (atomic #1).
+    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true).on('change', function () {
+        extensionSettings.semanticRetrieval = $(this).prop('checked');
+        saveSettings();
+        if (extensionSettings.semanticRetrieval) {
+            toastr.info('Semantic retrieval on. Click "Embed all facts" to vectorize existing facts; new facts embed automatically.', 'BF Memory');
+        }
+    });
+
+    // --- Embed all facts (atomic #16): one-shot semantic backfill of the current character's DB ---
+    $('#bf_mem_embed_all').on('click', async () => {
+        if (!extensionSettings.semanticRetrieval) {
+            toastr.info('Enable "Semantic retrieval" first, then embed.', 'BF Memory');
+            return;
+        }
+        const btn = $('#bf_mem_embed_all');
+        const progress = $('#bf_mem_embed_all_progress');
+        btn.prop('disabled', true).text('Embedding…');
+        progress.show().text('Starting…');
+        try {
+            const { bulkEmbedAllFacts } = await import('./fact-embedding.js');
+            const result = await bulkEmbedAllFacts(({ done, total }) => {
+                progress.text(`Embedding ${done}/${total} fact(s)…`);
+            });
+            if (result.total === 0) {
+                progress.text('All facts already embedded (or none to embed).');
+                toastr.info('Nothing to embed — facts are already vectorized or the store is empty.', 'BF Memory');
+            } else {
+                progress.text(`Done: ${result.succeeded}/${result.total} embedded.`);
+                toastr.success(`Embedded ${result.succeeded}/${result.total} fact(s)`, 'BF Memory');
+            }
+        } catch (err) {
+            toastr.error(`Embed failed: ${err.message}`, 'BF Memory');
+            progress.text(`Failed: ${err.message}`);
+        } finally {
+            btn.prop('disabled', false).html('<i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)');
+        }
     });
 
     // --- Tokens Tab ---

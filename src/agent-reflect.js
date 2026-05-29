@@ -25,6 +25,70 @@
 // pipeline (mirrors the existing agent fallbacks).
 
 import { getAllDatabases, upsertFact, saveDatabase, createEmptyDatabase, getTrackSteps, dedupeDatabase, removeFact, markFactCold, normalizeAspect, L1_CATEGORIES, buildMemoryIndex } from './database.js';
+import { trackUpdate } from './review-popup.js';
+
+// Contradiction scan (atomic #7) tuning.
+const MAX_CONFLICT_PAIRS = 30;
+const NEAR_KEY_THRESHOLD = 0.72;
+
+/** Token-Jaccard similarity between two key strings (0..1). */
+function keyJaccard(a, b) {
+    const tok = (s) => new Set(String(s).toLowerCase().replace(/[^a-z0-9]/g, ' ').split(/\s+/).filter(Boolean));
+    const A = tok(a), B = tok(b);
+    let inter = 0;
+    for (const t of A) if (B.has(t)) inter++;
+    const union = A.size + B.size - inter;
+    return union ? inter / union : 0;
+}
+
+/** Same normalized key, different value → exact conflict pairs. */
+function findKeyConflicts(databases) {
+    const byKey = new Map();
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (fact.active === false || !fact.key) continue;
+            const nk = String(fact.key).toLowerCase().replace(/[^a-z0-9_]/g, '_');
+            if (!byKey.has(nk)) byKey.set(nk, []);
+            byKey.get(nk).push({ category, fact });
+        }
+    }
+    const pairs = [];
+    for (const entries of byKey.values()) {
+        if (entries.length < 2) continue;
+        for (let i = 0; i < entries.length; i++) {
+            for (let j = i + 1; j < entries.length; j++) {
+                const va = String(entries[i].fact.value || '').toLowerCase().trim();
+                const vb = String(entries[j].fact.value || '').toLowerCase().trim();
+                if (va && vb && va !== vb) pairs.push({ a: entries[i], b: entries[j] });
+                if (pairs.length >= MAX_CONFLICT_PAIRS) return pairs;
+            }
+        }
+    }
+    return pairs;
+}
+
+/** Near (not identical) keys with different values → possible parallel-key contradiction. */
+function findNearKeyConflicts(databases, threshold = NEAR_KEY_THRESHOLD) {
+    const all = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (fact.active === false || !fact.key) continue;
+            all.push({ category, fact });
+        }
+    }
+    const pairs = [];
+    for (let i = 0; i < all.length && pairs.length < MAX_CONFLICT_PAIRS; i++) {
+        for (let j = i + 1; j < all.length && pairs.length < MAX_CONFLICT_PAIRS; j++) {
+            const sim = keyJaccard(all[i].fact.key, all[j].fact.key);
+            if (sim < threshold || sim >= 1.0) continue;
+            const va = String(all[i].fact.value || '').toLowerCase().trim();
+            const vb = String(all[j].fact.value || '').toLowerCase().trim();
+            if (!va || !vb || va === vb) continue;
+            pairs.push({ a: all[i], b: all[j] });
+        }
+    }
+    return pairs;
+}
 import { addDebugLog, setReflection, getSummaryPyramid, setSummaryPyramid } from './settings.js';
 import { callAgentLLM } from './llm-call.js';
 import * as host from './host.js';
@@ -489,6 +553,46 @@ export async function runReflection({ runId = '', scene = null, prevReflection =
             }
         }
         if (totalMerged > 0) addDebugLog('pass', `[${runId}] Dedupe-janitor merged ${totalMerged} duplicate fact(s) total`);
+
+        // CONTRADICTION SCAN (atomic #7). Heuristic, no LLM call. Every N reflection passes,
+        // flag same-key / near-key facts with differing values into the review popup as
+        // read-only CONFLICT items. Runs AFTER dedupe, so what it surfaces is a genuine semantic
+        // conflict the normalized-key merge didn't catch.
+        try {
+            const cfgScan = host.getExtensionSettings();
+            if (cfgScan?.contradictionScanEnabled !== false) {
+                const interval = Math.max(1, Number(cfgScan?.contradictionInterval) || 3);
+                const chatMeta = SillyTavern.getContext().chatMetadata;
+                let reflectRuns = 1;
+                if (chatMeta) {
+                    chatMeta.bf_mem_reflect_runs = (chatMeta.bf_mem_reflect_runs || 0) + 1;
+                    reflectRuns = chatMeta.bf_mem_reflect_runs;
+                }
+                if (reflectRuns % interval === 0) {
+                    const seen = new Set();
+                    const pairs = [...findKeyConflicts(databases), ...findNearKeyConflicts(databases)]
+                        .filter(p => {
+                            const id = [`${p.a.category}:${p.a.fact.key}`, `${p.b.category}:${p.b.fact.key}`].sort().join('|');
+                            if (seen.has(id)) return false;
+                            seen.add(id);
+                            return true;
+                        })
+                        .slice(0, MAX_CONFLICT_PAIRS);
+                    for (const p of pairs) {
+                        trackUpdate({
+                            action: 'conflict',
+                            category: p.a.category,
+                            key: p.a.fact.key,
+                            value: `"${p.a.fact.value}"  vs  ${p.b.category}/${p.b.fact.key} = "${p.b.fact.value}"`,
+                            knownBy: p.a.fact.knownBy || [],
+                        });
+                    }
+                    if (pairs.length > 0) addDebugLog('info', `[${runId}] Contradiction scan queued ${pairs.length} conflict(s) for review`);
+                }
+            }
+        } catch (err) {
+            addDebugLog('fail', `[${runId}] Contradiction scan failed (non-fatal): ${err.message || err}`);
+        }
 
         const settings = host.getExtensionSettings();
         const substitute = host.getSubstituteParams();
