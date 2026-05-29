@@ -16,8 +16,11 @@ jQuery(async () => {
 
         // Register the optional Writer recall tool (search_memory) when its setting is on.
         // Default-OFF; idempotent; no-ops if ST's function-tool API is unavailable.
-        const { syncWriterRecallTool } = await import('./src/agent-writer.js');
+        // Also sync the optional Writer WRITE tool (remember_fact) the same way. Default-OFF;
+        // idempotent; no-ops if ST's function-tool API is unavailable.
+        const { syncWriterRecallTool, syncWriterWriteTool } = await import('./src/agent-writer.js');
         syncWriterRecallTool();
+        syncWriterWriteTool();
 
         console.log('[BFMemory] Extension loaded successfully');
     } catch (error) {

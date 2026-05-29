@@ -1072,6 +1072,183 @@ const IDB_STORE = 'character_dbs';
 // can recognize an old on-disk shape. Bump only on a breaking record-shape change.
 const SNAPSHOT_SCHEMA_VERSION = 1;
 
+// =============================================================================
+// USER-LEVEL SHARED MEMORY (opt-in; setting `userLevelMemory`, default OFF).
+// A single GLOBAL store holding facts about the player ({{user}}) so EVERY character remembers
+// them instead of re-learning per character. It is just ANOTHER avatar record in the SAME IDB
+// store + the SAME `bf_memory_db_<category>.json` attachment layer, keyed by this fixed
+// PSEUDO-AVATAR string (never a real character avatar, so it can't collide). All the existing
+// load / save / snapshot / rehydrate machinery is reused unchanged — zero new persistence code,
+// fully durable + device-independent + back-compat. When the setting is OFF this key is NEVER
+// read or written, so storage+retrieval are byte-identical to today.
+//
+// NOTE: attachments are stored under `character_attachments[avatar]`. The shared store's
+// attachment files therefore live under this pseudo-avatar key; SillyTavern treats it as an
+// (orphan) attachment bucket, which is harmless — it is never a selectable character.
+const SHARED_USER_AVATAR = 'bf_shared_user_memory';
+
+/** Is the opt-in user-level shared memory feature ON? Defaults OFF; never throws. */
+function sharedUserMemoryEnabled() {
+    try {
+        return host.getExtensionSettings()?.userLevelMemory === true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Does this fact's SUBJECT resolve to the user persona ({{user}})? Used to decide which facts to
+ * MIRROR into the shared user store. Resolution reuses deriveSubject (explicit `subject` → key
+ * prefix, reserved-token resolution) so a fact filed under the live persona NAME or the generic
+ * `user`/`{{user}}` token both match. Best-effort; returns false on any error or when the persona
+ * name is unknown. Sequence/track facts are excluded — they're chat-local narrative scaffolding,
+ * not portable identity facts about the player.
+ * @param {FactSchema} fact
+ * @returns {boolean}
+ */
+function isUserSubjectFact(fact) {
+    try {
+        if (!fact || isSequenceFact(fact)) return false;
+        const subject = deriveSubject(fact); // lowercased, reserved-token-resolved
+        if (!subject) return false;
+        // Match the resolved live persona name, or the un-resolvable generic placeholders (covers
+        // the unnamed-persona fallback where resolveGenericSubjectToken returns the literal token).
+        if (_RESERVED_USER_SUBJECT.has(subject)) return true;
+        const persona = String(host.getUserPersonaName() || '').trim().toLowerCase();
+        return !!persona && subject === persona;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Read the shared user store's full { category: DatabaseSchema } map. Reuses loadAllDatabases
+ * (IDB-first with attachment rehydrate/fallback) against the pseudo-avatar. Never throws.
+ * @returns {Promise<Object<string, DatabaseSchema>>}
+ */
+async function loadSharedUserDatabases() {
+    try {
+        return await loadAllDatabases(SHARED_USER_AVATAR);
+    } catch (e) {
+        console.error('[BFMemory] shared user store load failed', e);
+        return {};
+    }
+}
+
+/**
+ * Mirror the user-subject facts of ONE just-saved category into the shared user store (read-merge-
+ * write against the pseudo-avatar via the SAME upsert + persistence machinery). Best-effort and
+ * fully isolated: any failure is swallowed so the primary per-character write is never affected.
+ *
+ * IMPORTANT: this routes a COPY into the shared store; the fact ALSO remains in the character store
+ * (the character store stays the source of truth and WINS on read-merge conflicts). We upsert into
+ * a freshly-loaded shared-store category so merges/supersession behave exactly as in a normal save.
+ * @param {DatabaseSchema} charDb - the category db just written for the active character
+ */
+async function mirrorUserFactsToSharedStore(charDb) {
+    if (!charDb || !Array.isArray(charDb.facts) || charDb.facts.length === 0) return;
+    const userFacts = charDb.facts.filter(isUserSubjectFact);
+    if (userFacts.length === 0) return;
+    try {
+        const sharedMap = await loadSharedUserDatabases();
+        const category = charDb.category;
+        const sharedDb = sharedMap[category] && Array.isArray(sharedMap[category].facts)
+            ? sharedMap[category]
+            : { category, facts: [] };
+        let changed = 0;
+        for (const f of userFacts) {
+            // Deep-clone so the shared copy and the character copy never alias the same object
+            // (an in-place merge in one store must not silently mutate the other). Drop the
+            // transient `__sharedOrigin` read-merge tag so it is never persisted into the store.
+            const clone = JSON.parse(JSON.stringify(f));
+            delete clone.__sharedOrigin;
+            upsertFact(sharedDb, clone);
+            changed++;
+        }
+        if (changed === 0) return;
+        await saveSharedUserDatabase(sharedDb);
+        addDebugLog('debug', 'Mirrored user facts into shared user store', {
+            subsystem: 'db', event: 'db.sharedUser.mirror',
+            data: { category, mirrored: changed },
+        });
+    } catch (e) {
+        // Never break the per-character write because the optional shared mirror failed.
+        console.error('[BFMemory] mirrorUserFactsToSharedStore failed', e);
+    }
+}
+
+/**
+ * Persist ONE category db into the shared user store (pseudo-avatar). Mirrors saveDatabase's
+ * hybrid IDB-first / attachment-fallback body but PINNED to SHARED_USER_AVATAR (saveDatabase
+ * itself is hard-wired to getCharacterAvatar()). Applies cold-tiering like the normal path.
+ * Never invalidates the per-character cache (that key is unrelated). Best-effort; throws only to
+ * its caller (mirrorUserFactsToSharedStore), which swallows.
+ * @param {DatabaseSchema} db
+ */
+async function saveSharedUserDatabase(db) {
+    coldTierOverflow(db);
+    if (idbAvailable()) {
+        try {
+            const rec = await idbGetRecord(SHARED_USER_AVATAR);
+            const databases = (rec && rec.databases) ? rec.databases : {};
+            databases[db.category] = db;
+            await idbPutDatabases(SHARED_USER_AVATAR, databases, Date.now());
+            scheduleSnapshot(SHARED_USER_AVATAR);
+            return;
+        } catch (e) {
+            console.error('[BFMemory] shared user IDB save failed; falling back to attachment', e);
+            disableIdb('shared user IDB save failed mid-session');
+        }
+    }
+    await saveDatabaseToAttachment(SHARED_USER_AVATAR, db);
+}
+
+/**
+ * Merge the shared user store into a per-character database map IN A NEW MAP (the input map is
+ * never mutated). Dedupe is by `category:key`: the CHARACTER store ALWAYS WINS on conflict, so a
+ * character that has its own version of a user fact is unaffected; only user facts the character
+ * has NOT seen are added from the shared store. Returns the merged map. Never throws (returns the
+ * original character map on any error).
+ * @param {Object<string, DatabaseSchema>} charMap - the active character's loaded map
+ * @param {Object<string, DatabaseSchema>} sharedMap - the shared user store map
+ * @returns {Object<string, DatabaseSchema>}
+ */
+function mergeSharedUserIntoCharacter(charMap, sharedMap) {
+    try {
+        if (!sharedMap || typeof sharedMap !== 'object') return charMap || {};
+        const out = {};
+        // Start from a shallow-but-array-copied clone of the character map so we never mutate the
+        // cached/shared object reference the rest of the code may still hold.
+        for (const [cat, sdb] of Object.entries(charMap || {})) {
+            out[cat] = sdb ? { ...sdb, facts: Array.isArray(sdb.facts) ? sdb.facts.slice() : [] } : { category: cat, facts: [] };
+        }
+        for (const [cat, sharedDb] of Object.entries(sharedMap)) {
+            const sharedFacts = (sharedDb && Array.isArray(sharedDb.facts)) ? sharedDb.facts : [];
+            if (sharedFacts.length === 0) continue;
+            if (!out[cat]) out[cat] = { category: cat, facts: [] };
+            const have = new Set(out[cat].facts.map(f => String(f && f.key || '')));
+            for (const sf of sharedFacts) {
+                const key = String(sf && sf.key || '');
+                if (!key || have.has(key)) continue; // character store WINS — skip duplicates
+                // Clone so the merged-in shared fact never aliases the shared store's object, and
+                // TAG it with a transient `__sharedOrigin` marker. This fact is shown to retrieval/
+                // the finder/menu like any other, but saveDatabase() STRIPS `__sharedOrigin` facts
+                // before persisting to the CHARACTER store — so the shared store stays the single
+                // source of truth for user facts and they don't get copied into every character's
+                // own store on the next write (which would defeat the dedup + risk divergence).
+                const clone = JSON.parse(JSON.stringify(sf));
+                clone.__sharedOrigin = true;
+                out[cat].facts.push(clone);
+                have.add(key);
+            }
+        }
+        return out;
+    } catch (e) {
+        console.error('[BFMemory] mergeSharedUserIntoCharacter failed', e);
+        return charMap || {};
+    }
+}
+
 // Capability probe result is memoized: 'unknown' until first checked, then true/false.
 let _idbCapable = 'unknown';
 let _idbConnPromise = null; // shared open() promise (one connection for the page lifetime)
@@ -1398,6 +1575,19 @@ export async function flushSnapshotNow({ avatar: pinnedAvatar, reconcileDeletes 
         if (_snapshotTimers.has(avatar)) { clearTimeout(_snapshotTimers.get(avatar)); _snapshotTimers.delete(avatar); }
         _snapshotDirty.add(avatar); // ensure snapshotAvatar runs even if no timer was armed
         await snapshotAvatar(avatar, { reconcileDeletes });
+        // USER-LEVEL SHARED MEMORY (opt-in): the shared user store is a SEPARATE pseudo-avatar
+        // record with its own throttled snapshot timer; the per-character flush above never covers
+        // it. So on every meaningful flush boundary (CHAT_CHANGED / beforeunload / destructive op)
+        // ALSO flush the shared store IFF it has un-snapshotted writes. We pass reconcileDeletes:false
+        // (the conservative stance) so a transiently-empty shared store can't prune durable backups.
+        // No-op when the feature is OFF or nothing was mirrored (dirty set empty). Self-guarded.
+        if (sharedUserMemoryEnabled() && _snapshotDirty.has(SHARED_USER_AVATAR)) {
+            if (_snapshotTimers.has(SHARED_USER_AVATAR)) {
+                clearTimeout(_snapshotTimers.get(SHARED_USER_AVATAR));
+                _snapshotTimers.delete(SHARED_USER_AVATAR);
+            }
+            await snapshotAvatar(SHARED_USER_AVATAR, { reconcileDeletes: false });
+        }
     } catch (e) {
         console.error('[BFMemory] flushSnapshotNow failed', e);
     }
@@ -1468,7 +1658,21 @@ export async function getAllDatabases() {
     _dbCacheChatId = chatId;
     _dbCachePromise = (async () => {
         try {
-            const result = await loadAllDatabases(avatar);
+            let result = await loadAllDatabases(avatar);
+            // USER-LEVEL SHARED MEMORY (opt-in): merge the global shared user store ON TOP of this
+            // character's map so the player's facts surface for EVERY character. Dedupe is by
+            // category:key with the CHARACTER store winning (a character's own version is untouched).
+            // Self-guarded: any failure falls back to the un-merged character map (today's behavior).
+            // The merged result is what gets cached/served, and the cache invalidates on every write,
+            // so a freshly-mirrored user fact is visible on the next read.
+            if (sharedUserMemoryEnabled()) {
+                try {
+                    const sharedMap = await loadSharedUserDatabases();
+                    result = mergeSharedUserIntoCharacter(result, sharedMap);
+                } catch (e) {
+                    console.error('[BFMemory] shared user merge failed; serving character map only', e);
+                }
+            }
             // Only commit to the cache if neither the avatar NOR the chatId changed under us mid-load
             // and the cache wasn't invalidated (a write/switch during the fetch nulls the keys). This
             // stops a load started under chat A from committing under chat B (same character).
@@ -2295,6 +2499,20 @@ export async function saveDatabase(db) {
     // concurrent read mid-upload can't latch onto a now-stale snapshot.
     invalidateDatabaseCache();
 
+    // USER-LEVEL SHARED MEMORY (opt-in): when ON, getAllDatabases() merges shared-store user facts
+    // into the character map TAGGED with a transient `__sharedOrigin`. Those copies must NOT be
+    // persisted into the CHARACTER store (the shared store is the single source of truth for user
+    // facts; copying them per-character would defeat the dedup + risk divergence). So before writing
+    // we STRIP them, persisting only the character's OWN facts. The mirror below still routes the
+    // character's user-subject facts back into the shared store. `mirrorSource` keeps the FULL
+    // (pre-strip) fact list so an updated shared-origin user fact still reaches the shared store.
+    // When the feature is OFF nothing is ever tagged, so this is a no-op and behavior is unchanged.
+    let mirrorSource = db;
+    if (sharedUserMemoryEnabled() && Array.isArray(db.facts) && db.facts.some(f => f && f.__sharedOrigin)) {
+        mirrorSource = db; // mirror considers the full set (incl. updated shared-origin user facts)
+        db = { ...db, facts: db.facts.filter(f => !(f && f.__sharedOrigin)) };
+    }
+
     // INFINITE FACTS — RANK, NEVER EVICT. We do NOT delete facts when a category grows. Instead,
     // when the ACTIVE hot working set overflows HOT_SET_SIZE, the lowest-salience overflow is
     // COLD-TIERED (cold:true) — kept on disk (IDB + snapshot), still queryable, just deprioritized
@@ -2318,6 +2536,12 @@ export async function saveDatabase(db) {
             await idbPutDatabases(avatar, databases, Date.now());
             // Mark dirty + arm the throttled durable snapshot to attachments.
             scheduleSnapshot(avatar);
+            // USER-LEVEL SHARED MEMORY (opt-in): ALSO mirror this category's user-subject facts into
+            // the global shared store so every character remembers them. Awaited but self-guarded —
+            // a failed mirror never affects the primary per-character write above (already done).
+            // Mirror from `mirrorSource` (the pre-strip full set) so an updated shared-origin user
+            // fact still reaches the shared store even though it was stripped from the char write.
+            if (sharedUserMemoryEnabled()) await mirrorUserFactsToSharedStore(mirrorSource);
             return;
         } catch (e) {
             // IDB write failed mid-session → disable IDB and fall back to attachment-only for the
@@ -2329,6 +2553,9 @@ export async function saveDatabase(db) {
 
     // FALLBACK / attachment-only path (also the original behavior): upload synchronously.
     await saveDatabaseToAttachment(avatar, db);
+    // Mirror into the shared user store on the fallback path too (opt-in, self-guarded). Uses the
+    // pre-strip full set (mirrorSource) so updated shared-origin user facts still reach the store.
+    if (sharedUserMemoryEnabled()) await mirrorUserFactsToSharedStore(mirrorSource);
 }
 
 /**
@@ -2475,10 +2702,17 @@ function mergeProvenance(existing, incoming, now) {
         history.push({ src: prevSource, at: existing.lastUpdated || now });
         if (history.length > MAX_SOURCE_HISTORY) history.splice(0, history.length - MAX_SOURCE_HISTORY);
     }
+    // Bi-temporal (feature): story-world `validFrom` is a GENESIS stamp (when the fact became true
+    // in-story) — keep first-wins like `validAt` so a re-mention can't move the established start.
+    // `validUntil` (when it stopped being true) is intentionally NOT pinned here: it can legitimately
+    // be set/updated later (e.g. a fact later marked as ended), so it flows through from `...fact`.
+    // Both are only present when the bi-temporal feature wrote them, so this is a no-op otherwise.
+    const genesisValidFrom = (existing.validFrom !== undefined) ? existing.validFrom : incoming.validFrom;
     return {
         source: genesisSource,
         validAt: genesisValidAt,
         learnedAt,
+        ...(genesisValidFrom !== undefined ? { validFrom: genesisValidFrom } : {}),
         ...(history.length ? { sourceHistory: history } : {}),
     };
 }
@@ -2656,6 +2890,19 @@ export function upsertFact(db, fact) {
                 supersededAt: now,
                 supersededBy: existing.key, // in-place: canonical key is unchanged
             };
+            // BI-TEMPORAL (feature, opt-in): when story-world validity is being tracked, close the
+            // OUTGOING (now-inactive) fact's story-world window — stamp its `validUntil` with the
+            // INCOMING fact's `validFrom` (the moment the new truth begins), falling back to the
+            // current wall-clock time if the writer gave no `from:`. Only do this when the feature
+            // is enabled AND the snapshot doesn't already carry a `validUntil` (don't overwrite an
+            // explicit end the writer set). `supersededAt` already records the RECORD-time end; this
+            // adds the distinct STORY-WORLD end so flashbacks/time-skips stay consistent. Wrapped in
+            // try/catch + a default-off settings read so the hot supersession path never breaks.
+            try {
+                if (host.getExtensionSettings()?.biTemporal === true && !snapshot.validUntil) {
+                    snapshot.validUntil = fact.validFrom || new Date(now).toISOString();
+                }
+            } catch { /* settings unavailable — leave the snapshot's story-world window open */ }
             // Drop any prior superseded snapshot of this same logical key (keep just one).
             const normCanon = normalizeFactKey(existing.key);
             db.facts = db.facts.filter(f =>
@@ -4219,7 +4466,18 @@ export async function deleteDebugLogFile(chatId) {
  *   Absent on older facts (backward-compatible).
  * @property {number} [validAt] - OPTIONAL provenance: the source message index (or ms time)
  *   at which the fact became true. Defaults to the source message index at write time.
- *   Absent on older facts (backward-compatible).
+ *   Absent on older facts (backward-compatible). NOTE: this is an ORDERING integer, DISTINCT from
+ *   the bi-temporal story-world `validFrom`/`validUntil` strings below.
+ * @property {string} [validFrom] - OPTIONAL bi-temporal validity (opt-in `biTemporal` feature):
+ *   WHEN the fact is true in the STORY WORLD (free-form: an in-story date, an age, a labelled era),
+ *   distinct from when it was recorded — so flashbacks/time-skips stay consistent (cf. Graphiti/Zep
+ *   valid_at). Emitted by Agent 3 via the `from:` marker; FIRST-WINS at merge (mirrors validAt).
+ *   Absent unless the feature is enabled and the writer supplied it (backward-compatible).
+ * @property {string} [validUntil] - OPTIONAL bi-temporal validity (opt-in `biTemporal` feature):
+ *   WHEN the fact stopped being true in the STORY WORLD (free-form), e.g. a past job or former home
+ *   (cf. Graphiti/Zep invalid_at). Emitted via the `until:` marker; ALSO auto-stamped on the OUTGOING
+ *   snapshot at supersession (the incoming fact's `validFrom`, else current time) when not already
+ *   set. DISTINCT from `supersededAt` (the RECORD-time end). Absent on older facts (back-compatible).
  * @property {number} [sceneNo] - OPTIONAL scene strand (Spiderweb 2): the monotonic scene NUMBER
  *   the fact was ESTABLISHED in (origin). Stamped at write from the current scene card; FIRST-WINS
  *   (a re-mention never moves it — mirrors validAt). The supersession path is the one exception:

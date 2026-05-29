@@ -197,6 +197,11 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <span>Let the Writer search memory on demand (search_memory tool)</span>
                         </label>
                         <small class="bf-mem-hint">Off by default. When on, registers an optional <code>search_memory</code> tool the Writer can call mid-reply to pull a stored fact that wasn't already injected (read-only — never writes). Requires a tool-calling-capable main model; only active on the main generation path.</small>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_write_tool_enabled" />
+                            <span>Let the Writer pin a fact on demand (remember_fact tool)</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, registers an optional <code>remember_fact</code> tool the Writer can call mid-reply to PIN one durable fact directly into memory (add-only — never deletes; routes through the same write path as extraction). Requires a tool-calling-capable main model; only active on the main generation path.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -227,6 +232,54 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <span>Auto-connect a new fact to related existing facts</span>
                         </label>
                         <small class="bf-mem-hint">On by default. When a fact is written, it is automatically linked to related existing facts — same subject, shared location/participants, or strong word overlap — so asking about any one surfaces the others. Fully deterministic and free (no LLM call). Links are added to the fact's relationship list (capped, never overwriting existing links).</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-wand-magic-sparkles"></i> Retrieval &amp; extraction enhancements</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_mmr_enabled" />
+                            <span>Diversify injected facts (MMR)</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. When choosing which overflow facts to inject, avoids stacking several near-duplicates — it balances importance against being different from what's already chosen, so the same token budget covers more ground. Deterministic (stable across swipes/regens). Turn off for pure importance/recency order.</small>
+                        <div class="bf-mem-field">
+                            <label>MMR balance (relevance ↔ diversity) <span class="bf-mem-val" id="bf_mem_mmr_lambda_val">0.70</span></label>
+                            <input type="range" id="bf_mem_mmr_lambda" min="0" max="100" step="5" value="70" />
+                        </div>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_confidence_ranking" />
+                            <span>Rank uncertain facts lower</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Facts the Scribe marked low/medium confidence lose ground to solid facts when competing for scarce injection slots. Never affects a direct/exact match — only the ranking of overflow candidates. Turn off to ignore confidence in ranking.</small>
+                        <div class="bf-mem-field">
+                            <label>Confidence weight <span class="bf-mem-val" id="bf_mem_confidence_weight_val">0.30</span></label>
+                            <input type="range" id="bf_mem_confidence_weight" min="0" max="100" step="5" value="30" />
+                        </div>
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_temporal_grounding" />
+                            <span>Ground relative dates at extraction</span>
+                        </label>
+                        <small class="bf-mem-hint">On by default. Tells the Scribe to convert "yesterday"/"last week" into absolute dates (relative to when the message was sent) so time references still make sense much later. The message's send-time is shown to the Scribe in its data block, not baked into the cacheable system prompt.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-clock-rotate-left"></i> Bi-temporal fact validity</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_bitemporal_enabled" />
+                            <span>Track when a fact is true in the story world</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, the Scribe may tag a fact with story-world validity — <code>| from:&lt;when&gt;</code> and <code>| until:&lt;when&gt;</code> (a free-form in-story date, age, or era) — recorded separately from when the fact was learned. When a state fact changes, the old value's story-world window is closed automatically. Keeps flashbacks and time-skips consistent. Purely additive: facts written without it are unaffected.</small>
+                    </div>
+                </div>
+                <div class="bf-mem-section">
+                    <div class="bf-mem-section-header"><i class="fa-solid fa-user-group"></i> User-level shared memory</div>
+                    <div class="bf-mem-section-body">
+                        <label class="checkbox_label">
+                            <input type="checkbox" id="bf_mem_user_level_memory" />
+                            <span>Share facts about you across every character</span>
+                        </label>
+                        <small class="bf-mem-hint">Off by default. When on, facts whose subject is <strong>you</strong> (your persona / {{user}}) are also saved into one shared global store, and merged into every character's memory on read — so each character remembers the player without re-learning. Your character's own version of a fact always wins on conflict. Purely additive: when off, storage and retrieval are unchanged.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
@@ -363,6 +416,11 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <input type="range" id="bf_mem_charcheck_interval" min="2" max="50" step="1" value="10" />
                             <small class="bf-mem-hint">Successful pipeline runs between detection checks. Higher = less frequent prompting.</small>
                         </div>
+                        <label class="checkbox_label" style="margin-top:8px;">
+                            <input type="checkbox" id="bf_mem_entity_resolution" />
+                            <span>Merge entity name variants (experimental)</span>
+                        </label>
+                        <small class="bf-mem-hint">CONSERVATIVE, deterministic (no LLM call): merges facts recorded under variant names for the same entity (e.g. "Bobby"/"Robert"/"Rob") into one canonical subject, re-keying the loser's facts and keeping the old name as a searchable alias. Merges ONLY on a strong signal (exact alias match, or very high name similarity), never touches you or the active character, and logs every merge. <b>Default OFF</b> — false merges are the main risk. Runs on the Check Interval above.</small>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Known Characters (live)</label>
                             <div id="bf_mem_charreg_list" class="bf-mem-fact-list">
@@ -371,6 +429,9 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <div class="bf-mem-db-actions" style="margin-top:6px;">
                                 <button id="bf_mem_charreg_scan" class="menu_button" title="Scan the fact store now and prompt for any new names">
                                     <i class="fa-solid fa-magnifying-glass"></i> Scan now
+                                </button>
+                                <button id="bf_mem_entity_merge_now" class="menu_button" title="Run the conservative entity-merge pass now (requires the toggle above)">
+                                    <i class="fa-solid fa-code-merge"></i> Merge variants now
                                 </button>
                             </div>
                         </div>
@@ -388,6 +449,16 @@ Extract facts from EITHER message. Now output ONLY #MEM and #WHY sections.</pre>
                             <label>Re-evaluation Interval <span class="bf-mem-val" id="bf_mem_reflection_interval_val">12</span></label>
                             <input type="range" id="bf_mem_reflection_interval" min="4" max="100" step="1" value="12" />
                             <small class="bf-mem-hint">Successful pipeline runs between reflection passes. Higher = cheaper, less frequent maintenance.</small>
+                        </div>
+                        <label class="checkbox_label" style="margin-top:8px;">
+                            <input type="checkbox" id="bf_mem_idle_consolidation" />
+                            <span>Also consolidate after idle time</span>
+                        </label>
+                        <small class="bf-mem-hint">In ADDITION to the turn-based cadence above, run the same reflection/dedupe pass once you have been idle (no new messages) for the delay below. Lets heavy maintenance happen during quiet time. Never runs during generation; shares all the safety guards of the periodic pass. OFF by default.</small>
+                        <div class="bf-mem-field" style="margin-top:8px;">
+                            <label>Idle delay (seconds) <span class="bf-mem-val" id="bf_mem_idle_consolidation_ms_val">120</span></label>
+                            <input type="range" id="bf_mem_idle_consolidation_ms" min="30" max="1800" step="10" value="120" />
+                            <small class="bf-mem-hint">Quiet time before the idle consolidation fires. Range 30s–30min.</small>
                         </div>
                         <div class="bf-mem-field" style="margin-top:8px;">
                             <label>Current Reflection (live)</label>

@@ -9,7 +9,7 @@ import { DEFAULT_WRITER_FORMAT } from './agent-writer.js';
 import { DEFAULT_REFLECT_PROMPT } from './agent-reflect.js';
 import {
     getEntities, setEntityStatus, reloadEntitiesFromChat,
-    scanForNamedCandidates, showEntityPopup, promoteEntity,
+    scanForNamedCandidates, showEntityPopup, promoteEntity, runEntityResolution,
 } from './agent-entities.js';
 import { explainFactRetrieval } from './fact-retrieval.js';
 
@@ -121,6 +121,21 @@ const DEFAULT_SETTINGS = {
     // message in the extraction window is trivially empty (pure asterisk actions, OOC, or very
     // short) per isTriviallyEmptyForExtraction. Saves a wasted call + tokens on no-content turns.
     agent3EmptyScopeSkip: true,
+    // Temporal grounding at extraction (atomic, from mem0 'Observation Date'): pass the message's
+    // real-world observation timestamp into the Scribe and instruct it to convert relative time
+    // words ("yesterday","last week") into ABSOLUTE dates anchored to that timestamp, so stored
+    // facts don't rot. Default ON. The date goes in the USER prompt block (system prefix stays
+    // cache-stable); the resolution rule is appended to the system prompt only while this is on.
+    temporalGrounding: true,
+    // BI-TEMPORAL FACT VALIDITY (Graphiti/Zep valid_at/invalid_at). Default OFF. When ON, the
+    // Scribe may tag a fact with story-world validity markers `| from:<when>` / `| until:<when>`
+    // (free-form in-story time), parsed in agent-memory.js into the DISTINCT `validFrom`/`validUntil`
+    // fields (NOT the existing `validAt` ordering integer). On supersession the OUTGOING fact's
+    // `validUntil` is stamped, and the recall/push formatter annotates facts that carry a window —
+    // so flashbacks/time-skips stay consistent. Purely additive + back-compat: when OFF the markers
+    // are ignored, no fields are written, and output is byte-for-byte unchanged. Absent (older
+    // settings) → default false.
+    biTemporal: false,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -134,6 +149,13 @@ const DEFAULT_SETTINGS = {
     // only active on the main generation path (ST's tool loop never runs on the quiet/agent
     // paths). READ-ONLY: the tool never writes or deletes.
     enableWriterRecallTool: false,
+    // Optional WRITE tool (`remember_fact`, Letta core_memory_append analogue): lets the MAIN model
+    // PIN one fact directly into the active store mid-reply via an ST function-tool, complementing
+    // the read-only search_memory pull tool above. ADD-ONLY (never deletes); routes through the same
+    // upsertFact/saveDatabase path as extraction. Default OFF — opt-in, and requires a tool-calling
+    // main model (ST's tool loop never runs on the quiet/agent paths). Synced alongside the recall
+    // tool wherever syncWriterRecallTool is synced (index.js init + settings toggle).
+    enableWriterWriteTool: false,
     // Summary pyramid — optional "Big Picture" injection (hierarchical zoom-out). When ON, the
     // Writer gets a compact block = the rolling reflection story summary + the SHORT shelf
     // (category/aspect-bucket) summaries relevant to the current scene focus, hard token-capped.
@@ -178,6 +200,26 @@ const DEFAULT_SETTINGS = {
     // than N days ago are dropped from retrieval. Primary picks + legacy un-stamped facts are
     // never cut. Clamp 0..3650.
     recencyCutoffDays: 0,
+    // MMR DIVERSITY RERANK (Graphiti/Zep maximal_marginal_relevance). Default ON. When admitting
+    // secondary+tertiary overflow under the count/token caps, pure-salience ordering can let
+    // several NEAR-DUPLICATE facts all get injected, wasting scarce slots. MMR reorders the
+    // overflow candidates so each pick balances salience against being DIFFERENT from the
+    // already-chosen set: score = lambda*normSalience - (1-lambda)*maxTrigramSim(c, chosen).
+    // Uses the existing deterministic trigramSimilarity (no embeddings, no PRNG → swipe/regen
+    // stable). Primary facts are untouched/always kept. mmrLambda: 1.0 = pure salience (no
+    // diversity), 0.0 = pure diversity; 0.7 leans on salience while breaking up duplicates.
+    mmrEnabled: true,
+    mmrLambda: 0.7,
+    // CONFIDENCE-GATED RETRIEVAL (Zep minRating + mem0 confidence). Facts may carry a
+    // `confidence` field ('high'|'med'|'low' or a 0..1 number; parsed in agent-memory.js from the
+    // `conf:` marker). When ON, that confidence folds into the OVERFLOW ranking (retrievalSalience)
+    // as a bounded multiplier so low-confidence guesses lose scarce secondary/tertiary slots to
+    // solid facts. Primary/exact/keyword matches are NEVER gated — they're always kept. Default ON.
+    confidenceRanking: true,
+    // How strongly confidence bends the overflow score. The multiplier is blended toward 1.0 by
+    // (1 - confidenceWeight), so a small weight nudges ordering without ever zeroing a fact out:
+    // effectiveMult = 1 - confidenceWeight * (1 - confidenceFactor). Clamp 0..1; small default.
+    confidenceWeight: 0.3,
     // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
     // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
     rebuildConcurrency: 3,
@@ -223,6 +265,13 @@ const DEFAULT_SETTINGS = {
     // ON but with a conservative interval. Absent (older settings) → defaults apply.
     reflectionEnabled: true,
     reflectionInterval: 12,
+    // IDLE-TIME CONSOLIDATION (Letta sleeptime-agent pattern). In ADDITION to the every-N-turns
+    // cadence above, arm an idle timer that runs the SAME maybeRunReflection() pass once the user
+    // has been quiet for idleConsolidationMs. Lets heavy maintenance happen during dead time
+    // instead of always on the turn boundary. OFF by default (opt-in); shares every reflection
+    // guard (enabled, in-flight, group, character-changed) and never fires during generation.
+    idleConsolidation: false,
+    idleConsolidationMs: 120000,
     // DEPRECATED (refinement #1): the reflection "story so far" summary is NO LONGER
     // injected into the writer prompt under any circumstance. This key is retained inert
     // for back-compat (default now FALSE) so old saved settings don't error. Reflection
@@ -238,6 +287,17 @@ const DEFAULT_SETTINGS = {
     // reflection. Absent (older settings) → defaults apply (back-compatible).
     characterRegistryEnabled: true,
     characterCheckInterval: 10,
+    // SEMANTIC ENTITY RESOLUTION / MERGE (Graphiti node-dedup + mem0 entity-linking). When ON,
+    // a CONSERVATIVE pass (run from the same OFF-critical-path entity-check cadence) merges
+    // facts recorded under variant names for the SAME entity ("Bobby"/"Robert"/"Rob") into one
+    // canonical subject, re-keying the loser's facts (reusing the promoteEntity re-key/collision
+    // machinery) and recording an alias. Merge requires a STRONG signal only — exact alias/aka
+    // match OR trigram name-similarity >= entityResolutionThreshold (default 0.85) AND the two
+    // are NOT both already classified as distinct 'named' entities. Never merges {{user}}/{{char}}
+    // /the active character. False merges are the main risk, so this is DEFAULT OFF and logs every
+    // merge loudly. Deterministic (NO LLM call). Absent (older settings) → defaults apply.
+    entityResolution: false,
+    entityResolutionThreshold: 0.85,
     // Two-stage retrieval: STAGE 2 detail finder (Agent 4). When true (default), after
     // Agent 1 picks #Branches from the menu, Agent 4 reads the full facts under those
     // branches (+ all Unsorted) and chooses the relevant subset for injection. When false
@@ -256,6 +316,15 @@ const DEFAULT_SETTINGS = {
     // per present character to always inject alongside the finder's picks, so the in-focus
     // character's anchors surface even if the finder misses them. 0 disables.
     finderAnchorsPerCharacter: 3,
+    // USER-LEVEL SHARED MEMORY (Zep/mem0 user-scoping). Default OFF. When ON, facts whose SUBJECT
+    // resolves to the user persona ({{user}}) are ALSO routed into a single shared, durable
+    // "global user" store (a fixed pseudo-avatar record reusing the same IDB+attachment layer), and
+    // on read that shared store is MERGED into the active character's fact map (dedupe by
+    // category:key, the active character's own fact WINS on conflict). So the player's facts are
+    // remembered by EVERY character instead of being re-learned per character. Purely additive +
+    // back-compat: when OFF, storage AND retrieval are byte-identical to today (no shared store is
+    // ever read or written). Absent (older settings) => default false.
+    userLevelMemory: false,
     // Optional system-prompt override for Agent 4. Empty => DEFAULT_FINDER_PROMPT.
     finderPrompt: '',
     draftPrompt: '',
@@ -322,6 +391,12 @@ function validateSettings(s) {
     s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
     s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));
+    // MMR diversity rerank (default ON): boolean toggle + 0..1 lambda (salience vs diversity tradeoff).
+    if (typeof s.mmrEnabled !== 'boolean') s.mmrEnabled = true;
+    s.mmrLambda = clamp(s.mmrLambda, 0, 1, 0.7);
+    // Confidence-gated retrieval (default ON): boolean toggle + small 0..1 blend weight.
+    if (typeof s.confidenceRanking !== 'boolean') s.confidenceRanking = true;
+    s.confidenceWeight = clamp(s.confidenceWeight, 0, 1, 0.3);
     s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
     s.semanticThreshold = clamp(s.semanticThreshold, 0.1, 0.99, 0.75);
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
@@ -344,12 +419,23 @@ function validateSettings(s) {
     s.reflectionInterval = Math.floor(clamp(s.reflectionInterval, 4, 100, 12));
     s.reflectionMaxTokens = Math.floor(clamp(s.reflectionMaxTokens, 50, 500, 200));
     if (typeof s.reflectionEnabled !== 'boolean') s.reflectionEnabled = true;
+    // Idle-time consolidation: opt-in toggle + idle delay. Delay clamped to a sane floor (30s,
+    // so it can't thrash) and ceiling (30min) with the 2-minute default as fallback.
+    if (typeof s.idleConsolidation !== 'boolean') s.idleConsolidation = false;
+    s.idleConsolidationMs = Math.floor(clamp(s.idleConsolidationMs, 30000, 1800000, 120000));
     if (typeof s.reflectionInject !== 'boolean')  s.reflectionInject = false; // inert (refinement #1)
     if (typeof s.reflectionPrompt !== 'string')   s.reflectionPrompt = '';
     // Character registry: enable toggle + check interval (clamped 2..50 so it can't fire every
     // turn nor be set absurdly high). Defaults: enabled true, interval 10.
     if (typeof s.characterRegistryEnabled !== 'boolean') s.characterRegistryEnabled = true;
     s.characterCheckInterval = Math.floor(clamp(s.characterCheckInterval, 2, 50, 10));
+    // Semantic entity resolution/merge: DEFAULT OFF (false-merge risk). Threshold clamped to a
+    // high, conservative band [0.80..0.99] so it can't be loosened into noise; default 0.85.
+    if (typeof s.entityResolution !== 'boolean') s.entityResolution = false;
+    s.entityResolutionThreshold = clamp(s.entityResolutionThreshold, 0.80, 0.99, 0.85);
+    // User-level shared memory: DEFAULT OFF (largest behavior change; opt-in only). When false,
+    // the shared store is never touched, so storage+retrieval are byte-identical to today.
+    if (typeof s.userLevelMemory !== 'boolean') s.userLevelMemory = false;
     if (typeof s.useMemoryProfile !== 'boolean') s.useMemoryProfile = true;
     if (typeof s.showToast !== 'boolean')        s.showToast = true;
     if (typeof s.debugMode !== 'boolean')        s.debugMode = false;
@@ -369,7 +455,12 @@ function validateSettings(s) {
     s.finderTargetFacts = Math.floor(clamp(s.finderTargetFacts, 0, 30, 12));
     s.finderAnchorsPerCharacter = Math.floor(clamp(s.finderAnchorsPerCharacter, 0, 8, 3));
     if (typeof s.enableWriterRecallTool !== 'boolean') s.enableWriterRecallTool = false;
+    if (typeof s.enableWriterWriteTool !== 'boolean') s.enableWriterWriteTool = false;
     if (typeof s.enableSummaryPyramid !== 'boolean') s.enableSummaryPyramid = false;
+    // Temporal grounding defaults ON (free, deterministic): absent/invalid => true (back-compat).
+    if (typeof s.temporalGrounding !== 'boolean') s.temporalGrounding = true;
+    // Bi-temporal fact validity (opt-in) — default OFF; absent (older settings) => false (back-compat).
+    if (typeof s.biTemporal !== 'boolean') s.biTemporal = false;
     // Moment echo (Resonance Part B) — default OFF; absent (older settings) => false (back-compat).
     if (typeof s.enableMomentEcho !== 'boolean') s.enableMomentEcho = false;
     s.momentEchoMaxTokens = Math.floor(clamp(s.momentEchoMaxTokens, 12, 120, 40));
@@ -3082,7 +3173,17 @@ export async function saveCurrentToActiveProfile(profileKey = null, { allowEmpty
     }
     try {
         const { getAllDatabases } = await import('./database.js');
-        const databases = await getAllDatabases();
+        const databasesRaw = await getAllDatabases();
+        // USER-LEVEL SHARED MEMORY: getAllDatabases() may merge shared-store user facts (tagged with
+        // a transient `__sharedOrigin`) into the character map when the feature is ON. A DB PROFILE
+        // is the CHARACTER's own snapshot — it must NOT bake in shared-store copies (they'd be
+        // written back per-character on profile load, defeating the dedup + risking divergence). So
+        // strip `__sharedOrigin` facts here. No-op when the feature is off (nothing is ever tagged).
+        const databases = {};
+        for (const [cat, sdb] of Object.entries(databasesRaw || {})) {
+            const facts = Array.isArray(sdb?.facts) ? sdb.facts.filter(f => !(f && f.__sharedOrigin)) : [];
+            databases[cat] = sdb ? { ...sdb, facts } : { category: cat, facts };
+        }
         const totalFacts = Object.values(databases).reduce((sum, db) => sum + db.facts.length, 0);
         // Empty-store guard: by default an empty map is treated as "nothing to save" so a transient
         // load failure can't wipe a populated profile. An explicit clear/delete passes allowEmpty so
@@ -3976,6 +4077,18 @@ export async function initSettings() {
         import('./agent-writer.js').then(m => m.syncWriterRecallTool?.()).catch(() => {});
     });
 
+    // Writer WRITE tool toggle (remember_fact / model-writable pin). Default OFF. Toggling it
+    // register/unregisters the optional remember_fact function-tool via syncWriterWriteTool().
+    $('#bf_mem_write_tool_enabled').prop('checked', extensionSettings.enableWriterWriteTool === true).on('change', function () {
+        const before = extensionSettings.enableWriterWriteTool === true;
+        const next = $(this).prop('checked');
+        extensionSettings.enableWriterWriteTool = next;
+        addDebugLog('info', `Writer write tool ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableWriterWriteTool' }, before, after: !!next });
+        saveSettings();
+        // Re-sync registration to the new state (cycle-safe lazy import).
+        import('./agent-writer.js').then(m => m.syncWriterWriteTool?.()).catch(() => {});
+    });
+
     // Summary pyramid "Big Picture" injection toggle. Default OFF. Gates ONLY whether the
     // story+shelf summaries are injected into the Writer's context — shelf summaries are
     // still generated on the reflection cadence regardless. No registration side-effect.
@@ -4006,6 +4119,82 @@ export async function initSettings() {
         const next = $(this).prop('checked');
         extensionSettings.enableAutoLinking = next;
         addDebugLog('info', `Automatic associative linking ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'enableAutoLinking' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // Bi-temporal fact validity toggle (Graphiti/Zep valid_at/invalid_at). DEFAULT OFF, so the
+    // checkbox reflects `=== true`. Gates story-world `from:`/`until:` marker parsing (agent-memory),
+    // the supersession `validUntil` stamp (database), and the formatter annotation (fact-retrieval).
+    $('#bf_mem_bitemporal_enabled').prop('checked', extensionSettings.biTemporal === true).on('change', function () {
+        const before = extensionSettings.biTemporal === true;
+        const next = $(this).prop('checked');
+        extensionSettings.biTemporal = next;
+        addDebugLog('info', `Bi-temporal fact validity ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'biTemporal' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // User-level shared memory (opt-in, default OFF). Gates routing user-subject facts into the
+    // shared global store on write (database.saveDatabase) and merging that store into every
+    // character's map on read (database.getAllDatabases). When off, storage+retrieval are unchanged.
+    $('#bf_mem_user_level_memory').prop('checked', extensionSettings.userLevelMemory === true).on('change', function () {
+        const before = extensionSettings.userLevelMemory === true;
+        const next = $(this).prop('checked');
+        extensionSettings.userLevelMemory = next;
+        addDebugLog('info', `User-level shared memory ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'userLevelMemory' }, before, after: !!next });
+        saveSettings();
+    });
+
+    // RETRIEVAL/EXTRACTION ENHANCEMENTS (all DEFAULT ON — checkbox reflects `!== false` so a
+    // legacy settings blob without the key still shows enabled, matching the registered default).
+
+    // MMR diversity rerank (fact-retrieval). Off = pure salience order for overflow facts.
+    $('#bf_mem_mmr_enabled').prop('checked', extensionSettings.mmrEnabled !== false).on('change', function () {
+        const before = extensionSettings.mmrEnabled !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.mmrEnabled = next;
+        addDebugLog('info', `MMR diversity rerank ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'mmrEnabled' }, before, after: !!next });
+        saveSettings();
+    });
+    // MMR lambda slider (stored 0..1; UI shows 0..100). Higher favors relevance; lower favors diversity.
+    {
+        const lam = (typeof extensionSettings.mmrLambda === 'number') ? extensionSettings.mmrLambda : 0.7;
+        $('#bf_mem_mmr_lambda').val(Math.round(lam * 100));
+        $('#bf_mem_mmr_lambda_val').text(lam.toFixed(2));
+        $('#bf_mem_mmr_lambda').on('input', function () {
+            const v = Math.min(1, Math.max(0, parseInt($(this).val(), 10) / 100));
+            extensionSettings.mmrLambda = v;
+            $('#bf_mem_mmr_lambda_val').text(v.toFixed(2));
+            saveSettings();
+        });
+    }
+
+    // Confidence-gated ranking (fact-retrieval). Off = ignore stored confidence in overflow ranking.
+    $('#bf_mem_confidence_ranking').prop('checked', extensionSettings.confidenceRanking !== false).on('change', function () {
+        const before = extensionSettings.confidenceRanking !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.confidenceRanking = next;
+        addDebugLog('info', `Confidence ranking ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'confidenceRanking' }, before, after: !!next });
+        saveSettings();
+    });
+    // Confidence weight slider (stored 0..1; UI shows 0..100). How hard low-confidence facts are nudged down.
+    {
+        const cw = (typeof extensionSettings.confidenceWeight === 'number') ? extensionSettings.confidenceWeight : 0.3;
+        $('#bf_mem_confidence_weight').val(Math.round(cw * 100));
+        $('#bf_mem_confidence_weight_val').text(cw.toFixed(2));
+        $('#bf_mem_confidence_weight').on('input', function () {
+            const v = Math.min(1, Math.max(0, parseInt($(this).val(), 10) / 100));
+            extensionSettings.confidenceWeight = v;
+            $('#bf_mem_confidence_weight_val').text(v.toFixed(2));
+            saveSettings();
+        });
+    }
+
+    // Temporal grounding at extraction (agent-memory + pipeline). Off = store relative dates verbatim.
+    $('#bf_mem_temporal_grounding').prop('checked', extensionSettings.temporalGrounding !== false).on('change', function () {
+        const before = extensionSettings.temporalGrounding !== false;
+        const next = $(this).prop('checked');
+        extensionSettings.temporalGrounding = next;
+        addDebugLog('info', `Temporal grounding ${next ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'temporalGrounding' }, before, after: !!next });
         saveSettings();
     });
 
@@ -4073,6 +4262,19 @@ export async function initSettings() {
         if (before !== val) addDebugLog('debug', `Reflection interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'reflectionInterval' }, before, after: val });
         saveSettings();
     });
+    // Idle-time consolidation: opt-in toggle + idle delay (shown in seconds, stored as ms).
+    $('#bf_mem_idle_consolidation').prop('checked', extensionSettings.idleConsolidation).on('change', function () {
+        extensionSettings.idleConsolidation = $(this).prop('checked');
+        saveSettings();
+    });
+    $('#bf_mem_idle_consolidation_ms').val(Math.round((extensionSettings.idleConsolidationMs || 120000) / 1000));
+    $('#bf_mem_idle_consolidation_ms_val').text(Math.round((extensionSettings.idleConsolidationMs || 120000) / 1000));
+    $('#bf_mem_idle_consolidation_ms').on('input', function () {
+        const secs = parseInt($(this).val());
+        extensionSettings.idleConsolidationMs = secs * 1000;
+        $('#bf_mem_idle_consolidation_ms_val').text(secs);
+        saveSettings();
+    });
     $('#bf_mem_reflection_prompt').val(extensionSettings.reflectionPrompt || DEFAULT_REFLECT_PROMPT).off('input').on('input', function () {
         const val = $(this).val();
         extensionSettings.reflectionPrompt = (val === DEFAULT_REFLECT_PROMPT) ? '' : val;
@@ -4102,6 +4304,32 @@ export async function initSettings() {
         $('#bf_mem_charcheck_interval_val').text(val);
         if (before !== val) addDebugLog('debug', `Character-check interval changed: ${before} → ${val}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'characterCheckInterval' }, before, after: val });
         saveSettings();
+    });
+    // Semantic entity resolution / merge toggle (default OFF). Conservative, off-critical-path.
+    $('#bf_mem_entity_resolution').prop('checked', extensionSettings.entityResolution === true).on('change', function () {
+        extensionSettings.entityResolution = $(this).prop('checked');
+        addDebugLog('debug', `Entity resolution ${extensionSettings.entityResolution ? 'enabled' : 'disabled'}`, { subsystem: 'settings', event: 'settings.changed', actor: 'USER', data: { key: 'entityResolution' }, after: extensionSettings.entityResolution });
+        saveSettings();
+    });
+    // Manual "merge now": run the conservative entity-merge pass immediately (off the interval
+    // gate). Self-guarded; reports the result via toast. Requires the toggle above to be ON.
+    $('#bf_mem_entity_merge_now').on('click', async () => {
+        try {
+            if (extensionSettings.entityResolution !== true) {
+                toastr.info('Enable "Merge entity name variants" first.', 'BF Memory');
+                return;
+            }
+            const res = await runEntityResolution();
+            if (res && res.merges > 0) {
+                toastr.success(`Merged ${res.merges} variant(s), re-keyed ${res.factsMoved} fact(s).`, 'BF Memory');
+            } else {
+                toastr.info('No strong-signal name variants to merge.', 'BF Memory');
+            }
+            renderEntities();
+        } catch (err) {
+            addDebugLog('fail', `Manual entity merge failed: ${err.message || err}`);
+            toastr.error('Entity merge failed (see debug log).', 'BF Memory');
+        }
     });
     // Manual "scan now": run the deterministic scan and, if there are unclassified named
     // candidates, open the batched popup immediately (off the normal interval gate).

@@ -119,6 +119,8 @@ LOCATION (optional, events): for an \`scope:event\` fact, append \`| at:<PLACE>\
 
 CONFIDENCE (optional): append \`| conf:high|med|low\` (or a 0-1 number) when the fact is uncertain or inferred rather than plainly stated. Omit for plainly-stated facts (treated as high).
 
+STORY-WORLD TIME (optional): append \`| from:<when>\` and/or \`| until:<when>\` to record WHEN the fact is true in the STORY WORLD — distinct from when it is recorded — so flashbacks and time-skips stay consistent. \`<when>\` is a free-form story-world time (an in-story date, an age, a labelled era, "the war", etc.), used verbatim. Use \`from:\` for when a fact became true and \`until:\` for when it stopped being true (e.g. a past job, a former home, a flashback detail). Omit for ordinary present-tense facts. These are honored only when the bi-temporal feature is enabled; otherwise they are ignored.
+
 SUPERSEDES (optional): when a write REPLACES the prior value of an existing CHANGEABLE-STATE fact (a status, a current location, a goal now resolved — not a durable trait like a name), append \`| ~\` to mark the old value as ended history while the key becomes the new current truth. Only for \`kind:state\` facts whose value genuinely changed; omit for trait corrections and unchanged re-mentions (the system also infers this for changed kind:state facts, so \`~\` is optional).
 
 SEQUENCE STEPS (optional): for things that form a genuine ORDERED SERIES over time — a character's location changing place to place, plot milestones in order — emit each step as its OWN fact with \`| track:<track_name>\`. Use a stable track name tied to the subject (e.g. \`<char>_location\`). Give each step a numbered key (\`<char>_location_1\`, \`_2\`, ...); do NOT worry about getting the number right — the system assigns the real order. ALSO keep one plain overwriting current-state fact (e.g. \`<char>_location = <current_place>\`, with NO track) so "where are they now" stays a single cheap fact. Only use tracks for real ordered series, never for unrelated facts.
@@ -251,6 +253,15 @@ CAPTURE clearly-stated reveals even on a long turn: names, ages, origins, family
 
 Only SKIP when something is purely hypothetical, [OOC:], reported/historical speech, or pure scene atmosphere. A clearly-disclosed fact should be captured even if you're slightly unsure of phrasing — atomize it conservatively. Do NOT skip a behavior/trait just because you can't yet tell if it lasts — record it (to its proper aspect if clear, else Unsorted/misc with conf:low); a later re-evaluation pass promotes or drops it. A wrong/verbose fact poisons retrieval, but a dropped clear reveal is the bug we're fixing.`;
 
+// TEMPORAL GROUNDING rule (atomic, from mem0 ADDITIVE_EXTRACTION_PROMPT 'Observation Date'). Appended
+// to the system prompt ONLY when the temporalGrounding setting is ON (see buildMemoryPrompt). Relative
+// time words rot ("yesterday" is meaningless once stored), so the model is told to anchor them to the
+// "## Observation date" supplied in the user data block. Kept brief to avoid bloating the prompt.
+export const TEMPORAL_GROUNDING_RULE = `
+
+# OBSERVATION DATE (TIME GROUNDING)
+The user data block gives a \`## Observation date\` (the real-world time this message was observed). Resolve RELATIVE time expressions to ABSOLUTE dates relative to it — e.g. "yesterday" → the day before that date, "last week" → "the week of <date>", "two years ago" → the year. Store the absolute form (in the value or note), not the relative word, so the fact doesn't rot. If no observation date is given, leave time expressions as-is.`;
+
 /**
  * Run Agent 3: Analyze message and update databases
  * @param {string} messageText - The message to analyze
@@ -271,7 +282,7 @@ Only SKIP when something is purely hypothetical, [OOC:], reported/historical spe
  *   speaking character's name. Empty → falls back to the active character name.
  * @returns {Promise<MemoryUpdateResult>}
  */
-export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null, sourceSpeakerName = '') {
+export async function runMemoryUpdater(messageText, messageIndex, characterInfo, existingDatabases, profileId = null, isUserMessage = false, userPersona = '', priorMessages = [], userMsgIndex = null, sourceSpeakerName = '', observationDate = '') {
     // SCOPED DEDUP CONTEXT (scaling fix). Instead of dumping EVERY active fact into the Scribe
     // prompt (impossible on a huge store), fetch only the SCOPED candidates that could be
     // duplicates/relevant for THIS message — by the subjects + keyword tokens in play — via the
@@ -300,7 +311,7 @@ export async function runMemoryUpdater(messageText, messageIndex, characterInfo,
         scopedFacts = null;
     }
 
-    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages, scopedFacts);
+    const { systemPrompt, userPrompt } = buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages, scopedFacts, observationDate);
     // Capture the Scribe system-prompt size + prefix-stability for the run-summary timing
     // breakdown (slowness hunt). Measurement only — does NOT alter the prompt or the call.
     const systemPromptChars = systemPrompt.length;
@@ -402,7 +413,7 @@ function scribeKeywords(text) {
  *   candidates for dedup context (scaling fix). When provided, the "Existing facts" block lists
  *   ONLY these (not the whole DB). When null (scoping failed/unavailable), the block is omitted.
  */
-function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages = [], scopedFacts = null) {
+function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUserMessage, userPersona, priorMessages = [], scopedFacts = null, observationDate = '') {
     const sysPrompt = getSettingsSafe()?.memoryPrompt || DEFAULT_MEMORY_PROMPT;
 
     // Resolve {{user}} / {{char}} macros via ST's canonical substituteParams
@@ -414,10 +425,29 @@ function buildMemoryPrompt(messageText, characterInfo, existingDatabases, isUser
     // and on the Scribe's PARSED OUTPUT at apply time). Baking per-character names into the system
     // prefix made systemPromptStable=false and defeated caching (the documented invariant in
     // llm-call.js: never interleave variable data into the static system prefix).
-    const systemPrompt = sysPrompt;
+    // TEMPORAL GROUNDING (default ON): append the absolute-date resolution rule to the system prompt.
+    // This is a STATIC, character-independent suffix, so the cacheable prefix stays byte-stable for a
+    // given setting value (toggling the rare setting is the only thing that changes it — acceptable).
+    // The variable observation date itself stays in the USER block, never the system prefix.
+    let systemPrompt = sysPrompt;
+    try {
+        if (getSettingsSafe()?.temporalGrounding !== false) {
+            systemPrompt = sysPrompt + TEMPORAL_GROUNDING_RULE;
+        }
+    } catch (_) { /* never block extraction on the temporal-grounding rule */ }
 
     // User message: data to analyze
     const dataParts = [];
+    // TEMPORAL GROUNDING (default ON): surface the message's real-world observation timestamp so the
+    // Scribe can resolve relative time words ("yesterday","last week") into ABSOLUTE dates that won't
+    // rot. Goes in the USER data block (NOT the static system prefix) so the cacheable system prompt
+    // stays byte-stable. Gated by the temporalGrounding setting; paired with a rule appended to the
+    // memory prompt. Wrapped so a bad timestamp can never break extraction.
+    try {
+        if (getSettingsSafe()?.temporalGrounding !== false && observationDate) {
+            dataParts.push(`## Observation date: ${observationDate}`);
+        }
+    } catch (_) { /* never block extraction on the temporal-grounding line */ }
     if (characterInfo) {
         dataParts.push(`## Character Info ({{char}})\n${characterInfo}`);
     }
@@ -509,6 +539,12 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         const s = getScene();
         if (s && Number.isInteger(s.sceneNo)) curScene = { no: s.sceneNo, name: typeof s.sceneName === 'string' ? s.sceneName : '' };
     } catch { /* no scene available — leave facts unstamped */ }
+
+    // BI-TEMPORAL (feature): story-world validity (`from:`/`until:`) is OPT-IN. When off we skip
+    // parsing the markers entirely so the existing single-axis behavior is byte-for-byte unchanged.
+    // Distinct from `validAt` (an ordering INTEGER) — these are story-world ISO/freeform stamps.
+    let biTemporal = false;
+    try { biTemporal = getSettingsSafe()?.biTemporal === true; } catch { /* default off */ }
 
     if (!response || !response.trim()) {
         result.error = 'Empty response from memory updater';
@@ -627,6 +663,8 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         let involved = [];     // Involved (feature): optional participants/entities IN the fact (`with:` marker)
         let location = '';     // Location-link (feature): optional WHERE an event happened (`at:` marker)
         let tone = '';         // Episodic-memory (feature): optional short emotional descriptor for a `moment` (`tone:` marker)
+        let validFrom = '';    // Bi-temporal (feature): optional STORY-WORLD time the fact became true (`from:` marker)
+        let validUntil = '';   // Bi-temporal (feature): optional STORY-WORLD time the fact stopped being true (`until:` marker)
 
         for (let i = 1; i < segments.length; i++) {
             const seg = segments[i].trim();
@@ -741,6 +779,26 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
             if (toneMatch) {
                 tone = toneMatch[1].trim();
                 continue;
+            }
+
+            // from:<story-world date/time> / until:<story-world date/time> — OPTIONAL bi-temporal
+            // VALIDITY (feature, gated by the `biTemporal` setting; default OFF). Records WHEN the
+            // fact is true in the STORY WORLD, distinct from when it was recorded — so flashbacks /
+            // time-skips stay consistent (cf. Graphiti/Zep valid_at/invalid_at). Free-form value
+            // (an ISO date, an in-story label, etc.) stored verbatim. `from:`/`until:` do NOT
+            // collide with the existing grammar (no other marker starts with `f`/`u`). Parsed only
+            // when biTemporal is on so the default path is unchanged; NEVER overloads `validAt`.
+            if (biTemporal) {
+                const fromMatch = seg.match(/^from\s*:\s*(.+)$/i);
+                if (fromMatch) {
+                    validFrom = fromMatch[1].trim();
+                    continue;
+                }
+                const untilMatch = seg.match(/^until\s*:\s*(.+)$/i);
+                if (untilMatch) {
+                    validUntil = untilMatch[1].trim();
+                    continue;
+                }
             }
 
             // conf:<high|med|low|0-1> — OPTIONAL provenance confidence (feature: provenance).
@@ -955,6 +1013,11 @@ function parseMemoryUpdateResult(response, messageIndex, userMsgIndex = null, na
         // message index (when the fact became true). Both kept optional/back-compat.
         if (confidence !== null && confidence !== '') update.confidence = confidence;
         if (Number.isInteger(sourceIndex)) update.validAt = sourceIndex;
+        // Bi-temporal (feature): story-world validity window, only when biTemporal is on AND the
+        // writer emitted the marker(s). Kept optional / only-when-present so back-compat facts stay
+        // lean and the field set is unchanged when the feature is off. DISTINCT from `validAt`.
+        if (biTemporal && validFrom) update.validFrom = validFrom;
+        if (biTemporal && validUntil) update.validUntil = validUntil;
         // SCENE + SOURCE STRANDS (Spiderweb 2): stamp the scene the fact was established in, plus a
         // `sourceMsg` provenance handle (REUSES the existing source message index — no new id). Both
         // optional / only-when-present (lean / back-compat). First-wins is enforced at merge: a
@@ -1346,6 +1409,11 @@ async function applyUpdates(updates, existingDatabases) {
             factToWrite.confidence = update.confidence;
         }
         if (Number.isInteger(update.validAt)) factToWrite.validAt = update.validAt;
+        // Bi-temporal (feature): forward story-world validity window (`from:`/`until:`) when present
+        // so upsertFact can persist + supersession-stamp it. Only set when biTemporal parsed them,
+        // so back-compat facts simply lack these fields. DISTINCT from `validAt` (ordering integer).
+        if (update.validFrom) factToWrite.validFrom = update.validFrom;
+        if (update.validUntil) factToWrite.validUntil = update.validUntil;
         // SCENE + SOURCE STRANDS (Spiderweb 2): forward the origin scene + source-message handle so
         // upsertFact stores them. First-wins is enforced in mergeSalience (the origin scene is kept
         // across re-mentions, mirroring validAt). Only attached when present (lean / back-compat).

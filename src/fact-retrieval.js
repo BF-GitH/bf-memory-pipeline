@@ -329,6 +329,24 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     secondary.sort(byScore);
     tertiary.sort(byScore);
 
+    // MMR DIVERSITY RERANK (#mmr; Graphiti/Zep maximal_marginal_relevance). Pure salience order
+    // can stack several near-duplicate facts into the scarce overflow slots. MMR reorders each
+    // candidate list so a pick balances salience against being DIFFERENT from what's already
+    // chosen: score(c) = lambda*normSalience(c) - (1-lambda)*maxTrigramSim(c, chosen). Reuses the
+    // deterministic trigramSimilarity over each candidate's "key value tags" text (embeddings off
+    // by default) → fully deterministic, so swipe/regen reuse is stable. Reordering only changes
+    // WHICH overflow candidates admitTier keeps under the same caps; primary is never touched.
+    if (cfg.mmrEnabled !== false) {
+        try {
+            const lambda = (typeof cfg.mmrLambda === 'number' && cfg.mmrLambda >= 0 && cfg.mmrLambda <= 1) ? cfg.mmrLambda : 0.7;
+            secondary = mmrRerank(secondary, lambda, now);
+            tertiary = mmrRerank(tertiary, lambda, now);
+        } catch (e) {
+            // Degrade to the salience order already computed above — never break retrieval.
+            addDebugLog('debug', `MMR rerank skipped: ${e?.message || e}`, { subsystem: 'retrieval', event: 'retrieval.mmr.error' });
+        }
+    }
+
     // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
     // admitted by salience until the token budget OR the count cap is reached (smaller wins).
     // The first overflow candidate is always admitted (never an empty overflow on a tiny budget).
@@ -425,6 +443,72 @@ export function trigramSimilarity(a, b) {
     for (const g of A) if (B.has(g)) inter++;
     const union = A.size + B.size - inter;
     return union === 0 ? 0 : inter / union;
+}
+
+/**
+ * The text MMR diversifies over: "key value tags" for a retrieval candidate. This is the
+ * surface the trigram similarity compares so near-duplicate facts (same key restated, same
+ * value with different phrasing, overlapping tags) score high and get spread apart. Cheap,
+ * deterministic, no allocation beyond the joined string.
+ * @param {{fact: Object}} r
+ * @returns {string}
+ */
+function mmrCandidateText(r) {
+    const f = r.fact || {};
+    const tags = Array.isArray(f.tags) ? f.tags.join(' ') : '';
+    return `${f.key || ''} ${f.value || ''} ${tags}`.trim();
+}
+
+/**
+ * MMR DIVERSITY RERANK (#mmr; Graphiti/Zep maximal_marginal_relevance). Greedily reorders a
+ * SALIENCE-SORTED candidate list so each successive pick maximizes
+ *   score(c) = lambda * normSalience(c) - (1 - lambda) * maxTrigramSim(c, alreadyChosen)
+ * where normSalience is min-max normalized across the list (so the two terms share the [0,1]
+ * scale) and similarity reuses the existing deterministic trigramSimilarity over each
+ * candidate's "key value tags" text. lambda=1 → pure salience order; lambda=0 → pure diversity.
+ *
+ * Fully DETERMINISTIC (no Math.random / PRNG): same inputs → same order, so swipe/regen reuse
+ * is stable. The first pick is always the top-salience candidate (empty chosen set → similarity
+ * penalty is 0). Ties break by original (salience) index — stable and reproducible. O(n^2) over
+ * a list already bounded to a few dozen overflow candidates → well under 1ms.
+ *
+ * NOTE: this only changes ORDER. The caller still admits under the same count/token caps, so
+ * MMR changes WHICH near-duplicates win slots, never how many facts are injected.
+ * @param {Array<{fact: Object}>} list  salience-sorted candidates (not mutated)
+ * @param {number} lambda  salience↔diversity tradeoff in [0,1]
+ * @param {number} now  Date.now() for retrievalSalience
+ * @returns {Array} reordered copy
+ */
+function mmrRerank(list, lambda, now) {
+    if (!Array.isArray(list) || list.length <= 2) return list; // nothing to diversify
+    // Precompute salience + normalize to [0,1] so it shares scale with trigram sim (also [0,1]).
+    const sal = list.map(r => retrievalSalience(r.fact, now));
+    let lo = Infinity, hi = -Infinity;
+    for (const s of sal) { if (s < lo) lo = s; if (s > hi) hi = s; }
+    const span = hi - lo;
+    const norm = (i) => (span > 0 ? (sal[i] - lo) / span : 1); // all-equal salience → all 1 (order by diversity)
+    const texts = list.map(mmrCandidateText);
+
+    const remaining = list.map((_, i) => i); // indices into list, kept in salience order
+    const chosenIdx = [];
+    while (remaining.length > 0) {
+        let bestPos = 0, bestScore = -Infinity;
+        for (let p = 0; p < remaining.length; p++) {
+            const i = remaining[p];
+            let maxSim = 0;
+            for (const j of chosenIdx) {
+                const s = trigramSimilarity(texts[i], texts[j]);
+                if (s > maxSim) maxSim = s;
+            }
+            const score = lambda * norm(i) - (1 - lambda) * maxSim;
+            // Strict > keeps the first (higher-salience, since `remaining` is salience-ordered)
+            // candidate on ties → deterministic, salience-preferring tie-break.
+            if (score > bestScore) { bestScore = score; bestPos = p; }
+        }
+        chosenIdx.push(remaining[bestPos]);
+        remaining.splice(bestPos, 1);
+    }
+    return chosenIdx.map(i => list[i]);
 }
 
 /**
@@ -568,6 +652,20 @@ const RETRIEVAL_HALF_LIFE_DAYS = { trait: 90, state: 3, event: 7, moment: 30 };
 // a capped slot when no hot fact contends for it — i.e. it surfaces on a direct/strong match
 // (exact-key, keyword, fuzzy all still admit it) but loses ties for scarce slots to hot facts.
 const RETRIEVAL_COLD_PENALTY = 1000;
+// CONFIDENCE-GATED RETRIEVAL (Zep minRating + mem0 confidence). A fact's stored `confidence`
+// ('high'|'med'|'low' or a 0..1 number; written by agent-memory.js from the `conf:` marker) is
+// otherwise ignored at retrieval. Here we map it to a 0..1 factor so the OVERFLOW ranking can let
+// solid facts out-compete low-confidence guesses for scarce secondary/tertiary slots. Absent or
+// unrecognized => 1.0 (treated as high), matching the prompt's "omit => high" contract. Primaries
+// never pass through retrievalSalience, so they're never gated.
+const CONFIDENCE_FACTOR = { high: 1.0, med: 0.8, medium: 0.8, low: 0.5 };
+function confidenceFactor(fact) {
+    const c = fact?.confidence;
+    if (c === undefined || c === null || c === '') return 1.0;
+    if (typeof c === 'number') return Number.isFinite(c) ? Math.min(1, Math.max(0, c)) : 1.0;
+    const f = CONFIDENCE_FACTOR[String(c).toLowerCase()];
+    return f === undefined ? 1.0 : f;
+}
 function retrievalSalience(fact, now) {
     const importance = clampImportance(fact?.importance);
     const kind = normalizeKind(fact?.kind);
@@ -579,7 +677,20 @@ function retrievalSalience(fact, now) {
     const ageDays = last > 0 ? Math.max(0, (now - last) / 86400000) : 36500;
     const halfLife = RETRIEVAL_HALF_LIFE_DAYS[kind] || RETRIEVAL_HALF_LIFE_DAYS.trait;
     const recency = Math.pow(0.5, ageDays / halfLife);
-    const base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
+    let base = RETRIEVAL_IMPORTANCE_WEIGHT * (importance / 5) + RETRIEVAL_RECENCY_WEIGHT * recency + useBonus(fact?.useCount);
+    // CONFIDENCE GATE (overflow ranking only). Gated behind settings.confidenceRanking (default ON)
+    // and degrades to the ungated score on any error. Applied as a BOUNDED multiplier blended
+    // toward 1.0 by (1 - confidenceWeight): effectiveMult = 1 - w*(1 - factor). A small weight
+    // nudges low-confidence facts down without ever zeroing them — they still surface on a direct
+    // match (which doesn't use this) and merely lose ties for scarce overflow slots to solid facts.
+    try {
+        const cfg = getSettings();
+        if (cfg?.confidenceRanking) {
+            const w = Math.min(1, Math.max(0, Number(cfg.confidenceWeight ?? 0.3)));
+            const mult = 1 - w * (1 - confidenceFactor(fact));
+            base *= mult;
+        }
+    } catch { /* degrade to ungated base score */ }
     return isColdFact(fact) ? base - RETRIEVAL_COLD_PENALTY : base;
 }
 
@@ -1053,6 +1164,21 @@ export function formatFactsForWriter(results) {
     // one-word `[Subject]` header per group. Subjects appear in FIRST-APPEARANCE order (so a primary
     // hit's subject still leads); facts with no/unknown subject collapse into a trailing "Misc"
     // group, so it degrades cleanly when subject is missing or mixed.
+    // BI-TEMPORAL (feature, opt-in): when story-world validity is enabled, annotate a fact carrying
+    // `validFrom`/`validUntil` with a compact `{from→until}` tail so the Writer sees WHEN the fact is
+    // true in-story (keeps flashbacks/time-skips consistent). Read the flag ONCE per call (not per
+    // line). When the feature is OFF — the default — these fields never get written, so output is
+    // byte-for-byte unchanged. Best-effort: a settings read failure simply omits the annotation.
+    let biTemporalOn = false;
+    try { biTemporalOn = getSettings()?.biTemporal === true; } catch { /* default off */ }
+    const temporalTail = (fact) => {
+        if (!biTemporalOn) return '';
+        const from = (typeof fact.validFrom === 'string' && fact.validFrom.trim()) ? fact.validFrom.trim() : '';
+        const until = (typeof fact.validUntil === 'string' && fact.validUntil.trim()) ? fact.validUntil.trim() : '';
+        if (!from && !until) return '';
+        return ` {${from || '?'}→${until || 'now'}}`;
+    };
+
     const formatLine = (fact, category) => {
         const knownBy = (fact.knownBy || []).join(', ');
         const prefix = knownBy ? `[${knownBy}]` : '[everyone]';
@@ -1061,15 +1187,16 @@ export function formatFactsForWriter(results) {
         // Episodic-memory feature: a `moment`-kind fact carries a short emotional `tone` we append
         // compactly so the beat reads WITH its feeling, e.g. `Events/key: <note> (tender)`.
         const tone = (typeof fact.tone === 'string' && fact.tone.trim()) ? fact.tone.trim() : '';
+        const temporal = temporalTail(fact);
         // INJECTION DE-DUPLICATION: storage keeps BOTH value and note, but the Writer
         // only needs one. When a fact HAS a note, the note already carries the
         // value/summary, so we inject the NOTE IN PLACE OF the value (all tiers) —
         // showing both would be redundant. With no note, inject `Category/key = value`.
         // Keep the KEY (Feature #2b) so the Writer can tell similar facts apart.
-        if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}`;
-        if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}`;
+        if (note) return `${prefix} ${category}/${fact.key}: ${note}${tone ? ` (${tone})` : ''}${temporal}`;
+        if (hasValue) return `${prefix} ${category}/${fact.key} = ${fact.value}${temporal}`;
         // Degenerate: neither value nor note — keep the key so it's still visible.
-        return `${prefix} ${category}/${fact.key}`;
+        return `${prefix} ${category}/${fact.key}${temporal}`;
     };
 
     // Bucket lines by subject, preserving first-appearance order of both groups and lines.
