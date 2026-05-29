@@ -16,6 +16,26 @@ import * as host from './host.js';
 const LLM_TIMEOUT_MS = 28000;          // 28s per transport leg (was 60s, per-leg, unbounded)
 const LLM_WALLCLOCK_BUDGET_MS = 45000; // 45s total across all legs + the one retry (hard cap)
 
+/**
+ * Minimal Promise-based counting semaphore (atomic #17). `acquire()` resolves to a release
+ * function once a slot is free (FIFO). Pure JS, no deps. Used to cap concurrent LLM calls
+ * during a full-chat rebuild so the provider isn't hammered. Applied locally by the rebuild.
+ * @param {number} n - max concurrent holders
+ */
+export function createSemaphore(n) {
+    let running = 0;
+    const queue = [];
+    const release = () => { running--; if (queue.length) { running++; queue.shift()(); } };
+    return {
+        acquire() {
+            return new Promise((resolve) => {
+                if (running < n) { running++; resolve(release); }
+                else queue.push(() => resolve(release));
+            });
+        },
+    };
+}
+
 // CACHE-ELIGIBILITY tracking (HONEST — server-side cache HITS are NOT observable from an
 // extension; see the long note in callAgentLLMOnce). We can only observe what makes the
 // cacheable PREFIX stable: the agent's system-prompt bytes (hash vs the last call for that

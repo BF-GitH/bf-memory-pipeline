@@ -2,13 +2,25 @@
 // Automation Step 1: Query databases and assemble facts with tiered relevance
 // No LLM calls - pure database lookup with smart fallback matching
 
-import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs } from './database.js';
+import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
 import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
 // Memory Updater (Agent 3) maintains these in the DB relationships,
-// but these are hardcoded fallbacks for common patterns
+// but these are hardcoded fallbacks for common patterns.
+//
+// RETAINED, not superseded by the item #4 sim-links (`expandSimLinks`). Evaluated for
+// removal and kept: the two mechanisms are ORTHOGONAL, not old-vs-new.
+//   - This table is a CONCEPT -> CATEGORY bridge (chat word "apartment" -> search the
+//     Furniture/Rooms/Decor categories). It needs no stored facts and works at cold-start.
+//   - sim-links are a FACT -> textually-similar-FACT edge that only fires from an existing
+//     PRIMARY hit and only after an Agent 3 write cycle has populated `fact.simLinks`.
+// So sim-links cannot reproduce this recall: a chat word matching NO stored fact yields no
+// primary seed (sim-links contribute nothing), and conceptually-related-but-textually-
+// dissimilar categories share too few trigrams to ever link. The semantic layer (item #1)
+// is the only true conceptual analogue, and it is opt-in/default-off. Gating removal behind
+// an accumulated-fact count does not help — the gap is structural, not a warm-up phase.
 const FALLBACK_MAPPINGS = {
     // Location triggers
     'apartment': ['Furniture', 'Rooms', 'Decor'],
@@ -94,6 +106,21 @@ export function isFactVisible(fact, names = null) {
  */
 const MAX_EXPANSION_PER_SEED = 3;
 const MAX_EXPANSION_TOTAL = 16;
+
+/**
+ * Approximate injection token cost of a candidate (atomic #10), mirroring the writer line
+ * `[knownBy] Category/key = value [— context]`, ~4 chars/token.
+ * @param {{fact: Object, category: string, tier: string}} r
+ * @returns {number}
+ */
+function estimateInjectionTokens(r) {
+    const f = r.fact;
+    const kb = (f.knownBy || []).join(', ');
+    const prefix = kb ? `[${kb}]` : '[everyone]';
+    let line = `${prefix} ${r.category}/${f.key} = ${f.value || ''}`;
+    if (r.tier === 'primary' && typeof f.context === 'string' && f.context.trim()) line += ` — ${f.context.trim()}`;
+    return Math.ceil(line.length / 4);
+}
 
 /**
  * Retrieve relevant facts based on Agent 1's needed info list
@@ -199,26 +226,22 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // secondary/tertiary candidates exceed their caps we must drop some — rank them by a
     // DETERMINISTIC salience score (importance + recency, no Math.random) so higher-
     // importance and more-recent facts win the slots instead of arbitrary match order.
+    // COUNT caps remain the hard backstop; a TOKEN budget (#10) is the finer limit (smaller wins).
     const MAX_SECONDARY = 12;
     const MAX_TERTIARY = 6;
     const now = Date.now();
-    const primary = directResults.filter(r => r.tier === 'primary');
-    const secondary = directResults.filter(r => r.tier === 'secondary');
-    const tertiary = directResults.filter(r => r.tier === 'tertiary');
-    // Stable-ish descending sort by salience (ties keep original relative order in V8's
-    // stable sort, so still deterministic).
-    const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
-    secondary.sort(byScore);
-    tertiary.sort(byScore);
-    const filteredResults = [
-        ...primary,
-        ...secondary.slice(0, MAX_SECONDARY),
-        ...tertiary.slice(0, MAX_TERTIARY),
-    ];
+    const cfg = (() => { try { return getSettings(); } catch { return null; } })() || {};
+    const budget = Number(cfg.retrievalTokenBudget) || 800;
+    const cutoffDays = Number(cfg.recencyCutoffDays) || 0;
+    const cutoffIso = cutoffDays > 0 ? sinceIso(cutoffDays) : null;
+    const passesRecency = (r) => !cutoffIso || !r.fact.createdAt || r.fact.createdAt >= cutoffIso;
 
-    // EXCLUSION LEDGER — record candidates that fell off the cap cliff so "why it forgot X"
-    // is answerable. Only candidates that ACTUALLY entered a tier are logged (never the whole
-    // DB). Each carries rank + salience score so the user sees it was e.g. rank-14-of-18.
+    const primary = directResults.filter(r => r.tier === 'primary');
+    let secondary = directResults.filter(r => r.tier === 'secondary');
+    let tertiary = directResults.filter(r => r.tier === 'tertiary');
+
+    // EXCLUSION LEDGER — record candidates dropped at the cap/recency/budget cliffs so
+    // "why it forgot X" is answerable. Only candidates that ACTUALLY entered a tier are logged.
     const excludedByReason = {};
     const recordExclude = (r, reason, extra = {}) => {
         excludedByReason[reason] = (excludedByReason[reason] || 0) + 1;
@@ -227,10 +250,41 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
             data: { key: r.fact.key, category: r.category, tier: r.tier, ...extra },
         });
     };
-    secondary.slice(MAX_SECONDARY).forEach((r, i) =>
-        recordExclude(r, 'CAP_SECONDARY', { rank: MAX_SECONDARY + i + 1, of: secondary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
-    tertiary.slice(MAX_TERTIARY).forEach((r, i) =>
-        recordExclude(r, 'CAP_TERTIARY', { rank: MAX_TERTIARY + i + 1, of: tertiary.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }));
+
+    // RECENCY CUTOFF (#14): drop secondary/tertiary older than the cutoff. Primary is never cut;
+    // legacy facts with no createdAt are always kept (back-compat — never silently drop undated).
+    if (cutoffIso) {
+        for (const r of [...secondary, ...tertiary]) {
+            if (!passesRecency(r)) recordExclude(r, 'RECENCY_CUTOFF', { createdAt: r.fact.createdAt || null, cutoff: cutoffIso });
+        }
+        secondary = secondary.filter(passesRecency);
+        tertiary = tertiary.filter(passesRecency);
+    }
+
+    const byScore = (a, b) => retrievalSalience(b.fact, now) - retrievalSalience(a.fact, now);
+    secondary.sort(byScore);
+    tertiary.sort(byScore);
+
+    // TOKEN-BUDGET admission (#10): primary tokens charged first; secondary then tertiary
+    // admitted by salience until the token budget OR the count cap is reached (smaller wins).
+    // The first overflow candidate is always admitted (never an empty overflow on a tiny budget).
+    let usedTokens = primary.reduce((sum, r) => sum + estimateInjectionTokens(r), 0);
+    const admitted = [];
+    const admitTier = (list, maxCount, capReason) => {
+        let n = 0;
+        for (const r of list) {
+            if (n >= maxCount) { recordExclude(r, capReason, { rank: n + 1, of: list.length, score: Number(retrievalSalience(r.fact, now).toFixed(3)) }); continue; }
+            const cost = estimateInjectionTokens(r);
+            if (admitted.length > 0 && usedTokens + cost > budget) {
+                recordExclude(r, 'CAP_TOKENS', { usedTokens, budget, score: Number(retrievalSalience(r.fact, now).toFixed(3)) });
+                continue;
+            }
+            admitted.push(r); usedTokens += cost; n++;
+        }
+    };
+    admitTier(secondary, MAX_SECONDARY, 'CAP_SECONDARY');
+    admitTier(tertiary, MAX_TERTIARY, 'CAP_TERTIARY');
+    const filteredResults = [...primary, ...admitted];
 
     // Filter by knownBy: only include facts the current character knows.
     // Empty knownBy means "everyone knows" (no filter).

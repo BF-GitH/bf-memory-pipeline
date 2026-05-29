@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.33.0] - 2026-05-29
+
+### Added — atomic-derived Tier B (re-implemented against current code). Backward-compatible.
+
+- **#14 Recency cutoff.** Facts now carry an ISO `createdAt` stamp (preserved across updates, back-filled if absent); new `recencyCutoffDays` setting (0 = off) drops secondary/tertiary facts older than N days via lexicographic string compare. Primary picks and legacy un-stamped facts are never cut. Drops are logged in the retrieval exclusion ledger (`RECENCY_CUTOFF`). New exported `sinceIso(days)`. ([src/database.js](src/database.js), [src/fact-retrieval.js](src/fact-retrieval.js), [src/settings.js](src/settings.js))
+- **#10 Token budget.** The fixed `MAX_SECONDARY=12`/`MAX_TERTIARY=6` count caps are now backstops behind a `retrievalTokenBudget` (default 800, clamp 50–8000): primary tokens are charged first, then secondary/tertiary admitted by salience until the budget OR the count cap is hit (smaller wins), with an always-keep-one guard. Budget drops logged as `CAP_TOKENS`. ([src/fact-retrieval.js](src/fact-retrieval.js), [src/settings.js](src/settings.js))
+- **#17 Concurrent full-chat rebuild.** `runAgent3OnFullChat` (already loading the DB map once) now fans out extraction with a new `createSemaphore` capping parallel Scribe calls at `rebuildConcurrency` (default 3, clamp 1–6) instead of a strict sequential loop; progress fires per completion. Write-safe because the shared DB object is mutated by synchronous upserts between awaits. ([src/llm-call.js](src/llm-call.js), [src/settings.js](src/settings.js))
+
 ## [0.32.0] - 2026-05-29
 
 ### Added — atomic-derived Tier A (re-implemented against current code). Backward-compatible.
