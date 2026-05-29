@@ -1391,6 +1391,27 @@ async function applyUpdates(updates, existingDatabases) {
         }
     }
 
+    // Embed-on-write (atomic #1): when semantic retrieval is enabled, vectorize active
+    // non-sequence facts in modified categories that still lack an embedding, then re-save.
+    // Fire-and-forget + opt-in; embedFacts no-ops if the feature is off or no endpoint responds.
+    if (modified.size > 0 && getSettingsSafe()?.semanticRetrieval) {
+        (async () => {
+            const { embedFacts } = await import('./fact-embedding.js');
+            const { isActiveFact, isSequenceFact } = await import('./database.js');
+            const toEmbed = [];
+            for (const cat of modified) {
+                for (const f of (existingDatabases[cat]?.facts || [])) {
+                    if (isActiveFact(f) && !isSequenceFact(f) && !Array.isArray(f.embedding)) toEmbed.push(f);
+                }
+            }
+            const n = await embedFacts(toEmbed, {});
+            if (n > 0) {
+                for (const cat of modified) { try { await saveDatabase(existingDatabases[cat]); } catch { /* best-effort */ } }
+                addDebugLog('info', `Embed-on-write: vectorized ${n} new fact(s)`);
+            }
+        })().catch(e => addDebugLog('info', `Embed-on-write failed (non-fatal): ${e.message || e}`));
+    }
+
     return applied;
 }
 

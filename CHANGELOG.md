@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.34.0] - 2026-05-29
+
+### Added — atomic-derived Tier C: semantic retrieval (#1) + batch embedding (#16). Opt-in, default off.
+Match facts by **meaning**, not just keyword/trigram/graph — the one recall mode the current pipeline (spiderweb + relationship resonance) still lacks. Entirely opt-in behind `semanticRetrieval` (default **off**) and built defensively so it's safe to enable on any backend.
+
+- **Defensive embedding endpoint (#1).** New `callEmbeddingAPI` probes `CMRS.sendEmbeddingRequest`, then proxy routes `/api/backends/chat-completions/embeddings` and `/api/backends/embeddings/compute`; returns `null` (semantic features no-op, retrieval stays keyword/graph-only) if none respond. Never throws. Handles OpenAI / raw-array / `{embeddings}` / single-`{embedding}` shapes. New `getEmbeddingProfileId` (reuses Agent 1's profile if no dedicated one). ([src/llm-call.js](src/llm-call.js), [src/profiler.js](src/profiler.js))
+- **Embed-on-write + semantic layer (#1).** When enabled, new facts are vectorized after each Scribe write (fire-and-forget, stored as `fact.embedding` number[]); at retrieval `semanticLayer` embeds the query and admits the top cosine-closest facts (≥ `semanticThreshold`, default 0.75) as secondary (`via: 'semantic'`), feeding the existing token-budget/cap pipeline. ([src/fact-retrieval.js](src/fact-retrieval.js), [src/agent-memory.js](src/agent-memory.js))
+- **Batch embedding + bulk backfill (#16).** New `src/fact-embedding.js`: `embedFacts` (batches of 30 with backoff + adaptive halving) and `bulkEmbedAllFacts`. A **"Semantic retrieval"** toggle + **"Embed all facts"** button (with live progress) in the settings Database section. ([src/fact-embedding.js](src/fact-embedding.js), [src/settings.js](src/settings.js), [templates/settings.html](templates/settings.html))
+
+New settings: `semanticRetrieval` (default false), `embeddingProfile`, `embeddingModel` (default `text-embedding-3-small`), `semanticThreshold` (0.1–0.99, default 0.75).
+
+**Note:** the embedding endpoint paths are best-effort — the exact ST embedding API isn't guaranteed across versions. Enable the toggle, click "Embed all facts", and check the debug log: "No embedding endpoint responded" means the feature no-ops and a different route must be wired for your ST build.
+
 ## [0.33.0] - 2026-05-29
 
 ### Added — atomic-derived Tier B (re-implemented against current code). Backward-compatible.

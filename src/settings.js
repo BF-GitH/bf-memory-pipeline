@@ -181,6 +181,14 @@ const DEFAULT_SETTINGS = {
     // Full-chat rebuild concurrency (atomic #17): max parallel Scribe calls during a
     // "Run on current chat" backfill (shared DB object → no lost writes). Clamp 1..6.
     rebuildConcurrency: 3,
+    // Semantic retrieval (atomic #1/#16). Default OFF. When on, facts are embedded (vector) on
+    // write and the query is embedded at retrieval so facts match by MEANING, not just keyword/
+    // trigram/graph. callEmbeddingAPI probes CMRS + known ST routes and GRACEFULLY NO-OPS if
+    // none respond — safe to enable on any backend (retrieval just stays keyword-only).
+    semanticRetrieval: false,
+    embeddingProfile: '',                       // CMRS profile for embeddings (blank = reuse Agent 1's)
+    embeddingModel: 'text-embedding-3-small',   // embedding model name sent to the endpoint
+    semanticThreshold: 0.75,                    // min cosine similarity for a semantic hit
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
     // existing sliders, but no longer gate which facts get injected. Safe to remove the
@@ -315,6 +323,7 @@ function validateSettings(s) {
     s.retrievalTokenBudget = Math.floor(clamp(s.retrievalTokenBudget, 50, 8000, 800));
     s.recencyCutoffDays = Math.floor(clamp(s.recencyCutoffDays, 0, 3650, 0));
     s.rebuildConcurrency = Math.floor(clamp(s.rebuildConcurrency, 1, 6, 3));
+    s.semanticThreshold = clamp(s.semanticThreshold, 0.1, 0.99, 0.75);
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
     // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
@@ -4353,6 +4362,45 @@ export async function initSettings() {
     $('#bf_mem_run_full_chat_cancel').on('click', () => {
         fullChatCancel = true;
         $('#bf_mem_run_full_chat_cancel').prop('disabled', true).text('Cancelling…');
+    });
+
+    // Semantic retrieval toggle (atomic #1).
+    $('#bf_mem_semantic_enabled').prop('checked', extensionSettings.semanticRetrieval === true).on('change', function () {
+        extensionSettings.semanticRetrieval = $(this).prop('checked');
+        saveSettings();
+        if (extensionSettings.semanticRetrieval) {
+            toastr.info('Semantic retrieval on. Click "Embed all facts" to vectorize existing facts; new facts embed automatically.', 'BF Memory');
+        }
+    });
+
+    // --- Embed all facts (atomic #16): one-shot semantic backfill of the current character's DB ---
+    $('#bf_mem_embed_all').on('click', async () => {
+        if (!extensionSettings.semanticRetrieval) {
+            toastr.info('Enable "Semantic retrieval" first, then embed.', 'BF Memory');
+            return;
+        }
+        const btn = $('#bf_mem_embed_all');
+        const progress = $('#bf_mem_embed_all_progress');
+        btn.prop('disabled', true).text('Embedding…');
+        progress.show().text('Starting…');
+        try {
+            const { bulkEmbedAllFacts } = await import('./fact-embedding.js');
+            const result = await bulkEmbedAllFacts(({ done, total }) => {
+                progress.text(`Embedding ${done}/${total} fact(s)…`);
+            });
+            if (result.total === 0) {
+                progress.text('All facts already embedded (or none to embed).');
+                toastr.info('Nothing to embed — facts are already vectorized or the store is empty.', 'BF Memory');
+            } else {
+                progress.text(`Done: ${result.succeeded}/${result.total} embedded.`);
+                toastr.success(`Embedded ${result.succeeded}/${result.total} fact(s)`, 'BF Memory');
+            }
+        } catch (err) {
+            toastr.error(`Embed failed: ${err.message}`, 'BF Memory');
+            progress.text(`Failed: ${err.message}`);
+        } finally {
+            btn.prop('disabled', false).html('<i class="fa-solid fa-vector-square"></i> Embed all facts (semantic)');
+        }
     });
 
     // --- Tokens Tab ---

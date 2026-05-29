@@ -58,6 +58,23 @@ export function getAgent1ProfileId(settings) {
 }
 
 /**
+ * Get the embedding profile ID (atomic #1), or null. Prefers a dedicated `embeddingProfile`;
+ * otherwise reuses Agent 1's profile so one configured profile suffices. Verifies it still
+ * exists. Null → callEmbeddingAPI falls back to the ST proxy routes (or no-ops).
+ * @param {object} settings
+ * @returns {string|null}
+ */
+export function getEmbeddingProfileId(settings) {
+    const id = settings?.embeddingProfile;
+    if (id) {
+        const profiles = getConnectionProfiles();
+        if (profiles.some(p => p.id === id)) return id;
+        addDebugLog('fail', `Embedding profile "${id}" not found in connection manager`);
+    }
+    return getAgent1ProfileId(settings);
+}
+
+/**
  * Get the Agent 3 (Memory Updater) profile ID from settings, or null if not configured.
  * This does NOT switch any profile - just returns the ID for use with CMRS.
  * @param {object} settings - Extension settings

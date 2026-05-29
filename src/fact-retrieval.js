@@ -4,6 +4,8 @@
 
 import { getAllDatabases, getMemoryIndex, searchFacts, searchFactsIndexed, getTrackSteps, getFactsByScene, getRelationshipMomentThread, isSequenceFact, isActiveFact, isColdFact, clampImportance, normalizeKind, deriveSubject, deriveScope, useBonus, effectiveRecencyTs, sinceIso } from './database.js';
 import { addDebugLog, getSettings } from './settings.js';
+import { callEmbeddingAPI } from './llm-call.js';
+import { getEmbeddingProfileId } from './profiler.js';
 import * as host from './host.js';
 
 // Smart fallback mappings: when a concept appears, also check related categories
@@ -122,6 +124,62 @@ function estimateInjectionTokens(r) {
     return Math.ceil(line.length / 4);
 }
 
+// Max semantic (embedding) hits admitted as secondary per retrieval (atomic #1).
+const SEMANTIC_MAX_SECONDARY = 8;
+
+/** Cosine similarity of two equal-length numeric vectors. 0 on mismatch/empty. */
+function cosineSimilarity(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length === 0 || a.length !== b.length) return 0;
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return (na && nb) ? dot / (Math.sqrt(na) * Math.sqrt(nb)) : 0;
+}
+
+/**
+ * Semantic expansion (atomic #1, opt-in). Embeds the query keywords and admits the top
+ * cosine-closest active+visible facts (carrying a cached `embedding`) above the configured
+ * threshold as SECONDARY. Fully guarded: no-ops when semantic retrieval is off, no endpoint
+ * responds, or no facts are embedded yet — so it never breaks keyword/graph retrieval.
+ * @param {Object} databases
+ * @param {string[]} allKeywords
+ * @param {Array} results - mutated in place
+ * @param {Set<string>} alreadyFound - `category:key` ids already present (mutated)
+ */
+async function semanticLayer(databases, allKeywords, results, alreadyFound) {
+    const s = (() => { try { return getSettings(); } catch { return null; } })();
+    if (!s?.semanticRetrieval) return;
+    const queryText = (allKeywords || []).join(' ').trim();
+    if (!queryText) return;
+
+    let qvec = null;
+    try {
+        const vecs = await callEmbeddingAPI([queryText], getEmbeddingProfileId(s));
+        qvec = vecs && vecs[0];
+    } catch { /* graceful */ }
+    if (!Array.isArray(qvec) || qvec.length === 0) return;
+
+    const threshold = Number(s.semanticThreshold) || 0.75;
+    const hits = [];
+    for (const [category, db] of Object.entries(databases || {})) {
+        for (const fact of (db.facts || [])) {
+            if (!isActiveFact(fact) || !Array.isArray(fact.embedding)) continue;
+            const id = `${category}:${fact.key}`;
+            if (alreadyFound.has(id) || !isFactVisible(fact)) continue;
+            const sim = cosineSimilarity(qvec, fact.embedding);
+            if (sim >= threshold) hits.push({ fact, category, sim });
+        }
+    }
+    if (hits.length === 0) return;
+    hits.sort((a, b) => b.sim - a.sim);
+    let admitted = 0;
+    for (const h of hits.slice(0, SEMANTIC_MAX_SECONDARY)) {
+        results.push({ fact: h.fact, category: h.category, tier: 'secondary', via: 'semantic' });
+        alreadyFound.add(`${h.category}:${h.fact.key}`);
+        admitted++;
+    }
+    addDebugLog('info', `Semantic expansion: admitted ${admitted} fact(s) (cos ≥ ${threshold})`);
+}
+
 /**
  * Retrieve relevant facts based on Agent 1's needed info list
  * @param {string[]} neededInfo - Array of fact categories/keywords from Agent 1
@@ -214,6 +272,12 @@ export async function retrieveFacts(neededInfo, contextKeywords = []) {
     // sequence reach is now deterministic), one hop, deduped by id. The existing MAX_SECONDARY/
     // MAX_TERTIARY injection caps below remain the final backstop.
     gatherExpansionCandidates(databases, index, directResults, alreadyFound);
+
+    // SEMANTIC EXPANSION (atomic #1, opt-in). Embed the query and admit facts whose cached
+    // vector is cosine-close to it — catching meaning the keyword/trigram/graph lanes miss
+    // ("safe snack?" → peanut-allergy fact). No-ops gracefully when semantic retrieval is off,
+    // no facts are embedded yet, or no embedding endpoint responds.
+    await semanticLayer(databases, allKeywords, directResults, alreadyFound);
 
     // DETERMINISTIC tier inclusion (Feature #2a). The old code rolled Math.random()
     // against secondaryChance/tertiaryChance and silently dropped correctly-retrieved
