@@ -1204,6 +1204,61 @@ async function saveSharedUserDatabase(db) {
 }
 
 /**
+ * CLEAR the entire shared user store (user-level shared memory). Wipes both the IDB working
+ * record and every durable attachment file pinned to SHARED_USER_AVATAR, so the cross-character
+ * "facts about you" pool is emptied. Cancels any throttled snapshot for that avatar first so it
+ * can't re-upload after the wipe, and invalidates the per-turn cache so the next read reflects the
+ * cleared state. Best-effort + isolated: an IDB failure still removes the attachment files, and a
+ * single failed file delete never aborts the rest. Does NOT touch any character's own store — only
+ * the shared pseudo-avatar. Returns a small summary for the caller to surface.
+ * @returns {Promise<{categories:number, files:number}>}
+ */
+export async function clearSharedUserMemory() {
+    // A wipe is a write to the shared store; drop the memoized map so the next getAllDatabases()
+    // (which merges the shared store in) re-reads the now-empty pool.
+    invalidateDatabaseCache();
+    // Cancel any armed snapshot for the shared avatar so its timer can't fire post-wipe and
+    // resurrect category files from a stale dirty IDB record.
+    try { cancelPendingSnapshot(SHARED_USER_AVATAR); } catch { /* best-effort */ }
+
+    let categories = 0;
+    // 1) Empty the IDB working record (best-effort — on failure we still clear attachments below).
+    if (idbAvailable()) {
+        try {
+            const rec = await idbGetRecord(SHARED_USER_AVATAR);
+            categories = (rec && rec.databases) ? Object.keys(rec.databases).length : 0;
+            await idbPutDatabases(SHARED_USER_AVATAR, {}, Date.now());
+        } catch (e) {
+            console.error('[BFMemory] clearSharedUserMemory: IDB wipe failed; clearing attachments only', e);
+            disableIdb('shared user IDB wipe failed');
+        }
+    }
+
+    // 2) Remove every durable bf_memory_db_*.json attachment under the shared pseudo-avatar bucket.
+    let files = 0;
+    const context = getContext();
+    const attachments = context?.extensionSettings?.character_attachments?.[SHARED_USER_AVATAR];
+    if (Array.isArray(attachments) && attachments.length) {
+        // Iterate a copy; splice the live array as we go.
+        for (const a of [...attachments]) {
+            if (!a || typeof a.name !== 'string' || !a.name.startsWith(DB_PREFIX)) continue;
+            try { await deleteAttachmentFile(a.url); } catch { /* one failed delete must not abort the rest */ }
+            const idx = attachments.indexOf(a);
+            if (idx >= 0) attachments.splice(idx, 1);
+            files++;
+        }
+        if (!categories) categories = files; // fall back to file count when IDB was unavailable
+        context.saveSettingsDebounced?.();
+    }
+
+    addDebugLog('info', `Cleared shared user memory: ${categories} category(ies), ${files} file(s) removed`, {
+        subsystem: 'db', event: 'shared_user.cleared', actor: 'USER',
+        data: { categories, files },
+    });
+    return { categories, files };
+}
+
+/**
  * Merge the shared user store into a per-character database map IN A NEW MAP (the input map is
  * never mutated). Dedupe is by `category:key`: the CHARACTER store ALWAYS WINS on conflict, so a
  * character that has its own version of a user fact is unaffected; only user facts the character

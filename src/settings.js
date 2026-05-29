@@ -4198,6 +4198,28 @@ export async function initSettings() {
         saveSettings();
     });
 
+    // Clear shared user memory (user-level shared memory). DESTRUCTIVE: wipes ONLY the shared
+    // pseudo-avatar store (IDB working copy + backup files); each character's own memory is
+    // untouched. Confirm first (mirrors the deleteDatabase confirm pattern), then call the
+    // database-layer clearSharedUserMemory() via the same dynamic import used elsewhere here.
+    $('#bf_mem_clear_shared_user').on('click', async function () {
+        if (!confirm('Clear the shared "facts about you" memory used across ALL characters? Each character\'s own memory is left untouched. This cannot be undone.')) return;
+        const $btn = $(this);
+        $btn.prop('disabled', true);
+        try {
+            const { clearSharedUserMemory } = await import('./database.js');
+            const { categories, files } = await clearSharedUserMemory();
+            if (typeof toastr !== 'undefined') {
+                toastr.success(`Cleared shared user memory (${categories} categor${categories === 1 ? 'y' : 'ies'}, ${files} file${files === 1 ? '' : 's'}).`, 'BF Memory');
+            }
+        } catch (e) {
+            addDebugLog('fail', `Clear shared user memory failed: ${e?.message || e}`);
+            if (typeof toastr !== 'undefined') toastr.error('Failed to clear shared user memory — see Debug log.', 'BF Memory');
+        } finally {
+            $btn.prop('disabled', false);
+        }
+    });
+
     // Review interval slider
     $('#bf_mem_review_interval').val(extensionSettings.reviewInterval);
     $('#bf_mem_review_val').text(extensionSettings.reviewInterval);

@@ -280,6 +280,10 @@ Choose AT MOST N facts. Output ONLY the #Facts: section listing the chosen Categ
                             <span>Share facts about you across every character</span>
                         </label>
                         <small class="bf-mem-hint">Off by default. When on, facts whose subject is <strong>you</strong> (your persona / {{user}}) are also saved into one shared global store, and merged into every character's memory on read — so each character remembers the player without re-learning. Your character's own version of a fact always wins on conflict. Purely additive: when off, storage and retrieval are unchanged.</small>
+                        <div class="bf-mem-field">
+                            <button type="button" id="bf_mem_clear_shared_user" class="menu_button" title="Permanently erase the cross-character shared store of facts about you. Does not touch any character's own memory.">Clear shared user memory</button>
+                        </div>
+                        <small class="bf-mem-hint">Wipes the shared "facts about you" pool (IDB working copy + backup files). Each character's own memory is untouched. Cannot be undone.</small>
                     </div>
                 </div>
                 <div class="bf-mem-section">
