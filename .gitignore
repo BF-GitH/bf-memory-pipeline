@@ -6,6 +6,10 @@ Thumbs.db
 # Claude Code worktrees, agent transcripts, and other harness state
 .claude/
 
+# Local scratch / notes (transient, never committed)
+.tmpcheck/
+previoues convo.txt
+
 # Research artifacts (third-party ST extension source files downloaded
 # transiently by research agents for pattern lookup — should never be committed)
 mb_*.js
