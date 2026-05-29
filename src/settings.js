@@ -117,6 +117,10 @@ const DEFAULT_SETTINGS = {
     // pipeline.js — only the debug-log preview is substring'd, never the prompt).
     agent1ContextMessages: 5,
     agent3ContextMessages: 5,
+    // Empty-scope pre-LLM skip (atomic #13): skip the Agent 3 (Scribe) LLM call when EVERY
+    // message in the extraction window is trivially empty (pure asterisk actions, OOC, or very
+    // short) per isTriviallyEmptyForExtraction. Saves a wasted call + tokens on no-content turns.
+    agent3EmptyScopeSkip: true,
     // Agent 2 (Writer) context limit: default 0 = off (main model sees full chat as ST
     // sends it). When > 0, we trim data.chat IN-PLACE to the last N user/AI messages
     // before sending — the main model sees only those + our injected facts. Lets you
@@ -161,6 +165,10 @@ const DEFAULT_SETTINGS = {
     // char-budget truncation style). Bounds prompt growth even with a huge store.
     summaryPyramidMaxTokens: 250,
     reviewInterval: 10,
+    // Contradiction scan (atomic #7): every N reflection passes, flag facts that appear to
+    // contradict (same/near key, different value) into the review popup. Heuristic, no LLM call.
+    contradictionScanEnabled: true,
+    contradictionInterval: 3,
     // DEPRECATED (Feature #2a): retrieval tier inclusion is now DETERMINISTIC (capped,
     // no random dice). These keys are kept for settings persistence/back-compat and the
     // existing sliders, but no longer gate which facts get injected. Safe to remove the
@@ -291,6 +299,7 @@ function validateSettings(s) {
     s.agent3ContextMessages = Math.floor(clamp(s.agent3ContextMessages, 1, 20, 5));
     s.agent2ContextMessages = Math.floor(clamp(s.agent2ContextMessages, 0, 50, 0));
     s.reviewInterval  = Math.floor(clamp(s.reviewInterval,  3, 100, 10));
+    s.contradictionInterval = Math.floor(clamp(s.contradictionInterval, 1, 50, 3));
     s.secondaryChance = Math.floor(clamp(s.secondaryChance, 0, 100, 50));
     s.tertiaryChance  = Math.floor(clamp(s.tertiaryChance,  0, 100, 15));
     // Feature #4 depth-dice probabilities are 0..1 floats (not clamped to ints).
@@ -3275,7 +3284,7 @@ function detachCurrentChatIfNeeded(unlinkedChatId, profileName) {
  *     "ok", "*nods*", emoji, etc.
  *   - pure OOC lines: every non-empty line wrapped in (( )) or prefixed OOC:
  */
-function isTriviallyEmptyForExtraction(mes) {
+export function isTriviallyEmptyForExtraction(mes) {
     const raw = String(mes ?? '');
     // Strip simple action-asterisks and collapse whitespace for the length test.
     const visible = raw.replace(/\*/g, '').replace(/\s+/g, ' ').trim();

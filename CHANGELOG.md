@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.32.0] - 2026-05-29
+
+### Added — atomic-derived Tier A (re-implemented against current code). Backward-compatible.
+First batch of improvements inferred from the *atomic* engine, ported onto the current pipeline (the originals were built on a stale v0.18.0 fork). These four had no equivalent on master.
+
+- **#13 Empty-scope pre-LLM skip.** `runMemoryExtraction` now skips the Scribe (Agent 3) LLM call when every message in the extraction window is trivially empty (pure asterisk actions / OOC / very short). `isTriviallyEmptyForExtraction` is now exported and wired into the LIVE path (previously only the backfill used it). New `agent3EmptyScopeSkip` setting (default on). Saves a wasted call + tokens on no-content turns. ([src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js))
+- **#12 Watermark at scope-time.** `bf_mem_processed` is now stamped `'in-flight'` BEFORE the Scribe call and promoted to `true` on commit, reset to `false` on explicit discard (cancel / character-change / returned LLM error), and left `'in-flight'` on an unexpected throw — closing the crash/swipe window that previously caused re-extraction. Preserves the existing no-redundant-save optimization. ([src/pipeline.js](src/pipeline.js))
+- **#8 Fact provenance.** `upsertFact` now preserves the GENESIS `source`/`validAt` across updates (previously clobbered by each re-mention), stamps a `learnedAt` timestamp, and keeps a capped (≤10) `sourceHistory` trail. New `getProvenanceSummary(fact)` export. Applied across all write paths (new / in-place / supersession / sequence). ([src/database.js](src/database.js))
+- **#7 Contradiction scan.** A heuristic pass (no LLM) inside reflection, every `contradictionInterval` passes (default 3, after the dedupe-janitor): flags same-key and near-key (token-Jaccard ≥ 0.72) facts with differing values into the review popup as read-only `CONFLICT` items. Excluded from the upsert path in both the popup and pipeline handlers, so it can never corrupt data. New `contradictionScanEnabled`/`contradictionInterval` settings. ([src/agent-reflect.js](src/agent-reflect.js), [src/review-popup.js](src/review-popup.js), [src/pipeline.js](src/pipeline.js), [src/settings.js](src/settings.js), [style.css](style.css))
+
 ## [0.31.0] - 2026-05-24
 
 ### Added — relationship "resonance": a couple's emotional thread, pulled when it matters
