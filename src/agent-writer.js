@@ -623,3 +623,225 @@ export function syncWriterRecallTool() {
     if (recallToolEnabled()) registerWriterRecallTool();
     else unregisterWriterRecallTool();
 }
+
+// =============================================================================
+// OPTIONAL WRITER WRITE TOOL — `remember_fact` (model-writable memory / "pin")
+// -----------------------------------------------------------------------------
+// Letta core_memory_append analogue: gives the MAIN model an optional ST function-tool
+// to PIN ONE fact directly, complementing the read-only `search_memory` pull tool above.
+// Mirrors the EXACT registration pattern of registerWriterRecallTool/syncWriterRecallTool.
+//
+// ADD-ONLY. The action upserts ONE fact via the SAME upsertFact/saveDatabase path the
+// extraction pipeline uses (so cold-tiering, provenance, normalize-merge etc. all apply
+// identically) — it NEVER deletes. Gated behind the default-OFF `enableWriterWriteTool`
+// setting. Registration is idempotent (guarded by _writeToolRegistered); unregistered
+// cleanly when toggled off. IMPORTS are LAZY (dynamic import inside the action / logging
+// helpers) to avoid a static import cycle, exactly like the recall tool.
+// =============================================================================
+
+const WRITE_TOOL_NAME = 'remember_fact';
+// Module-level guard so register/unregister stay idempotent across init + toggle re-runs.
+let _writeToolRegistered = false;
+let _writeToolApiUnavailableLogged = false; // fail-level "API missing" notice fires once
+
+/**
+ * Read the enableWriterWriteTool setting (lazily, cycle-safe). Default OFF.
+ * @returns {boolean}
+ */
+function writeToolEnabled() {
+    const s = getSettingsSafe();
+    return !!(s && s.enableWriterWriteTool === true);
+}
+
+/**
+ * The tool action: PIN ONE fact into the active per-character store. ADD-ONLY. Reads/validates
+ * args defensively (never throws), then routes through the SAME upsertFact/saveDatabase path the
+ * extraction pipeline uses. Returns a STRING (the ST tool contract). Logs each invocation at debug
+ * level with key/category/importance metadata (NOT free-form value bodies beyond a short slice).
+ * On ANY failure returns a safe error string and degrades to a no-op (nothing written).
+ * @param {{key?: string, value?: string, category?: string, subject?: string, importance?: (number|string), aspect?: string}} args
+ * @returns {Promise<string>}
+ */
+async function rememberFactAction({ key, value, category, subject, importance, aspect } = {}) {
+    try {
+        // Validate the two required, load-bearing fields up front. Without key+value there is
+        // nothing meaningful to store; bail with a clear message rather than minting junk.
+        const factKey = String(key ?? '').trim();
+        const factValue = String(value ?? '').trim();
+        if (!factKey || !factValue) {
+            await rememberToolLog('debug', `Writer write: remember_fact rejected — missing ${!factKey ? 'key' : 'value'}`, {
+                subsystem: 'writer', event: 'tool.remember_fact', reason: 'MISSING_REQUIRED_FIELD',
+            });
+            return 'Could not remember: both a "key" and a "value" are required.';
+        }
+
+        // Resolve the target category (default 'Unsorted' to match the extraction default bucket).
+        const cat = String(category ?? '').trim() || 'Unsorted';
+
+        // Lazy import to dodge the static import cycle (database.js is heavy + pulls settings).
+        const { getDatabase, createEmptyDatabase, upsertFact, saveDatabase, clampImportance } = await import('./database.js');
+
+        // Get-or-create the category DB in the active per-character store. getDatabase reads through
+        // getAllDatabases() (the same active store the recall tool searches).
+        const db = (await getDatabase(cat)) || createEmptyDatabase(cat);
+
+        // Build a MINIMAL fact mirroring agent-memory.js applyUpdates' factToWrite shape so upsertFact
+        // gets the fields it expects. Optional axes are forwarded only when provided + valid.
+        const factToWrite = {
+            key: factKey,
+            value: factValue,
+            tags: [],
+            knownBy: [],
+            relationships: { primary: [], secondary: [], tertiary: [] },
+            // Provenance: mark this as model-pinned so the trail shows where it came from.
+            source: 'writer:remember_fact',
+        };
+        const imp = Math.floor(Number(importance));
+        if (Number.isInteger(imp) && imp >= 1 && imp <= 5) factToWrite.importance = clampImportance(imp);
+        const subj = String(subject ?? '').trim();
+        if (subj) factToWrite.subject = subj;
+        const asp = String(aspect ?? '').trim();
+        if (asp) factToWrite.aspect = asp;
+
+        // ADD-ONLY upsert: exact-key / normalized-variant merge is fine (idempotent re-pin updates
+        // the value in place), but nothing is ever removed. Then persist the touched category DB.
+        upsertFact(db, factToWrite);
+        await saveDatabase(db);
+
+        await rememberToolLog('info', `Writer write: remember_fact "${cat}/${factKey}" = "${factValue.slice(0, 80)}"`, {
+            subsystem: 'writer', event: 'tool.remember_fact',
+            data: {
+                category: cat, key: factKey.slice(0, 120),
+                value: factValue.slice(0, 120),
+                importance: Number.isInteger(imp) ? clampImportance(imp) : null,
+                subject: subj || null, aspect: asp || null,
+            },
+        });
+        return `Remembered: ${cat}/${factKey} = ${factValue.slice(0, 120)}`;
+    } catch (e) {
+        await rememberToolLog('fail', `Writer write: remember_fact failed — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.remember_fact', reason: 'WRITE_ERROR',
+        });
+        return 'Could not remember that fact.';
+    }
+}
+
+/**
+ * Best-effort debug log for the write tool that never throws (settings.js imported lazily to dodge
+ * the agent-writer <-> settings import cycle). Mirrors recallToolLog.
+ * @param {string} level
+ * @param {string} message
+ * @param {object} [opts]
+ */
+async function rememberToolLog(level, message, opts = {}) {
+    try {
+        const { addDebugLog } = await import('./settings.js');
+        addDebugLog(level, message, opts);
+    } catch { /* logging must never break the tool */ }
+}
+
+/**
+ * Register the optional `remember_fact` Writer write tool. Idempotent (guarded by
+ * _writeToolRegistered). No-op + single fail-level log when the ST tool API is unavailable.
+ * Never throws. Call on init (when enabled) and whenever the setting is toggled on.
+ */
+export function registerWriterWriteTool() {
+    if (_writeToolRegistered) return;
+    const api = getToolApi();
+    if (!api) {
+        if (!_writeToolApiUnavailableLogged) {
+            _writeToolApiUnavailableLogged = true;
+            void rememberToolLog('fail', 'Writer write: SillyTavern function-tool API unavailable — remember_fact not registered', {
+                subsystem: 'writer', event: 'tool.unregistered', reason: 'TOOL_API_UNAVAILABLE',
+            });
+        }
+        return;
+    }
+    try {
+        api.register({
+            name: WRITE_TOOL_NAME,
+            displayName: 'Remember Fact',
+            description: 'Pin ONE durable fact into long-term memory so it is remembered in future replies. '
+                + 'Use this for a stable, important detail the story just established that should persist — '
+                + 'a name, a relationship, a vow, a location, a lasting trait or change. Pass a short stable '
+                + '"key" (e.g. "eye_color", "home_town") and the "value". Optionally set "category" (e.g. People, '
+                + 'Places, Events; defaults to Unsorted), "subject" (whom/what the fact is about), "importance" '
+                + '(1-5, higher = more foundational), and "aspect" (the facet, e.g. appearance, history). '
+                + 'Add-only — this never deletes or overwrites unrelated facts; re-pinning the same key updates it.',
+            parameters: {
+                $schema: 'http://json-schema.org/draft-04/schema#',
+                type: 'object',
+                properties: {
+                    key: {
+                        type: 'string',
+                        description: 'Short, stable identifier for the fact (snake_case preferred, e.g. "eye_color", "captains_vow").',
+                    },
+                    value: {
+                        type: 'string',
+                        description: 'The fact itself — the established truth to remember.',
+                    },
+                    category: {
+                        type: 'string',
+                        description: 'Optional category bucket (e.g. People, Places, Events). Defaults to "Unsorted".',
+                    },
+                    subject: {
+                        type: 'string',
+                        description: 'Optional: whom or what the fact is about (the subject axis).',
+                    },
+                    importance: {
+                        type: 'integer',
+                        description: 'Optional importance 1-5 (higher = more foundational / longer retained).',
+                    },
+                    aspect: {
+                        type: 'string',
+                        description: 'Optional facet of the subject the fact describes (e.g. appearance, history, relationship).',
+                    },
+                },
+                required: ['key', 'value'],
+            },
+            action: rememberFactAction,
+            formatMessage: ({ key } = {}) => `Remembering "${String(key ?? '').slice(0, 80)}"…`,
+            shouldRegister: () => writeToolEnabled(),
+            stealth: false,
+        });
+        _writeToolRegistered = true;
+        void rememberToolLog('info', 'Writer write: remember_fact tool registered', {
+            subsystem: 'writer', event: 'tool.registered',
+        });
+    } catch (e) {
+        void rememberToolLog('fail', `Writer write: failed to register remember_fact — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.unregistered', reason: 'REGISTER_FAILED',
+        });
+    }
+}
+
+/**
+ * Unregister the `remember_fact` tool. Idempotent. If ST exposes no unregister fn we rely on the
+ * tool's own shouldRegister() returning false to keep it inert. Never throws.
+ */
+export function unregisterWriterWriteTool() {
+    if (!_writeToolRegistered) return;
+    const api = getToolApi();
+    try {
+        if (api && typeof api.unregister === 'function') {
+            api.unregister(WRITE_TOOL_NAME);
+        }
+        _writeToolRegistered = false;
+        void rememberToolLog('info', 'Writer write: remember_fact tool unregistered', {
+            subsystem: 'writer', event: 'tool.unregistered',
+        });
+    } catch (e) {
+        void rememberToolLog('fail', `Writer write: failed to unregister remember_fact — ${e?.message || e}`, {
+            subsystem: 'writer', event: 'tool.unregistered', reason: 'UNREGISTER_FAILED',
+        });
+    }
+}
+
+/**
+ * Sync the write tool's registration to the current setting. Register when enabled, unregister
+ * when not. Safe to call on init and on every settings change. Never throws.
+ */
+export function syncWriterWriteTool() {
+    if (writeToolEnabled()) registerWriterWriteTool();
+    else unregisterWriterWriteTool();
+}

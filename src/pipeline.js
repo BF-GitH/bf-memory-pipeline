@@ -13,7 +13,7 @@ import { cancelInFlightLLM } from './llm-call.js';
 import { getAgent1ProfileId, getAgent3ProfileId, getAgent4ProfileId } from './profiler.js';
 import { trackUpdate, tickMessageCounter, showReviewPopup } from './review-popup.js';
 import { getSettings, addDebugLog, updateStatus, setLastGenerated, setLastInserted, appendLastInserted, saveCurrentToActiveProfile, setRunTokens, setMainOutputTokens, addAgent3Tokens, addReflectionTokens, setScene, getScene, reloadEntitiesUI, beginRun, endRun, setPendingRun, getPendingRun, consumePendingRun, getSummaryPyramid, isTriviallyEmptyForExtraction } from './settings.js';
-import { detectAndRecord, showEntityPopup } from './agent-entities.js';
+import { detectAndRecord, showEntityPopup, runEntityResolution } from './agent-entities.js';
 
 // Pipeline state
 let lastProcessedMessageIndex = -1;
@@ -61,6 +61,13 @@ let runRecordedInput = false; // true once setRunTokens fired this generation cy
 let successfulRunsSinceReflection = 0;
 let reflectionPending = null; // {runId, charAvatar} captured at the run that armed it; consumed on MESSAGE_RECEIVED
 let reflectionInFlight = false; // guard so overlapping turns can't double-fire the pass
+// IDLE-TIME CONSOLIDATION (Letta sleeptime pattern). In ADDITION to the every-N-turns cadence,
+// an idle timer fires the SAME maybeRunReflection() pass once the user has gone quiet for
+// idleConsolidationMs. Reset on every user activity (MESSAGE_RECEIVED), cleared on CHAT_CHANGED.
+// Opt-in (settings.idleConsolidation, default OFF). Self-guarded so it can never double-fire with
+// the turn-cadence pass (maybeRunReflection no-ops without an armed reflectionPending / when one is
+// already in flight) and never runs while a generation is active.
+let idleConsolidationTimer = null;
 // Phase 3b: Agent 3 (memory extraction) now runs on MESSAGE_RECEIVED, off the blocking
 // path. This guard prevents two MESSAGE_RECEIVED events (e.g. a fast follow-up turn) from
 // launching overlapping extractions that race on the same DB save.
@@ -130,6 +137,61 @@ function scheduleSettleExtraction(reason, runPostPasses = false) {
         }, SETTLE_EXTRACTION_DELAY_MS);
     } catch (err) {
         addDebugLog('fail', `Scheduling settle extraction failed (non-fatal): ${err.message || err}`);
+    }
+}
+
+/**
+ * IDLE-TIME CONSOLIDATION (Letta sleeptime pattern). Cancel any pending idle timer. Called on
+ * every user activity (to debounce) and on CHAT_CHANGED (so the timer can't fire against a
+ * different chat). Cheap + idempotent.
+ */
+function clearIdleConsolidation() {
+    if (idleConsolidationTimer) {
+        clearTimeout(idleConsolidationTimer);
+        idleConsolidationTimer = null;
+    }
+}
+
+/**
+ * (Re)arm the idle-consolidation timer. Resets any previously-armed timer so the countdown only
+ * elapses after genuine quiet (every MESSAGE_RECEIVED pushes it forward). When it fires we invoke
+ * the SAME maybeRunReflection() pass used by the turn-cadence path — it carries every existing
+ * guard (enabled / cancelled / group / character-changed / reflectionInFlight) and no-ops unless a
+ * reflection is actually armed (reflectionPending), so this CANNOT double-fire with the turn pass.
+ * We additionally skip if a generation/turn is still mid-flight (getPendingRun() non-null) so we
+ * never run during active generation. Opt-in via settings.idleConsolidation (default OFF). Fully
+ * try/catch'd at every layer — an idle-timer failure must never break the turn.
+ */
+function armIdleConsolidation() {
+    try {
+        const settings = getSettings();
+        if (!settings || !settings.enabled || !settings.idleConsolidation) {
+            clearIdleConsolidation(); // disabled mid-session — make sure nothing is left armed
+            return;
+        }
+        clearIdleConsolidation();
+        const delay = Math.max(30000, Number(settings.idleConsolidationMs) || 120000);
+        idleConsolidationTimer = setTimeout(() => {
+            idleConsolidationTimer = null;
+            try {
+                const s = getSettings();
+                if (!s || !s.enabled || !s.idleConsolidation) return; // re-check at fire time
+                // Never run while a generation/turn is still settling: getPendingRun() stays
+                // non-null from generation start until the settle extraction consumes it (which
+                // ALSO runs maybeRunReflection). Skipping here avoids racing that pass and avoids
+                // firing during active generation. If still busy, re-arm to retry after quiet.
+                if (getPendingRun()) { armIdleConsolidation(); return; }
+                if (pipelineCancelled || reflectionInFlight) return; // also fully covered inside the call
+                addDebugLog('info', `Idle consolidation: ${Math.round(delay / 1000)}s quiet — running reflection pass`);
+                // maybeRunReflection() is self-guarded + try/catch'd: no-ops unless a reflection
+                // is armed (reflectionPending) and no other guard trips.
+                maybeRunReflection();
+            } catch (err) {
+                try { addDebugLog('fail', `Idle consolidation fire failed (non-fatal): ${err.message || err}`); } catch { /* noop */ }
+            }
+        }, delay);
+    } catch (err) {
+        try { addDebugLog('fail', `Arming idle consolidation failed (non-fatal): ${err.message || err}`); } catch { /* noop */ }
     }
 }
 
@@ -1448,9 +1510,22 @@ async function runMemoryExtraction() {
         // generic `char`/`{{char}}` facts resolve to the REAL speaking character — correct for group
         // chats / NPC-vs-main-char where ST sets `targetMessage.name` to the speaking member.
         const sourceSpeakerName = String(targetMessage.name || '').trim();
+        // TEMPORAL GROUNDING: derive the message's real-world observation timestamp (ISO) so the
+        // Scribe can resolve relative time words ("yesterday","last week") to ABSOLUTE dates that
+        // don't rot. ST messages carry send_date (usually a parseable string, sometimes a number);
+        // fall back to now() if absent/unparseable. Never throws — degrades to current time.
+        let observationDate;
+        try {
+            const sd = targetMessage.send_date;
+            const ts = (sd != null) ? new Date(sd).getTime() : NaN;
+            observationDate = (Number.isFinite(ts) ? new Date(ts) : new Date()).toISOString();
+        } catch (_) {
+            observationDate = new Date().toISOString();
+        }
         memoryResult = await runMemoryUpdater(
             targetMessage.mes, memoryTargetIndex, characterInfo, databases, agent3ProfileId,
             !!targetMessage.is_user, userPersona, agent3PriorMessages, lastUserMsgIndex, sourceSpeakerName,
+            observationDate,
         ).catch(err => ({ updates: [], summary: '', raw: '', error: err.message, tokensIn: 0, tokensOut: 0 }));
         postStageMs.agent3Ms = Date.now() - agent3Start; // observability: Scribe LLM call wall-clock
 
@@ -1711,7 +1786,11 @@ async function maybeRunReflection() {
 async function maybeRunEntityCheck() {
     if (entityCheckInFlight) return;
     const settings = getSettings();
-    if (!settings || !settings.enabled || settings.characterRegistryEnabled === false) return;
+    // Run when EITHER the registry popup OR the semantic merge pass is enabled — both share this
+    // OFF-critical-path cadence. The popup-specific work below is still gated on characterRegistryEnabled.
+    const registryOn = settings && settings.characterRegistryEnabled !== false;
+    const resolutionOn = settings && settings.entityResolution === true;
+    if (!settings || !settings.enabled || (!registryOn && !resolutionOn)) return;
     if (pipelineCancelled) return;
     const ctx = SillyTavern.getContext();
     if (ctx.groupId || ctx.selected_group) return; // group chats unsupported (same as the gate)
@@ -1723,6 +1802,17 @@ async function maybeRunEntityCheck() {
 
     entityCheckInFlight = true;
     try {
+        // Semantic entity resolution / merge (default OFF; self-guarded internally). Conservative,
+        // deterministic, off the critical path. Run BEFORE detection so the registry/popup sees the
+        // post-merge subject set. A failure here degrades to a no-op (it never throws out).
+        if (resolutionOn) {
+            try { await runEntityResolution(); } catch (err) {
+                addDebugLog('fail', `Entity resolution (cadence) failed (non-fatal): ${err.message || err}`);
+            }
+            try { reloadEntitiesUI(); } catch { /* ignore */ }
+        }
+        // Registry detection + popup is gated on its own toggle.
+        if (!registryOn) return;
         const { getAllDatabases } = await import('./database.js');
         const databases = await getAllDatabases();
         const candidates = detectAndRecord(databases);
@@ -1848,6 +1938,12 @@ export function initPipeline() {
         // remain inside runMemoryExtraction and are evaluated at fire time (settle), so a Stop
         // or a swipe that lands new content is still honored.
         scheduleSettleExtraction('message-received', true);
+
+        // IDLE-TIME CONSOLIDATION: a reply just landed, so the activity clock restarts. (Re)arm
+        // the idle timer — if the user then goes quiet for idleConsolidationMs it fires the same
+        // reflection pass during dead time, in ADDITION to the turn-cadence pass. Opt-in + fully
+        // self-guarded inside armIdleConsolidation (no-op when disabled or generation in flight).
+        armIdleConsolidation();
     });
 
     // Also reset on generation stop/failure (user clicks Stop, or error).
@@ -1944,6 +2040,9 @@ export function initPipeline() {
         // chat switch can't fire a consolidation against the new chat using old context.
         successfulRunsSinceReflection = 0;
         reflectionPending = null;
+        // IDLE-TIME CONSOLIDATION: drop any armed idle timer so it can't fire a consolidation
+        // against the NEW chat using the prior chat's armed/context state.
+        clearIdleConsolidation();
         // Debug-log redesign §2: drop any armed pendingRun + clear the ambient run id so a chat
         // switch can't leak the prior chat's runId onto the new chat's logs.
         setPendingRun(null);
